@@ -5,7 +5,7 @@ import { DEFAULT_EFFORT, EFFORTS, MAX_TOOL_NAME } from '../claude/pins.ts'
 // deno-lint-ignore no-explicit-any
 type Json = any
 
-/** Claude Code 2.1.284 validates each image's base64 length against this default API limit. */
+/** Gateway-owned per-image input cap, enforced before Claude Code can resize or re-encode the image. */
 export const MAX_IMAGE_BASE64_CHARS = 5 * 1024 * 1024
 
 export type Part = { type: 'text'; text: string } | { type: 'image'; mediaType: string; data: string }

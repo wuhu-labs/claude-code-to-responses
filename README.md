@@ -68,7 +68,7 @@ reads `~/.claude`.
   | `unexpected_reasoning_item` | A reasoning item next to new input that the gateway did not issue in this conversation. |
   | `missing_tool_output`, `unexpected_tool_output` | The outputs don't match the calls the conversation waits on. |
   | `tool_output_too_large` | An output over 500,000 characters (Claude Code would move it to a file). |
-  | `image_too_large` | `400`: an image whose base64 payload exceeds 5,242,880 characters (5 MiB encoded, up to 3,932,160 decoded bytes), the pinned version’s default per-image API limit after its image processing. Resize it before sending. |
+  | `image_too_large` | `400`: an image whose base64 payload exceeds 5,242,880 characters (5 MiB encoded, up to 3,932,160 decoded bytes), the gateway’s own per-image input cap, enforced before Claude Code’s image processing. Resize it before sending. |
   | `conversation_busy` | `409`: another response of the conversation is streaming or starting. |
   | `not_found`, `response_not_in_progress` | Cancel of an unknown response, or of one that is no longer streaming. |
   | `shutting_down` | `503`: the gateway is stopping. |
