@@ -32,10 +32,29 @@ export interface NormRequest {
 }
 
 const ACCEPTED = new Set([
-  'model', 'input', 'instructions', 'tools', 'tool_choice', 'parallel_tool_calls', 'stream', 'store',
-  'previous_response_id', 'reasoning', 'include', 'metadata', 'text', 'truncation', 'user',
-  'prompt_cache_key', 'safety_identifier', 'service_tier', 'background', 'max_output_tokens',
-  'temperature', 'top_p', 'stream_options',
+  'model',
+  'input',
+  'instructions',
+  'tools',
+  'tool_choice',
+  'parallel_tool_calls',
+  'stream',
+  'store',
+  'previous_response_id',
+  'reasoning',
+  'include',
+  'metadata',
+  'text',
+  'truncation',
+  'user',
+  'prompt_cache_key',
+  'safety_identifier',
+  'service_tier',
+  'background',
+  'max_output_tokens',
+  'temperature',
+  'top_p',
+  'stream_options',
 ])
 
 const isObj = (v: unknown): v is Record<string, Json> => typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -106,7 +125,9 @@ export function parseRequest(body: unknown): NormRequest {
     }
     const e = body.reasoning.effort
     if (e !== undefined && e !== null) {
-      if (typeof e !== 'string' || !(e in EFFORTS)) throw unsupported('reasoning.effort', `Effort '${e}' is not supported; use one of ${Object.keys(EFFORTS).join(', ')}.`)
+      if (typeof e !== 'string' || !(e in EFFORTS)) {
+        throw unsupported('reasoning.effort', `Effort '${e}' is not supported; use one of ${Object.keys(EFFORTS).join(', ')}.`)
+      }
       effort = EFFORTS[e]
     }
   }
@@ -127,7 +148,9 @@ export function parseRequest(body: unknown): NormRequest {
       }
       if (names.has(t.name)) throw invalid(`${p}.name`, `Duplicate tool name '${t.name}'.`)
       names.add(t.name)
-      if (t.description !== undefined && t.description !== null && typeof t.description !== 'string') throw invalid(`${p}.description`, 'Tool descriptions must be strings.')
+      if (t.description !== undefined && t.description !== null && typeof t.description !== 'string') {
+        throw invalid(`${p}.description`, 'Tool descriptions must be strings.')
+      }
       const parameters = t.parameters ?? { type: 'object', properties: {} }
       if (!isObj(parameters) || parameters.type !== 'object') throw invalid(`${p}.parameters`, "Tool parameters must be a JSON Schema with 'type: object'.")
       tools.push({ name: t.name, description: t.description ?? '', parameters })
@@ -136,7 +159,9 @@ export function parseRequest(body: unknown): NormRequest {
 
   let previousResponseId: string | null = null
   if (body.previous_response_id !== undefined && body.previous_response_id !== null) {
-    if (typeof body.previous_response_id !== 'string' || !body.previous_response_id) throw invalid('previous_response_id', "'previous_response_id' must be a string.")
+    if (typeof body.previous_response_id !== 'string' || !body.previous_response_id) {
+      throw invalid('previous_response_id', "'previous_response_id' must be a string.")
+    }
     previousResponseId = body.previous_response_id
   }
 
@@ -202,7 +227,9 @@ function parseContent(content: unknown, p: string, role: 'user' | 'assistant'): 
     if (c.type === 'input_text' || c.type === 'output_text') {
       if (typeof c.text !== 'string') throw invalid(`${q}.text`, 'Text parts need a string text.')
       if (c.type === 'output_text' && role !== 'assistant') throw invalid(`${q}.type`, "'output_text' belongs to assistant messages.")
-      if (c.type === 'output_text' && Array.isArray(c.annotations) && c.annotations.length) throw unsupported(`${q}.annotations`, 'Annotations are not supported.')
+      if (c.type === 'output_text' && Array.isArray(c.annotations) && c.annotations.length) {
+        throw unsupported(`${q}.annotations`, 'Annotations are not supported.')
+      }
       return { type: 'text', text: c.text }
     }
     if (c.type === 'input_image' && role === 'user') {

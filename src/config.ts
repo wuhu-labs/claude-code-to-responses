@@ -25,7 +25,6 @@ export interface Config {
 export interface Paths {
   configDir: string
   homeDir: string
-  tmpDir: string
   runDir: string
 }
 
@@ -33,7 +32,6 @@ export function paths(c: Config): Paths {
   return {
     configDir: `${c.stateDir}/claude/config`,
     homeDir: `${c.stateDir}/claude/home`,
-    tmpDir: `${c.stateDir}/claude/tmp`,
     runDir: `${c.stateDir}/run`,
   }
 }
@@ -68,7 +66,9 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
       flags.add(a)
       continue
     }
-    if (!['--listen', '--bridge-port', '--state-dir', '--work-root', '--claude', '--tz', '--idle-timeout', '--hold-timeout'].includes(a)) throw new ConfigError(`unknown option ${a}\n\n${USAGE}`)
+    if (!['--listen', '--bridge-port', '--state-dir', '--work-root', '--claude', '--tz', '--idle-timeout', '--hold-timeout'].includes(a)) {
+      throw new ConfigError(`unknown option ${a}\n\n${USAGE}`)
+    }
     const v = argv[++i]
     if (v === undefined) throw new ConfigError(`${a} needs a value`)
     opts.set(a, v)
@@ -114,16 +114,18 @@ export function prepare(c: Config): Config {
   Deno.mkdirSync(c.workRoot, { recursive: true })
   const stateDir = Deno.realPathSync(c.stateDir)
   const workRoot = Deno.realPathSync(c.workRoot)
-  for (let d = workRoot; ; d = d.replace(/\/[^/]+$/, '') || '/') {
+  for (let d = workRoot;; d = d.replace(/\/[^/]+$/, '') || '/') {
     try {
       Deno.statSync(`${d}/.git`)
-      throw new ConfigError(`--work-root ${workRoot} is inside the git repository at ${d}; Claude Code would announce it in every prompt. Use a folder outside git.`)
+      throw new ConfigError(
+        `--work-root ${workRoot} is inside the git repository at ${d}; Claude Code would announce it in every prompt. Use a folder outside git.`,
+      )
     } catch (e) {
       if (e instanceof ConfigError) throw e
     }
     if (d === '/') break
   }
   const p = paths({ ...c, stateDir })
-  for (const d of [p.configDir, p.homeDir, p.tmpDir, p.runDir]) Deno.mkdirSync(d, { recursive: true })
+  for (const d of [p.configDir, p.homeDir, p.runDir]) Deno.mkdirSync(d, { recursive: true })
   return { ...c, stateDir, workRoot }
 }

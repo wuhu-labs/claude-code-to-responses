@@ -95,6 +95,8 @@ export async function claudeVersion(binary: string, env: Record<string, string>)
   const out = await new Deno.Command(binary, { args: ['--version'], env, clearEnv: true, stdout: 'piped', stderr: 'piped' }).output()
   const text = new TextDecoder().decode(out.stdout).trim()
   const m = /^(\d+\.\d+\.\d+)/.exec(text)
-  if (!out.success || !m) throw new Error(`could not read the Claude Code version from ${binary}: ${text || new TextDecoder().decode(out.stderr).slice(0, 500)}`)
+  if (!out.success || !m) {
+    throw new Error(`could not read the Claude Code version from ${binary}: ${text || new TextDecoder().decode(out.stderr).slice(0, 500)}`)
+  }
   return m[1]
 }

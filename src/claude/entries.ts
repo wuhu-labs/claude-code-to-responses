@@ -93,7 +93,9 @@ export function assistantUuidFor(lines: string[], callId: string): string | null
     } catch {
       continue
     }
-    if (e.type === 'assistant' && Array.isArray(e.message?.content) && e.message.content.some((b: Json) => b.type === 'tool_use' && b.id === callId)) return e.uuid
+    if (e.type === 'assistant' && Array.isArray(e.message?.content) && e.message.content.some((b: Json) => b.type === 'tool_use' && b.id === callId)) {
+      return e.uuid
+    }
   }
   return null
 }
@@ -128,7 +130,16 @@ export function assistantEntries(ctx: LogContext, outputs: InItem[], model: stri
   const stop = calls.length ? 'tool_use' : 'end_turn'
   const entries = blocks.map((b, k) =>
     base(ctx, {
-      message: { id, type: 'message', role: 'assistant', model, content: [b], stop_reason: stop, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } },
+      message: {
+        id,
+        type: 'message',
+        role: 'assistant',
+        model,
+        content: [b],
+        stop_reason: stop,
+        stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
       apiBlockIndex: k,
       type: 'assistant',
     })

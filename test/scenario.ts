@@ -7,8 +7,18 @@ import { cleanup, type Dirs, dirs, Driver, freePort, type Result, TestGateway } 
 export const MODEL = 'claude-opus-5-5'
 export const INSTRUCTIONS = 'You are a test agent. Use the tools when asked.'
 export const TOOLS = [
-  { type: 'function', name: 'echo', description: 'Echo the text back.', parameters: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } },
-  { type: 'function', name: 'read', description: 'Read a named thing.', parameters: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } },
+  {
+    type: 'function',
+    name: 'echo',
+    description: 'Echo the text back.',
+    parameters: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
+  },
+  {
+    type: 'function',
+    name: 'read',
+    description: 'Read a named thing.',
+    parameters: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] },
+  },
 ]
 export const toolsImpl = {
   echo: (a: Json) => `ECHO ${a.text}`,
@@ -25,7 +35,11 @@ export class Run {
   gateways: TestGateway[] = []
   disruptions: { kind: Disruption; beforeRequest: number }[] = []
 
-  constructor(readonly name: string, readonly live: boolean, readonly opts: { mode?: 'previous' | 'history'; tz?: string; workRoot?: string } = {}) {
+  constructor(
+    readonly name: string,
+    readonly live: boolean,
+    readonly opts: { mode?: 'previous' | 'history'; tz?: string; workRoot?: string; idleTimeoutMs?: number; holdTimeoutMs?: number } = {},
+  ) {
     this.fake = new FakeAnthropic(freePort())
     this.d = dirs(name)
     if (opts.workRoot) this.d.workRoot = opts.workRoot
@@ -36,7 +50,13 @@ export class Run {
   }
 
   async start(): Promise<void> {
-    this.tg = await TestGateway.start({ dirs: this.d, backendEnv: this.backend(), tz: this.opts.tz })
+    this.tg = await TestGateway.start({
+      dirs: this.d,
+      backendEnv: this.backend(),
+      tz: this.opts.tz,
+      idleTimeoutMs: this.opts.idleTimeoutMs,
+      holdTimeoutMs: this.opts.holdTimeoutMs,
+    })
     this.gateways.push(this.tg)
     this.drv = new Driver(this.tg.client, { instructions: INSTRUCTIONS, tools: TOOLS, model: MODEL, mode: this.opts.mode ?? 'previous' })
   }
@@ -53,7 +73,13 @@ export class Run {
     this.tg.assertClean()
     if (kind === 'restart-lost-store') this.d = { stateDir: dirs(`${this.name}-fresh`).stateDir, workRoot: o.workRoot ?? this.d.workRoot }
     else if (o.workRoot) this.d = { ...this.d, workRoot: o.workRoot }
-    this.tg = await TestGateway.start({ dirs: this.d, backendEnv: this.backend(), tz: o.tz ?? this.opts.tz })
+    this.tg = await TestGateway.start({
+      dirs: this.d,
+      backendEnv: this.backend(),
+      tz: o.tz ?? this.opts.tz,
+      idleTimeoutMs: this.opts.idleTimeoutMs,
+      holdTimeoutMs: this.opts.holdTimeoutMs,
+    })
     this.gateways.push(this.tg)
     this.drv.client = this.tg.client
   }
@@ -73,7 +99,9 @@ export class Run {
     let r = await this.send([{ role: 'user', content: text }])
     while (r.status === 'completed' && this.drv.calls(r).length) {
       const outs: Json[] = []
-      for (const c of this.drv.calls(r)) outs.push({ type: 'function_call_output', call_id: c.call_id, output: (toolsImpl as Json)[c.name](JSON.parse(c.arguments)) })
+      for (const c of this.drv.calls(r)) {
+        outs.push({ type: 'function_call_output', call_id: c.call_id, output: (toolsImpl as Json)[c.name](JSON.parse(c.arguments)) })
+      }
       r = await this.send([...outs, ...notices.splice(0).map((n) => ({ role: 'user', content: n }))])
     }
     assertEquals(r.status, 'completed', JSON.stringify(r.response.error))
@@ -85,6 +113,18 @@ export class Run {
     const sessions = new Set(this.gateways.flatMap((g) => g.events('spawn').map((e) => e.data.session as string)))
     for (const sid of sessions) s = s.replaceAll(new RegExp(`/private/tmp/cc2r-test/[^/"]+/${sid}`, 'g'), '<WORK>')
     return s
+  }
+
+  /** Runs the test body; on failure the run is still torn down, without hiding the failure. */
+  async run(fn: () => Promise<void>, start = true): Promise<void> {
+    if (start) await this.start()
+    try {
+      await fn()
+    } catch (e) {
+      await this.close().catch((c) => console.error('teardown after a failure:', c))
+      throw e
+    }
+    await this.close()
   }
 
   async close(): Promise<void> {

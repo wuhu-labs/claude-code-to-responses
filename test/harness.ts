@@ -190,12 +190,13 @@ export function messagesOf(ex: Exchange): string[] {
   return (ex.body.messages as Json[]).map((m) => JSON.stringify(m))
 }
 
-/** Strips cache markers and folds a marked block list back to the string Claude Code sends unmarked. */
+/** Strips cache markers. Claude Code marks a string message by turning it into one text block, so a single
+ * text block and its string compare equal. */
 export function unmark(m: Json): Json {
   const c = structuredClone(m)
   if (Array.isArray(c.content)) {
     for (const b of c.content) delete b.cache_control
-    if (c.role === 'system' && c.content.length === 1 && c.content[0].type === 'text') c.content = c.content[0].text
+    if (c.content.length === 1 && c.content[0].type === 'text' && Object.keys(c.content[0]).length === 2) c.content = c.content[0].text
   }
   return c
 }

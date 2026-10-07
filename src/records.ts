@@ -92,10 +92,14 @@ function canonPart(p: Part): unknown {
 }
 export function canonItem(it: InItem): unknown | null {
   switch (it.kind) {
-    case 'message': return ['m', it.role, it.parts.map(canonPart)]
-    case 'function_call': return ['c', it.callId, it.name, it.arguments]
-    case 'function_call_output': return ['o', it.callId, it.parts.map(canonPart)]
-    case 'reasoning': return null
+    case 'message':
+      return ['m', it.role, it.parts.map(canonPart)]
+    case 'function_call':
+      return ['c', it.callId, it.name, it.arguments]
+    case 'function_call_output':
+      return ['o', it.callId, it.parts.map(canonPart)]
+    case 'reasoning':
+      return null
   }
 }
 

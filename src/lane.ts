@@ -31,7 +31,10 @@ export interface Head {
 export interface LaneEvents {
   /** The gateway's log of lifecycle events, for tests and diagnostics. */
   note(kind: string, data: Json): void
+  /** The lane stops serving requests (its process is being killed). */
   dead(lane: Lane): void
+  /** Its process has exited. */
+  gone(lane: Lane): void
 }
 
 interface BlockState {
@@ -135,13 +138,11 @@ export class Lane implements BridgeTarget {
       workDir: this.workDir,
       configDir: p.configDir,
       homeDir: p.homeDir,
-      tmpDir: p.tmpDir,
       tz: this.config.tz,
       settingsPath,
       mcpConfigPath,
       interruptedTurn: opts.interruptedTurn,
       backendEnv: this.config.backendEnv,
-      user: Deno.env.get('USER') ?? 'user',
     }
     this.bridge.register(this.epoch, this)
     const epoch = this.epoch
@@ -153,15 +154,28 @@ export class Lane implements BridgeTarget {
   private onExit(epoch: string, s: Deno.CommandStatus): void {
     if (this.epoch !== epoch || this.dead) return
     this.events.note('exit', { session: this.sessionId, code: s.code, signal: s.signal })
-    const err = serverError('claude_code_exited', `Claude Code exited (code ${s.code}${s.signal ? `, signal ${s.signal}` : ''}): ${this.proc?.stderr.slice(-1000) ?? ''}`)
+    const err = serverError(
+      'claude_code_exited',
+      `Claude Code exited (code ${s.code}${s.signal ? `, signal ${s.signal}` : ''}): ${this.proc?.stderr.slice(-1000) ?? ''}`,
+    )
     this.fail(err)
     void this.kill('exited')
   }
 
-  /** Kills the process. Held calls lose only the gateway's wait: the client's tools are the client's. */
-  async kill(reason: string): Promise<void> {
-    if (this.dead) return
-    this.dead = true
+  private killing: Promise<void> | null = null
+
+  /** Kills the process. Held calls lose only the gateway's wait: the client's tools are the client's.
+   * The lane leaves the gateway at once; the returned promise settles once the process is gone. */
+  kill(reason: string): Promise<void> {
+    if (!this.killing) {
+      this.dead = true
+      this.events.dead(this)
+      this.killing = this.teardown(reason)
+    }
+    return this.killing
+  }
+
+  private async teardown(reason: string): Promise<void> {
     clearTimeout(this.timer)
     this.bridge.unregister(this.epoch)
     for (const [, resolve] of this.held) resolve({ content: [{ type: 'text', text: 'gateway: process evicted' }], isError: true })
@@ -175,7 +189,7 @@ export class Lane implements BridgeTarget {
       Deno.removeSync(this.runDir, { recursive: true })
     } catch { /* gone */ }
     if (this.config.verifyLogs && this.head) this.verifyLog()
-    this.events.dead(this)
+    this.events.gone(this)
   }
 
   /** The log on disk must start with the stored chain of records, byte for byte. */
@@ -356,7 +370,9 @@ export class Lane implements BridgeTarget {
         void this.kill('unowned_inference')
         return
       }
-      if (a.msg && !a.msg.stopped) return this.fail(serverError('upstream_stream_cut', 'The model stream was cut short and Claude Code retried; the partial output cannot be withdrawn.'))
+      if (a.msg && !a.msg.stopped) {
+        return this.fail(serverError('upstream_stream_cut', 'The model stream was cut short and Claude Code retried; the partial output cannot be withdrawn.'))
+      }
       this.continuing = false
       const u = ev.message?.usage ?? {}
       a.msg = {
@@ -364,7 +380,12 @@ export class Lane implements BridgeTarget {
         blocks: new Map(),
         stopReason: null,
         stopped: false,
-        usage: { input: u.input_tokens ?? 0, cacheRead: u.cache_read_input_tokens ?? 0, cacheCreation: u.cache_creation_input_tokens ?? 0, output: u.output_tokens ?? 0 },
+        usage: {
+          input: u.input_tokens ?? 0,
+          cacheRead: u.cache_read_input_tokens ?? 0,
+          cacheCreation: u.cache_creation_input_tokens ?? 0,
+          output: u.output_tokens ?? 0,
+        },
       }
       return
     }
@@ -393,7 +414,12 @@ export class Lane implements BridgeTarget {
         msg.blocks.set(ev.index, { type: cb.type, outputIndex, item, buf: '', signature: '', done: false })
         sink.send('response.output_item.added', { output_index: outputIndex, item: structuredClone(item) })
         if (cb.type === 'text') {
-          sink.send('response.content_part.added', { item_id: item.id, output_index: outputIndex, content_index: 0, part: { type: 'output_text', text: '', annotations: [], logprobs: [] } })
+          sink.send('response.content_part.added', {
+            item_id: item.id,
+            output_index: outputIndex,
+            content_index: 0,
+            part: { type: 'output_text', text: '', annotations: [], logprobs: [] },
+          })
         }
         return
       }
@@ -540,7 +566,9 @@ export class Lane implements BridgeTarget {
 }
 
 export function contentFor(parts: Part[]): Json[] {
-  return parts.map((p) => p.type === 'text' ? { type: 'text', text: p.text } : { type: 'image', source: { type: 'base64', media_type: p.mediaType, data: p.data } })
+  return parts.map((p) =>
+    p.type === 'text' ? { type: 'text', text: p.text } : { type: 'image', source: { type: 'base64', media_type: p.mediaType, data: p.data } }
+  )
 }
 
 export function mcpResult(parts: Part[]): Json {

@@ -69,9 +69,12 @@ export class FakeAnthropic {
     const u = new URL(req.url)
     const headers: Record<string, string> = {}
     req.headers.forEach((v, k) => (headers[k] = v))
-    const kind: Exchange['kind'] = u.pathname.includes('count_tokens') ? 'count_tokens'
-      : !u.pathname.startsWith('/v1/messages') ? 'other'
-      : Array.isArray(body.system) && JSON.stringify(body.system).includes('Agent SDK') ? 'main'
+    const kind: Exchange['kind'] = u.pathname.includes('count_tokens')
+      ? 'count_tokens'
+      : !u.pathname.startsWith('/v1/messages')
+      ? 'other'
+      : Array.isArray(body.system) && JSON.stringify(body.system).includes('Agent SDK')
+      ? 'main'
       : 'side'
     const ex: Exchange = { n: this.exchanges.length + 1, path: u.pathname + u.search, kind, raw, body, headers }
     this.exchanges.push(ex)
@@ -97,7 +100,16 @@ export class FakeAnthropic {
       output_tokens: r.usage?.output_tokens ?? 20,
     }
     const stop = r.stop ?? (r.blocks.some((b) => b.type === 'tool_use') ? 'tool_use' : 'end_turn')
-    const message = { id: `msg_fake_${ex.n}`, type: 'message', role: 'assistant', model: body.model ?? 'fake', content: r.blocks, stop_reason: stop, stop_sequence: null, usage }
+    const message = {
+      id: `msg_fake_${ex.n}`,
+      type: 'message',
+      role: 'assistant',
+      model: body.model ?? 'fake',
+      content: r.blocks,
+      stop_reason: stop,
+      stop_sequence: null,
+      usage,
+    }
     if (!body.stream) return Response.json(message)
     const events = sseEvents(message)
     const gap = r.gapMs ?? 0
@@ -117,7 +129,9 @@ export class FakeAnthropic {
 
 export function sseEvents(message: Json): string[] {
   const ev = (name: string, data: Json) => `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`
-  const out = [ev('message_start', { type: 'message_start', message: { ...message, content: [], stop_reason: null, usage: { ...message.usage, output_tokens: 1 } } })]
+  const out = [
+    ev('message_start', { type: 'message_start', message: { ...message, content: [], stop_reason: null, usage: { ...message.usage, output_tokens: 1 } } }),
+  ]
   message.content.forEach((b: Block, index: number) => {
     let start: Json, deltas: Json[]
     if (b.type === 'text') {

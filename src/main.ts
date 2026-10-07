@@ -13,7 +13,11 @@ if (import.meta.main) {
     console.error(e instanceof ConfigError ? e.message : `startup failed: ${e instanceof Error ? e.message : e}`)
     Deno.exit(2)
   }
-  const server = Deno.serve({ hostname: config.hostname, port: config.port, onListen: ({ hostname, port }) => console.error(`listening on http://${hostname}:${port}`) }, handler(gw))
+  const server = Deno.serve({
+    hostname: config.hostname,
+    port: config.port,
+    onListen: ({ hostname, port }) => console.error(`listening on http://${hostname}:${port}`),
+  }, handler(gw))
   const stop = async () => {
     await gw.close()
     await server.shutdown()

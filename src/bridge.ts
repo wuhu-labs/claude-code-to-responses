@@ -63,7 +63,9 @@ export class Bridge {
     if (!target) {
       this.fenced.push({ epoch, kind, at: Date.now() })
       if (kind === 'hook') return Response.json({}, { status: 410 })
-      return Response.json({ jsonrpc: '2.0', id: body?.id ?? null, error: { code: -32001, message: 'stale Claude Code process: this epoch is gone' } }, { status: 410 })
+      return Response.json({ jsonrpc: '2.0', id: body?.id ?? null, error: { code: -32001, message: 'stale Claude Code process: this epoch is gone' } }, {
+        status: 410,
+      })
     }
     if (kind === 'hook') return Response.json(target.hook(body))
     if (body?.id === undefined || body?.id === null) return new Response(null, { status: 202 })
@@ -71,7 +73,11 @@ export class Bridge {
     const fail = (code: number, message: string) => Response.json({ jsonrpc: '2.0', id: body.id, error: { code, message } })
     switch (body.method) {
       case 'initialize':
-        return reply({ protocolVersion: body.params?.protocolVersion ?? '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'claude-code-to-responses', version: '1' } })
+        return reply({
+          protocolVersion: body.params?.protocolVersion ?? '2025-06-18',
+          capabilities: { tools: {} },
+          serverInfo: { name: 'claude-code-to-responses', version: '1' },
+        })
       case 'ping':
         return reply({})
       case 'tools/list':

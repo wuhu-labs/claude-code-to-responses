@@ -40,9 +40,16 @@ export class Gateway {
 
   static async start(config: Config): Promise<Gateway> {
     const p = paths(config)
-    const version = await claudeVersion(config.claudeBinary, { HOME: p.homeDir, CLAUDE_CONFIG_DIR: p.configDir, PATH: '/usr/bin:/bin', DISABLE_AUTOUPDATER: '1' })
+    const version = await claudeVersion(config.claudeBinary, {
+      HOME: p.homeDir,
+      CLAUDE_CONFIG_DIR: p.configDir,
+      PATH: '/usr/bin:/bin',
+      DISABLE_AUTOUPDATER: '1',
+    })
     if (version !== CLAUDE_CODE_VERSION) {
-      throw new Error(`Claude Code ${version} at ${config.claudeBinary} is not the measured version ${CLAUDE_CODE_VERSION}; run the probe against it before supporting it.`)
+      throw new Error(
+        `Claude Code ${version} at ${config.claudeBinary} is not the measured version ${CLAUDE_CODE_VERSION}; run the probe against it before supporting it.`,
+      )
     }
     return new Gateway(config)
   }
@@ -52,9 +59,12 @@ export class Gateway {
     if (this.events.length > 10000) this.events.splice(0, 1000)
   }
 
+  /** Every lane whose process may still be running, live or dying. */
+  private processes = new Set<Lane>()
+
   async close(): Promise<void> {
     this.closed = true
-    await Promise.all([...this.lanes.values()].map((l) => l.kill('gateway_shutdown')))
+    await Promise.all([...this.processes].map((l) => l.kill('gateway_shutdown')))
     await this.bridge.close()
   }
 
@@ -63,6 +73,14 @@ export class Gateway {
     dead: (lane: Lane) => {
       if (this.lanes.get(lane.sessionId) === lane) this.lanes.delete(lane.sessionId)
     },
+    gone: (lane: Lane) => {
+      this.processes.delete(lane)
+    },
+  }
+
+  private addLane(lane: Lane): void {
+    this.lanes.set(lane.sessionId, lane)
+    this.processes.add(lane)
   }
 
   private workDir(sessionId: string): string {
@@ -113,8 +131,10 @@ export class Gateway {
   private async fromPrevious(req: NormRequest, chain: ChainSpec, state: ResponseState) {
     const prev = req.previousResponseId!
     const rec = this.store.get(prev)
-    if (!rec) throw previousResponseNotFound(prev, 'it is not in this gateway\'s store')
-    if (rec.chain !== chain.key) throw previousResponseNotFound(prev, 'instructions, tools, model or reasoning effort changed, which starts a new Claude Code session')
+    if (!rec) throw previousResponseNotFound(prev, "it is not in this gateway's store")
+    if (rec.chain !== chain.key) {
+      throw previousResponseNotFound(prev, 'instructions, tools, model or reasoning effort changed, which starts a new Claude Code session')
+    }
     const head: Head = { responseId: rec.id, end: rec.end, calls: rec.calls }
     const delivery = deliveryFor(head, req.input)
     let lane = this.lanes.get(rec.session)
@@ -127,7 +147,7 @@ export class Gateway {
     const records = this.store.chain(prev)
     if (!records) throw previousResponseNotFound(prev, 'its chain is incomplete in the store')
     lane = new Lane(rec.session, this.workDir(rec.session), chain, head, this.config, this.bridge, this.store, this.laneEvents)
-    this.lanes.set(rec.session, lane)
+    this.addLane(lane)
     const log = records.flatMap((r) => r.entries)
     const spawn = this.resumePlan(lane, log, head, delivery)
     state.gateway = { path: 'store', session: rec.session, records: records.length, resume: spawn.interruptedTurn ? 'interrupted_turn' : 'stdin' }
@@ -159,7 +179,7 @@ export class Gateway {
       const sessionId = crypto.randomUUID()
       const delivery = deliveryFor(null, tail)
       const lane = new Lane(sessionId, this.workDir(sessionId), chain, null, this.config, this.bridge, this.store, this.laneEvents)
-      this.lanes.set(sessionId, lane)
+      this.addLane(lane)
       state.gateway = { path: 'new', session: sessionId }
       return { lane, delivery, prevId: null, covered: tail, spawn: { resume: false, interruptedTurn: false } }
     }
@@ -172,7 +192,9 @@ export class Gateway {
     for (let gi = 0; gi < groups.length; gi++) {
       const g = groups[gi]
       pendingGroups.push(g)
-      const recs = (await Promise.all(g.outputs.filter((i) => i.kind === 'reasoning' && i.encrypted).map((i) => decodeRecord((i as { encrypted: string }).encrypted)))).filter((r) => r !== null)
+      const recs = (await Promise.all(
+        g.outputs.filter((i) => i.kind === 'reasoning' && i.encrypted).map((i) => decodeRecord((i as { encrypted: string }).encrypted)),
+      )).filter((r) => r !== null)
       if (recs.length === 0) continue
       const r = recs[recs.length - 1]!
       const fits = recs.length === 1 && r.chain === chain.key && r.prev === headId && (session === null || r.session === session) &&
@@ -202,9 +224,13 @@ export class Gateway {
       let calls: { id: string; name: string }[] = lastUsed?.end === 'calls' ? lastUsed.calls : []
       for (let i = 0; i < synth.length; i++) {
         const g = synth[i]
-        const d = i === 0 && used.length === 0 ? deliveryFor(null, g.inputs) : deliveryFor({ responseId: '', end: calls.length ? 'calls' : 'turn', calls }, g.inputs)
+        const d = i === 0 && used.length === 0
+          ? deliveryFor(null, g.inputs)
+          : deliveryFor({ responseId: '', end: calls.length ? 'calls' : 'turn', calls }, g.inputs)
         if (d.kind === 'turn') {
           extra.push(JSON.stringify(userMessageEntry(ctx, d.parts)))
+          // a fresh session logs this latch after its first message; a resumed one missing it writes it outside the mirror
+          if (i === 0 && used.length === 0) extra.push(JSON.stringify({ type: 'atis-latch', atis: '', sessionId }))
         } else {
           const all = [...log, ...extra]
           for (const c of calls) extra.push(JSON.stringify(toolResultEntry(ctx, c.id, d.outputs.get(c.id)!, assistantUuidFor(all, c.id))))
@@ -220,8 +246,17 @@ export class Gateway {
       head = { responseId: last.id, end: last.end, calls: last.calls }
     }
     const delivery = deliveryFor(head, tail)
-    const lane = new Lane(sessionId, workDir, chain, used.length ? { responseId: headId!, end: used[used.length - 1].end, calls: used[used.length - 1].calls } : null, this.config, this.bridge, this.store, this.laneEvents)
-    this.lanes.set(sessionId, lane)
+    const lane = new Lane(
+      sessionId,
+      workDir,
+      chain,
+      used.length ? { responseId: headId!, end: used[used.length - 1].end, calls: used[used.length - 1].calls } : null,
+      this.config,
+      this.bridge,
+      this.store,
+      this.laneEvents,
+    )
+    this.addLane(lane)
     const covered = [...synth.flatMap((g) => [...g.inputs, ...g.outputs]), ...tail]
     let spawn
     if (delivery.kind === 'turn') {
@@ -293,11 +328,17 @@ function deliveryFor(head: Head | null, input: InItem[]): Delivery {
       if (!want.has(it.callId)) throw invalid(`input[${i}].call_id`, `No tool call '${it.callId}' is waiting for output.`, 'unexpected_tool_output')
       if (outputs.has(it.callId)) throw invalid(`input[${i}].call_id`, `Duplicate output for '${it.callId}'.`)
       if (outputChars(it.parts) > MAX_RESULT_CHARS) {
-        throw invalid(`input[${i}].output`, `Tool output exceeds ${MAX_RESULT_CHARS} characters; Claude Code would move it out to a file.`, 'tool_output_too_large')
+        throw invalid(
+          `input[${i}].output`,
+          `Tool output exceeds ${MAX_RESULT_CHARS} characters; Claude Code would move it out to a file.`,
+          'tool_output_too_large',
+        )
       }
       outputs.set(it.callId, it.parts)
     } else if (it.kind === 'message' && it.role === 'user') {
-      if (it.parts.some((p) => p.type !== 'text')) throw unsupported(`input[${i}].content`, 'Notices sent with tool outputs carry text only (they go in through a hook).')
+      if (it.parts.some((p) => p.type !== 'text')) {
+        throw unsupported(`input[${i}].content`, 'Notices sent with tool outputs carry text only (they go in through a hook).')
+      }
       notices.push(it.parts.map((p) => (p as { text: string }).text).join('\n'))
     } else {
       throw invalid(`input[${i}]`, 'New input must be tool outputs and user messages here.')

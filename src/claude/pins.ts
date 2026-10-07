@@ -34,7 +34,6 @@ export interface LaunchSpec {
   workDir: string
   configDir: string
   homeDir: string
-  tmpDir: string
   tz: string
   settingsPath: string
   mcpConfigPath: string
@@ -42,27 +41,37 @@ export interface LaunchSpec {
   interruptedTurn: boolean
   /** Backend variables handed through from the gateway's own environment (base URL, credentials). */
   backendEnv: Record<string, string>
-  user: string
 }
 
 export function launchArgs(s: LaunchSpec): string[] {
   return [
     '-p',
-    '--input-format', 'stream-json',
-    '--output-format', 'stream-json',
+    '--input-format',
+    'stream-json',
+    '--output-format',
+    'stream-json',
     '--verbose',
     '--session-mirror',
     '--include-partial-messages',
-    '--model', s.model,
-    '--effort', s.effort,
-    '--tools', '',
-    '--permission-mode', 'dontAsk',
-    '--setting-sources', '',
-    '--settings', s.settingsPath,
+    '--model',
+    s.model,
+    '--effort',
+    s.effort,
+    '--tools',
+    '',
+    '--permission-mode',
+    'dontAsk',
+    '--setting-sources',
+    '',
+    '--settings',
+    s.settingsPath,
     '--strict-mcp-config',
-    '--mcp-config', s.mcpConfigPath,
-    '--system-prompt', s.instructions,
-    s.resume ? '--resume' : '--session-id', s.sessionId,
+    '--mcp-config',
+    s.mcpConfigPath,
+    '--system-prompt',
+    s.instructions,
+    s.resume ? '--resume' : '--session-id',
+    s.sessionId,
   ]
 }
 
@@ -70,11 +79,8 @@ export function launchEnv(s: LaunchSpec): Record<string, string> {
   return {
     HOME: s.homeDir,
     CLAUDE_CONFIG_DIR: s.configDir,
-    TMPDIR: s.tmpDir,
     TZ: s.tz,
     PATH: '/usr/bin:/bin',
-    LANG: 'en_US.UTF-8',
-    USER: s.user,
     DISABLE_AUTOUPDATER: '1',
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
     ENABLE_TOOL_SEARCH: 'false',

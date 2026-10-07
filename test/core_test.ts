@@ -13,10 +13,12 @@ function recordOf(r: { response: Json }) {
 
 Deno.test('parallel calls are held until the outputs come, in any order; the response ends at message_stop', async () => {
   const run = new Run('parallel', false)
-  await run.start()
-  try {
+  await run.run(async () => {
     // the fake streams 400 ms between blocks: Claude Code calls the first tool long before the message ends
-    run.fake.reply({ blocks: [think('plan'), call('toolu_a', 'echo', { text: 'a' }), call('toolu_b', 'read', { name: 'b' }), call('toolu_c', 'echo', { text: 'c' })], gapMs: 400 })
+    run.fake.reply({
+      blocks: [think('plan'), call('toolu_a', 'echo', { text: 'a' }), call('toolu_b', 'read', { name: 'b' }), call('toolu_c', 'echo', { text: 'c' })],
+      gapMs: 400,
+    })
     const r1 = await run.send([user('do three things')])
     assertEquals(r1.status, 'completed')
     const calls = run.drv.calls(r1)
@@ -49,15 +51,12 @@ Deno.test('parallel calls are held until the outputs come, in any order; the res
     assertEquals(run.tg.events('notice').map((n) => n.data.via), ['PostToolUse'])
     assertEquals(run.tg.events('notice')[0].data.call, 'toolu_c')
     assertEquals(run.fake.main().length, 2, 'exactly one model request per tool round')
-  } finally {
-    await run.close()
-  }
+  })
 })
 
 Deno.test('usage maps cache reads into cached_tokens and keeps the raw numbers', async () => {
   const run = new Run('usage', false)
-  await run.start()
-  try {
+  await run.run(async () => {
     run.fake.reply({ blocks: [text('hi')], usage: { input_tokens: 7, cache_read_input_tokens: 1000, cache_creation_input_tokens: 50, output_tokens: 3 } })
     const r = await run.send([user('hello')])
     assertEquals(r.response.usage.input_tokens, 1057)
@@ -67,20 +66,26 @@ Deno.test('usage maps cache reads into cached_tokens and keeps the raw numbers',
     // the standard event sequence of a text response
     const types = r.events.map((e) => e.type)
     assertEquals(types.slice(0, 2), ['response.created', 'response.in_progress'])
-    for (const t of ['response.output_item.added', 'response.content_part.added', 'response.output_text.delta', 'response.output_text.done', 'response.content_part.done', 'response.output_item.done']) {
+    for (
+      const t of [
+        'response.output_item.added',
+        'response.content_part.added',
+        'response.output_text.delta',
+        'response.output_text.done',
+        'response.content_part.done',
+        'response.output_item.done',
+      ]
+    ) {
       assert(types.includes(t), t)
     }
     assertEquals(types.at(-1), 'response.completed')
     assertEquals(r.events.map((e) => e.sequence_number), r.events.map((_, i) => i))
-  } finally {
-    await run.close()
-  }
+  })
 })
 
 Deno.test('a provider record is every log entry since the previous response, verbatim', async () => {
   const run = new Run('records', false)
-  await run.start()
-  try {
+  await run.run(async () => {
     run.fake.reply({ blocks: [text('one')] })
     const r1 = await run.send([user('first')])
     run.fake.reply({ blocks: [call('toolu_r', 'echo', { text: 'x' })] }, { blocks: [text('two')] })
@@ -94,9 +99,7 @@ Deno.test('a provider record is every log entry since the previous response, ver
     assertEquals(disk.slice(0, joined.length), joined)
     // the store holds the same records
     for (const r of recs) assertEquals(run.tg.gw.store.get(r!.id), r)
-  } finally {
-    await run.close()
-  }
+  })
   assert(run.tg.events('verify_ok').length > 0)
 })
 
@@ -147,15 +150,8 @@ Deno.test('kill/resume and gateway restarts: every request is byte-identical to 
 })
 
 Deno.test('idle timeout kills the process and the next request rebuilds it', async () => {
-  const run = new Run('idle-timer', false)
-  run.tg = undefined as never
-  const { TestGateway } = await import('./harness.ts')
-  run.tg = await TestGateway.start({ dirs: run.d, backendEnv: run.backend(), idleTimeoutMs: 300 })
-  run.gateways.push(run.tg)
-  const { Driver } = await import('./harness.ts')
-  const { INSTRUCTIONS, MODEL, TOOLS } = await import('./scenario.ts')
-  run.drv = new Driver(run.tg.client, { instructions: INSTRUCTIONS, tools: TOOLS, model: MODEL, mode: 'previous' })
-  try {
+  const run = new Run('idle-timer', false, { idleTimeoutMs: 300 })
+  await run.run(async () => {
     run.fake.reply({ blocks: [text('first')] })
     await run.turn('one')
     const killed = await run.tg.waitEvent('kill', (d) => d.reason === 'idle_timeout', 5000)
@@ -167,7 +163,5 @@ Deno.test('idle timeout kills the process and the next request rebuilds it', asy
     const [x, y] = run.fake.main()
     assertPrefix(x, y)
     assertStringIncludes(JSON.stringify(y.body.messages.at(-1)), 'two')
-  } finally {
-    await run.close()
-  }
+  })
 })
