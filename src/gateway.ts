@@ -475,7 +475,9 @@ function deliveryFor(head: Head | null, input: InItem[]): Delivery {
       if (it.parts.some((p) => p.type !== 'text')) {
         throw unsupported(`input[${i}].content`, 'Notices sent with tool outputs carry text only (they go in through a hook).')
       }
-      notices.push(it.parts.map((p) => (p as { text: string }).text).join('\n'))
+      // a blank notice (empty content, or only whitespace) carries nothing: it is treated as absent
+      const text = it.parts.map((p) => (p as { text: string }).text).join('\n')
+      if (text.trim() !== '') notices.push(text)
     } else {
       throw invalid(`input[${i}]`, 'New input must be tool outputs and user messages here.')
     }

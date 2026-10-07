@@ -2,6 +2,7 @@
 import { assert, assertEquals, assertRejects, assertStringIncludes, assertThrows } from '@std/assert'
 import { decodeRecord, encodeRecord } from '../src/records.ts'
 import { parseRequest } from '../src/api/request.ts'
+import { RESUME_LINE } from '../src/claude/pins.ts'
 import { call, type Json, text, think } from './fake.ts'
 import { assertPrefix, freePort, output, user } from './harness.ts'
 import { INSTRUCTIONS, MODEL, Run, TOOLS } from './scenario.ts'
@@ -547,3 +548,26 @@ Deno.test('a completed call keeps its real output in a rebuilt history, even whe
     assert(!sent.includes('No such tool available'))
   })
 })
+
+for (const evict of [false, true]) {
+  Deno.test(`blank notices are treated as absent (${evict ? 'after a hold eviction: the fixed resume line' : 'live: no hook context'})`, async () => {
+    const run = new Run(`blank-notice-${evict ? 'evicted' : 'live'}`, false)
+    await run.run(async () => {
+      run.fake.reply({ blocks: [call('toolu_b', 'echo', { text: 'b' })] }, { blocks: [text('done')] })
+      await run.send([user('go')])
+      await run.tg.waitEvent('hold')
+      if (evict) await run.disrupt('hold')
+      const r = await run.send([output('toolu_b', 'B'), { role: 'user', content: '' }, { role: 'user', content: [] }, { role: 'user', content: '  \n ' }])
+      assertEquals(r.status, 'completed')
+      assertEquals(run.tg.events('notice').length, 0)
+      const last = run.fake.main()[1].body.messages.at(-1)
+      if (evict) {
+        assertEquals(last.content.map((b: Json) => b.type), ['tool_result', 'text'])
+        assertEquals(last.content[1].text, RESUME_LINE)
+      } else {
+        assertEquals(last.role, 'user')
+        assertEquals(last.content.map((b: Json) => b.type), ['tool_result'])
+      }
+    })
+  })
+}

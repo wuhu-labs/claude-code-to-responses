@@ -90,8 +90,9 @@ call is held, keyed by its `claudecode/toolUseId`. The response ends at the mode
 `function_call` in it, never at the first MCP call. The next request's `function_call_output` items release the held
 calls by id, in whatever order Claude Code makes them.
 
-**Notices.** `message` items sent alongside outputs are notices. They are staged before any result is released and go
-in through the PostToolUse hook of the response's last call. If that hook never runs (Claude Code answered the call
+**Notices.** `message` items sent alongside outputs are notices (text only; a blank one, empty or whitespace, is
+treated as absent). They are staged before any result is released and go in through the PostToolUse hook of the
+response's last call. If that hook never runs (Claude Code answered the call
 itself, e.g. an unknown tool), they go in at the end-of-turn Stop hook, and the inference that follows is part of the
 same response. With no held calls, new `message` items go in through stdin as one user turn.
 
