@@ -44,12 +44,16 @@ reads `~/.claude`.
 
 - `POST /v1/responses` with `stream: true`. Accepted: `model`, `instructions` (required), `tools` (function tools),
   `input` (a string, or `message`, `function_call`, `function_call_output` and `reasoning` items), `previous_response_id`,
-  `reasoning.effort` (`low`, `medium`, `high`, `xhigh`, `max`; default `high`), `metadata`, and the neutral values of
-  `store`, `tool_choice` (`auto`), `parallel_tool_calls`, `truncation`, `text`, `include` (`reasoning.encrypted_content`),
+  `reasoning.effort` (`low`, `medium`, `high`, `xhigh`, `max`; default `high`), `metadata`, `store` (boolean), and the neutral values of
+  `tool_choice` (`auto`), `parallel_tool_calls`, `truncation`, `text`, `include` (`reasoning.encrypted_content`),
   `service_tier`, `user`, `prompt_cache_key`, `safety_identifier`.
 - Anything else is a `400` with `code: unsupported` and the offending `param`: other tool types, `strict: true`,
-  `store: false`, `background`, `max_output_tokens`, `temperature`, `top_p`, non-text output formats, `system` or
+  `background`, `max_output_tokens`, `temperature`, `top_p`, non-text output formats, `system` or
   `developer` messages, item references, images outside base64 data URLs or formats other than PNG, JPEG, GIF and WebP.
+- `store: false`, `store: true` and absent `store` are all accepted on both HTTP and WebSocket. `store` does not
+  change the gateway's retention: every response's provider records are retained for continuation and rebuilds,
+  so `previous_response_id` keeps working after a reconnect. The response object reports `store: true`, reflecting
+  that actual retention. Any non-boolean value (including `null`) is a typed `400 invalid_request` with `param: store`.
 - `POST /v1/responses/{id}/cancel` cancels a response in progress and returns it. An id the gateway never saw is a
   `404 not_found`; a response that is no longer streaming is a `409 response_not_in_progress`. A cancelled response
   ends with `response.failed`, status `cancelled`, code `cancelled`, and is not a continuation point: the client goes
@@ -134,8 +138,9 @@ same WebSocket.
 
 HTTP and WebSocket use **one durable response store and one set of Claude Code chains**. A response created over
 either transport can be continued over the other, or over a new connection, with the same eviction/rebuild and
-provider-record behavior. Unlike OpenAI's connection-local `store: false` mode, every response here is stored;
-`store: false` remains unsupported. Named lanes, concurrent responses on one socket, warm-up/steering, OpenAI's
+provider-record behavior. Unlike OpenAI's connection-local `store: false` mode, every response here is retained
+regardless of `store: false`, `store: true` or an absent `store`: the flag does not change gateway retention.
+Named lanes, concurrent responses on one socket, warm-up/steering, OpenAI's
 60-minute connection expiry and its full Responses feature set are not implemented.
 
 Closing or losing a socket **mid-response** cancels that response and kills its process, just like the HTTP cancel

@@ -70,7 +70,7 @@ Deno.test('WebSocket misuse is typed, has no fallback, and a recoverable error p
         [JSON.stringify({ type: 'response.create', ...base, input: 'x', stream: false }), 'unsupported', 'stream'],
         [JSON.stringify({ type: 'response.create', ...base, input: 'x', stream_id: 'lane' }), 'unsupported', 'stream_id'],
         [JSON.stringify({ type: 'response.create', ...base, input: 'x', generate: false }), 'unsupported', 'generate'],
-        [JSON.stringify({ type: 'response.create', ...base, input: 'x', store: false }), 'unsupported', 'store'],
+        [JSON.stringify({ type: 'response.create', ...base, input: 'x', store: 'false' }), 'invalid_request', 'store'],
         [
           JSON.stringify({ type: 'response.create', ...base, input: 'x', previous_response_id: 'resp_missing' }),
           'previous_response_not_found',
@@ -413,6 +413,76 @@ Deno.test('WebSocket an oversized initial response event does not launch Claude 
     assertEquals(event.error.code, 'websocket_message_too_large')
     await ws.closed
     await run.tg.waitEvent('kill')
+    assertEquals(run.tg.events('spawn').length, 0)
+    assertEquals(run.fake.main().length, 0)
+  })
+})
+
+Deno.test('WebSocket store:false retains a chain on the same socket, after reconnect and eviction, and over HTTP', async () => {
+  const run = new Run('ws-store-false', false)
+  await run.run(async () => {
+    const ws = run.tg.websocket()
+    run.fake.reply({ blocks: [call('toolu_store_a', 'echo', { text: 'a' })] })
+    const first = await ws.send({ ...base, store: false, input: 'first' })
+    run.fake.reply({ blocks: [text('same socket')] })
+    const second = await ws.send({ ...base, store: false, previous_response_id: first.response.id, input: [output('toolu_store_a', 'A')] })
+    assertEquals(second.response.x_gateway.path, 'live')
+    await ws.close()
+    await run.tg.evictAll()
+    const reconnect = run.tg.websocket()
+    run.fake.reply({ blocks: [call('toolu_store_b', 'echo', { text: 'b' })] })
+    const third = await reconnect.send({ ...base, store: false, previous_response_id: second.response.id, input: 'after reconnect' })
+    assertEquals(third.response.x_gateway.path, 'store')
+    run.fake.reply({ blocks: [text('HTTP continued')] })
+    const fourth = await send(run.tg.client, { ...base, store: false, previous_response_id: third.response.id, input: [output('toolu_store_b', 'B')] })
+    assertEquals(fourth.response.x_gateway.path, 'live')
+    for (const result of [first, second, third, fourth]) {
+      assertEquals(result.status, 'completed')
+      assertEquals(result.response.store, true, 'response reports actual gateway retention')
+      assertEquals(run.tg.gw.store.has(result.response.id), true)
+    }
+    assertEquals(run.tg.gw.store.chain(fourth.response.id)!.map((r) => r.id), [first, second, third, fourth].map((r) => r.response.id))
+    const requests = run.fake.main()
+    for (let i = 1; i < requests.length; i++) assertPrefix(requests[i - 1], requests[i])
+  })
+})
+
+Deno.test('HTTP store:false, store:true and absent store accept requests without changing chain retention', async () => {
+  const run = new Run('http-store-flags', false)
+  await run.run(async () => {
+    let previous: string | null = null
+    for (const flag of [{ store: false }, { store: true }, {}]) {
+      run.fake.reply({ blocks: [text('retained')] })
+      const result = await send(run.tg.client, { ...base, ...flag, ...(previous ? { previous_response_id: previous } : {}), input: 'continue' })
+      assertEquals(result.status, 'completed')
+      assertEquals(result.response.store, true)
+      assertEquals(run.tg.gw.store.has(result.response.id), true)
+      assertEquals(result.response.x_gateway.path, previous ? 'store' : 'new')
+      previous = result.response.id
+      await run.tg.evictAll()
+    }
+    assertEquals(run.tg.gw.store.chain(previous!)!.length, 3)
+  })
+})
+
+Deno.test('store rejects all non-boolean values with typed 400 on HTTP and WebSocket', async () => {
+  const run = new Run('store-types', false)
+  await run.run(async () => {
+    const ws = run.tg.websocket()
+    await ws.opened
+    for (const store of [null, 'false', 'true', 0, 1, [], {}]) {
+      const body = { ...base, input: 'never run', store }
+      const http = await fetch(`${run.tg.url}/v1/responses`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ...body, stream: true }),
+      })
+      const error = await http.json()
+      assertEquals([http.status, error.error.code, error.error.param], [400, 'invalid_request', 'store'])
+      create(ws, body)
+      const event = await ws.next()
+      assertEquals([event.type, event.status, event.error.code, event.error.param], ['error', 400, 'invalid_request', 'store'])
+    }
     assertEquals(run.tg.events('spawn').length, 0)
     assertEquals(run.fake.main().length, 0)
   })

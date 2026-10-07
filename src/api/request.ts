@@ -73,8 +73,10 @@ export function parseRequest(body: unknown, transport: 'sse' | 'websocket' = 'ss
   if (body.background !== undefined && body.background !== false && body.background !== null) {
     throw unsupported('background', 'Background mode is not supported.')
   }
-  if (body.store !== undefined && body.store !== true && body.store !== null) {
-    throw unsupported('store', "'store: false' is not supported: every response is stored so it can be continued.")
+  // `store` is a client compatibility field, not a retention switch. Durable gateway records always
+  // survive transport changes/reconnects, regardless of the accepted boolean (or its absence).
+  if (body.store !== undefined && typeof body.store !== 'boolean') {
+    throw invalid('store', "'store' must be a boolean when present; it does not change gateway retention.")
   }
   for (const k of ['max_output_tokens', 'temperature', 'top_p']) {
     if (body[k] !== undefined && body[k] !== null) throw unsupported(k, `'${k}' is not supported: Claude Code sets it.`)

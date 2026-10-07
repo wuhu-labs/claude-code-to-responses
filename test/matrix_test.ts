@@ -283,7 +283,7 @@ scenarioTest('typed errors: the subset, unknown ids, wrong outputs, a busy chain
   }
   await run.run(async () => {
     await expect({ ...base, input: 'x' }, 400, 'unsupported') // stream missing
-    await expect({ ...base, input: 'x', stream: true, store: false }, 400, 'unsupported')
+    await expect({ ...base, input: 'x', stream: true, store: 'false' }, 400, 'invalid_request')
     await expect({ ...base, input: 'x', stream: true, background: true }, 400, 'unsupported')
     await expect({ ...base, input: 'x', stream: true, tools: [{ type: 'web_search' }] }, 400, 'unsupported')
     await expect({ ...base, input: 'x', stream: true, tool_choice: 'required' }, 400, 'unsupported')
