@@ -72,6 +72,7 @@ export class Gateway {
     note: (kind: string, data: Json) => this.note(kind, data),
     dead: (lane: Lane) => {
       if (this.lanes.get(lane.sessionId) === lane) this.lanes.delete(lane.sessionId)
+      this.dying.set(lane.sessionId, lane.gone)
     },
     gone: (lane: Lane) => {
       this.processes.delete(lane)
@@ -138,6 +139,13 @@ export class Gateway {
   }
 
   private reserved = new Set<string>()
+  /** Lanes being killed, by session: a rebuild waits for its predecessor's tail to be stored. */
+  private dying = new Map<string, Promise<void>>()
+
+  private async settled(session: string): Promise<void> {
+    const d = this.dying.get(session)
+    if (d) await d
+  }
 
   /** Takes the chain for this request, synchronously: busy if a response is streaming or another request holds it. */
   private reserve(session: string, r: Reservation): void {
@@ -164,11 +172,13 @@ export class Gateway {
       return { lane, delivery, prevId: prev, covered: req.input, spawn: null }
     }
     if (lane) await lane.kill('superseded')
+    await this.settled(rec.session)
     const records = this.store.chain(prev)
     if (!records) throw previousResponseNotFound(prev, 'its chain is incomplete in the store')
     lane = new Lane(rec.session, this.workDir(rec.session), chain, head, this.config, this.bridge, this.store, this.laneEvents)
     this.addLane(lane)
     const log = records.flatMap((r) => r.entries)
+    lane.pending = this.store.tail(prev)
     const spawn = this.resumePlan(lane, log, head, delivery)
     state.gateway = { path: 'store', session: rec.session, records: records.length, resume: spawn.interruptedTurn ? 'interrupted_turn' : 'stdin' }
     return { lane, delivery: spawn.interruptedTurn ? null : delivery, prevId: prev, covered: req.input, spawn }
@@ -176,11 +186,10 @@ export class Gateway {
 
   /** The resume launch, with the interrupted-turn entries appended when the log stops at held calls. */
   private resumePlan(lane: Lane, log: string[], head: Head, delivery: Delivery) {
-    if (delivery.kind === 'turn') return { resume: true, interruptedTurn: false, log }
-    const ctx = contextOf(log, lane.sessionId, lane.workDir)
-    const extra = this.interruptedEntries(ctx, log, head, delivery)
-    lane.pending = extra
-    return { resume: true, interruptedTurn: true, log: [...log, ...extra] }
+    if (delivery.kind === 'turn') return { resume: true, interruptedTurn: false, log, attempt: [] }
+    const before = [...log, ...lane.pending]
+    const attempt = this.interruptedEntries(contextOf(before, lane.sessionId, lane.workDir), before, head, delivery)
+    return { resume: true, interruptedTurn: true, log, attempt }
   }
 
   /** The tool results plus one user text: the notices that came with the outputs, else a fixed line. */
@@ -233,11 +242,14 @@ export class Gateway {
     this.reserve(sessionId, reservation)
     const existing = this.lanes.get(sessionId)
     if (existing) await existing.kill('superseded')
+    await this.settled(sessionId)
     for (const r of used) if (!this.store.has(r.id)) this.store.put(r)
 
+    // the records, then what Claude Code wrote after the last of them (if this gateway kept it)
     const log = used.flatMap((r) => r.entries)
+    const tailLines = headId ? this.store.tail(headId) : []
     const workDir = this.workDir(sessionId)
-    const ctx = contextOf(log, sessionId, workDir)
+    const ctx = contextOf([...log, ...tailLines], sessionId, workDir)
     const extra: string[] = []
     let head: Head
     if (synth.length) {
@@ -253,7 +265,7 @@ export class Gateway {
           // a fresh session logs this latch after its first message; a resumed one missing it writes it outside the mirror
           if (i === 0 && used.length === 0) extra.push(JSON.stringify({ type: 'atis-latch', atis: '', sessionId }))
         } else {
-          const all = [...log, ...extra]
+          const all = [...log, ...tailLines, ...extra]
           for (const c of calls) extra.push(JSON.stringify(toolResultEntry(ctx, c.id, d.outputs.get(c.id)!, assistantUuidFor(all, c.id))))
           if (d.notices !== null) extra.push(JSON.stringify(userTextEntry(ctx, d.notices)))
         }
@@ -279,15 +291,14 @@ export class Gateway {
     )
     this.addLane(lane)
     const covered = [...synth.flatMap((g) => [...g.inputs, ...g.outputs]), ...tail]
+    lane.pending = tailLines
     let spawn
     if (delivery.kind === 'turn') {
-      lane.pending = extra
-      spawn = { resume: true, interruptedTurn: false, log: [...log, ...extra] }
+      spawn = { resume: true, interruptedTurn: false, log, attempt: extra }
     } else {
-      const all = [...log, ...extra]
+      const all = [...log, ...tailLines, ...extra]
       const r7 = this.interruptedEntries(contextOf(all, sessionId, workDir), all, head, delivery)
-      lane.pending = [...extra, ...r7]
-      spawn = { resume: true, interruptedTurn: true, log: [...all, ...r7] }
+      spawn = { resume: true, interruptedTurn: true, log, attempt: [...extra, ...r7] }
     }
     state.gateway = {
       path: 'history',
@@ -309,7 +320,7 @@ interface Plan {
   delivery: Delivery | null
   prevId: string | null
   covered: InItem[]
-  spawn: { resume: boolean; interruptedTurn: boolean; log?: string[] } | null
+  spawn: { resume: boolean; interruptedTurn: boolean; log?: string[]; attempt?: string[] } | null
 }
 
 interface Group {

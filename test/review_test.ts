@@ -1,8 +1,9 @@
 // Regression tests for the M1 review findings.
 import { assert, assertEquals, assertRejects, assertThrows } from '@std/assert'
 import { decodeRecord, encodeRecord } from '../src/records.ts'
+import { parseRequest } from '../src/api/request.ts'
 import { call, type Json, text } from './fake.ts'
-import { freePort, user } from './harness.ts'
+import { assertPrefix, freePort, user } from './harness.ts'
 import { INSTRUCTIONS, MODEL, Run, TOOLS } from './scenario.ts'
 
 /** Posts a request; an event stream is read to its end (dropping it would cancel the response). */
@@ -99,7 +100,6 @@ Deno.test('a killed lane answers late MCP calls and hooks as stale, without touc
 })
 
 Deno.test('two simultaneous continuations of one chain: one runs, the other is conversation_busy, no process is lost', async () => {
-  const { parseRequest } = await import('../src/api/request.ts')
   const { GatewayError } = await import('../src/errors.ts')
   const run = new Run('concurrent', false)
   await run.run(async () => {
@@ -127,5 +127,50 @@ Deno.test('two simultaneous continuations of one chain: one runs, the other is c
       assertEquals(run.tg.events('spawn').length, 2)
       run.drv.prevId = run.tg.events('completed').at(-1)!.data.response
     }
+  })
+})
+
+Deno.test('what Claude Code writes after a response is kept as its tail and carried into the next record', async () => {
+  const run = new Run('tail', false)
+  await run.run(async () => {
+    run.fake.reply({ blocks: [text('one')] })
+    const r1 = await run.turn('one')
+    const lane = [...run.tg.gw.lanes.values()][0]
+    // an entry logged after the response completed (Claude Code's session metadata does this)
+    const extra = JSON.stringify({ type: 'custom-title', customTitle: 'tail test', sessionId: lane.sessionId })
+    Deno.writeTextFileSync(lane.logFile, extra + '\n', { append: true })
+    await run.disrupt('idle')
+    assertEquals(run.tg.gw.store.tail(r1.response.id), [extra])
+    run.fake.reply({ blocks: [text('two')] })
+    const r2 = await run.turn('two')
+    assertEquals(r2.response.x_gateway.path, 'store')
+    const rec2 = (await decodeRecord(r2.response.output.at(-1).encrypted_content))!
+    assertEquals(rec2.entries[0], extra)
+    const [q1, q2] = run.fake.main()
+    assertPrefix(q1, q2)
+    // the full log is the records, the tail included
+    const lane2 = [...run.tg.gw.lanes.values()][0]
+    await lane2.kill('test')
+    const rec1 = (await decodeRecord(r1.response.output.at(-1).encrypted_content))!
+    assertEquals(Deno.readTextFileSync(lane2.logFile).split('\n').filter(Boolean), [...rec1.entries, ...rec2.entries])
+  })
+})
+
+Deno.test('a cancelled attempt never becomes a tail', async () => {
+  const run = new Run('tail-cancel', false)
+  await run.run(async () => {
+    run.fake.reply({ blocks: [text('one')] })
+    const r1 = await run.turn('one')
+    run.fake.reply({ blocks: [text('partial'), text('rest')], gapMs: 1000 })
+    const stream = await run.tg.gw.create(
+      parseRequest({ model: MODEL, instructions: INSTRUCTIONS, tools: TOOLS, stream: true, previous_response_id: r1.response.id, input: [user('two')] }),
+    )
+    const reader = stream.getReader()
+    let seen = ''
+    while (!seen.includes('output_text.delta')) seen += new TextDecoder().decode((await reader.read()).value)
+    const lane = [...run.tg.gw.lanes.values()][0]
+    lane.cancel(lane.active!.state.id, 'test')
+    await lane.gone
+    assertEquals(run.tg.gw.store.tail(r1.response.id), [])
   })
 })

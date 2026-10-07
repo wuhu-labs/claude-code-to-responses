@@ -93,12 +93,16 @@ Deno.test('a provider record is every log entry since the previous response, ver
     const r3 = await run.send([output('toolu_r', 'X')])
     const recs = [await recordOf(r1), await recordOf(r2), await recordOf(r3)]
     assertEquals(recs.map((r) => r!.prev), [null, r1.response.id, r2.response.id])
-    const lane = [...run.tg.gw.lanes.values()][0]
-    const disk = Deno.readTextFileSync(lane.logFile).split('\n').filter(Boolean)
-    const joined = recs.flatMap((r) => r!.entries)
-    assertEquals(disk.slice(0, joined.length), joined)
     // the store holds the same records
     for (const r of recs) assertEquals(run.tg.gw.store.get(r!.id), r)
+    // once the process is gone, its whole log is the records: the end-of-turn entries are in the last one, no tail
+    const lane = [...run.tg.gw.lanes.values()][0]
+    await lane.kill('test')
+    const disk = Deno.readTextFileSync(lane.logFile).split('\n').filter(Boolean)
+    const joined = recs.flatMap((r) => r!.entries)
+    assertEquals(disk, joined)
+    assertEquals(run.tg.gw.store.tail(r3.response.id), [])
+    assert(recs[2]!.entries.some((e) => e.includes('stop_hook_summary')), 'the turn end is in its response record')
   })
   assert(run.tg.events('verify_ok').length > 0)
 })

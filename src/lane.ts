@@ -63,6 +63,8 @@ export class Active {
   mirrorTimer: ReturnType<typeof setTimeout> | undefined
   /** Claude Code's current turn is this response's (its input went in), so the turn's result is its business. */
   ownsTurn = false
+  /** The turn's result arrived. */
+  turnEnded = false
   constructor(
     readonly state: ResponseState,
     readonly sink: SseSink,
@@ -111,8 +113,12 @@ export class Lane implements BridgeTarget {
 
   // ---- process lifecycle -------------------------------------------------------------------------------
 
-  /** Writes a rebuilt log (when resuming) and starts Claude Code. */
-  spawn(opts: { resume: boolean; interruptedTurn: boolean; log?: string[] }): void {
+  /**
+   * Writes a rebuilt log (when resuming) and starts Claude Code. The log is the stored records (`log`), the tail
+   * Claude Code wrote after the last of them (already in `pending`), then this attempt's own entries (`attempt`:
+   * synthesized history, the interrupted-turn results and text), which the response's record will carry.
+   */
+  spawn(opts: { resume: boolean; interruptedTurn: boolean; log?: string[]; attempt?: string[] }): void {
     const p = paths(this.config)
     Deno.mkdirSync(this.workDir, { recursive: true })
     if (opts.resume) {
@@ -121,8 +127,10 @@ export class Lane implements BridgeTarget {
       try {
         Deno.removeSync(`${dir}/${this.sessionId}`, { recursive: true })
       } catch { /* none */ }
-      Deno.writeTextFileSync(this.logFile, (opts.log ?? []).map((l) => l + '\n').join(''))
+      const lines = [...(opts.log ?? []), ...this.pending, ...(opts.attempt ?? [])]
+      Deno.writeTextFileSync(this.logFile, lines.map((l) => l + '\n').join(''), { mode: 0o600 })
     }
+    this.pending.push(...(opts.attempt ?? []))
     this.epoch = newId('ep')
     this.runDir = `${p.runDir}/${this.epoch}`
     Deno.mkdirSync(this.runDir, { recursive: true, mode: 0o700 })
@@ -173,13 +181,19 @@ export class Lane implements BridgeTarget {
   kill(reason: string): Promise<void> {
     if (!this.killing) {
       this.dead = true
-      this.events.dead(this)
       this.killing = this.teardown(reason)
+      this.events.dead(this)
     }
     return this.killing
   }
 
+  /** Settles once the process is gone and its tail is stored; resolved for a lane never killed. */
+  get gone(): Promise<void> {
+    return this.killing ?? Promise.resolve()
+  }
+
   private async teardown(reason: string): Promise<void> {
+    const atRest = this.pendingAtAttach === null
     clearTimeout(this.timer)
     this.bridge.unregister(this.epoch)
     for (const [, resolve] of this.held) resolve({ content: [{ type: 'text', text: 'gateway: process evicted' }], isError: true })
@@ -192,27 +206,37 @@ export class Lane implements BridgeTarget {
     try {
       Deno.removeSync(this.runDir, { recursive: true })
     } catch { /* gone */ }
-    if (this.config.verifyLogs && this.head) this.verifyLog()
+    if (this.head) this.keepTail(atRest)
     this.events.gone(this)
   }
 
-  /** The log on disk must start with the stored chain of records, byte for byte. */
-  private verifyLog(): void {
+  /**
+   * Stores what Claude Code wrote after the head response's record (its tail), so a rebuild loses nothing. At rest
+   * that is everything on disk past the stored records, mirrored or not; after a failed or cancelled attempt it is
+   * what came before the attempt, never the attempt itself.
+   */
+  private keepTail(atRest: boolean): void {
     const chain = this.store.chain(this.head!.responseId)
     if (!chain) return this.events.note('verify_error', { session: this.sessionId, error: 'chain missing from store' })
-    let disk: string[]
+    const want = chain.flatMap((r) => r.entries)
+    let disk: string[] | null = null
     try {
       disk = Deno.readTextFileSync(this.logFile).split('\n').filter((l) => l !== '')
     } catch (e) {
-      return this.events.note('verify_error', { session: this.sessionId, error: String(e) })
+      this.events.note('verify_error', { session: this.sessionId, error: String(e) })
     }
-    const want = chain.flatMap((r) => r.entries)
-    for (let i = 0; i < want.length; i++) {
-      if (disk[i] !== want[i]) {
-        return this.events.note('verify_error', { session: this.sessionId, line: i, disk: disk[i]?.slice(0, 300) ?? null, want: want[i].slice(0, 300) })
-      }
+    const prefixOk = disk !== null && want.every((l, i) => disk![i] === l)
+    if (disk && !prefixOk) {
+      const i = want.findIndex((l, i) => disk![i] !== l)
+      this.events.note('verify_error', { session: this.sessionId, line: i, disk: disk[i]?.slice(0, 300) ?? null, want: want[i].slice(0, 300) })
+    } else if (this.config.verifyLogs) {
+      this.events.note('verify_ok', { session: this.sessionId, lines: want.length })
     }
-    this.events.note('verify_ok', { session: this.sessionId, lines: want.length })
+    const tail = atRest && prefixOk ? disk!.slice(want.length) : this.pending.slice(0, this.pendingAtAttach ?? this.pending.length)
+    if (tail.length) {
+      this.store.putTail(this.head!.responseId, tail)
+      this.events.note('tail', { session: this.sessionId, response: this.head!.responseId, lines: tail.length })
+    }
   }
 
   private armEviction(): void {
@@ -225,9 +249,13 @@ export class Lane implements BridgeTarget {
 
   // ---- requests --------------------------------------------------------------------------------------
 
+  /** Length of `pending` when the active response attached: what came before is the head's tail. Null at rest. */
+  private pendingAtAttach: number | null = null
+
   attach(a: Active): void {
     clearTimeout(this.timer)
     this.active = a
+    this.pendingAtAttach = this.pending.length
     a.sink.onCancel = () => {
       this.events.note('client_disconnect', { session: this.sessionId, response: a.state.id })
       this.cancel(a.state.id, 'client_disconnected')
@@ -368,8 +396,11 @@ export class Lane implements BridgeTarget {
     // a result can only end the active response's own turn, never the previous one's
     if (!a || a.finished || !a.ownsTurn) return
     if (f.is_error) return this.fail(resultError(f))
-    if (a.msg?.stopped) return // the record is still on its way from the mirror
-    this.fail(serverError('turn_ended_without_message', `Claude Code ended its turn without a model message: ${String(f.result ?? '').slice(0, 300)}`))
+    if (!a.msg?.stopped) {
+      return this.fail(serverError('turn_ended_without_message', `Claude Code ended its turn without a model message: ${String(f.result ?? '').slice(0, 300)}`))
+    }
+    a.turnEnded = true
+    this.maybeFinish()
   }
 
   private streamEvent(ev: Json): void {
@@ -502,7 +533,11 @@ export class Lane implements BridgeTarget {
     }
   }
 
-  /** A response ends at the model's message_stop, once the log entries of every block are in hand. */
+  /**
+   * A response ends at the model's message_stop, once the log entries of every block are in hand. When the model
+   * ends its turn, the response also waits for the turn's result: Claude Code has then logged the turn's end-of-turn
+   * hook, so the record holds the whole turn and nothing is left over for the next one.
+   */
   private maybeFinish(): void {
     const a = this.active
     if (!a || a.finished || !a.msg?.stopped) return
@@ -511,10 +546,12 @@ export class Lane implements BridgeTarget {
     for (const i of msg.blocks.keys()) if (!m?.indexes.has(i)) return
     const calls = msg.stopReason === 'tool_use'
     if (!calls && (this.staged || this.continuing)) return // notices go in at the end-of-turn hook; inference goes on
+    if (!calls && !a.turnEnded) return
     if (calls && this.staged) return this.fail(serverError('notice_undelivered', 'The model called tools again before the notices could be delivered.'))
     clearTimeout(a.mirrorTimer)
     a.finished = true
-    const cut = m!.last + 1
+    // a turn's end takes everything logged so far; held calls take the message, and Claude Code writes nothing more while it waits
+    const cut = calls ? m!.last + 1 : this.pending.length
     const entries = this.pending.slice(0, cut)
     this.pending = this.pending.slice(cut)
     this.mirrored.clear()
@@ -538,6 +575,7 @@ export class Lane implements BridgeTarget {
     }
     this.store.put(record)
     this.head = { responseId: a.state.id, end, calls }
+    this.pendingAtAttach = null
     if (this.active === a) this.active = null
     const item = { type: 'reasoning', id: newId('rs'), summary: [], encrypted_content: await encodeRecord(record) }
     const outputIndex = a.state.output.length

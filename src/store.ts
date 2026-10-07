@@ -4,9 +4,29 @@ import type { ProviderRecord } from './records.ts'
 
 export class ResponseStore {
   readonly dir: string
+  readonly tailDir: string
   constructor(stateDir: string) {
     this.dir = `${stateDir}/responses`
+    this.tailDir = `${stateDir}/tails`
     Deno.mkdirSync(this.dir, { recursive: true })
+    Deno.mkdirSync(this.tailDir, { recursive: true })
+  }
+
+  /** Log lines Claude Code wrote after a response's record and before its process went away. */
+  tail(id: string): string[] {
+    if (!/^[A-Za-z0-9_-]+$/.test(id)) return []
+    try {
+      return JSON.parse(Deno.readTextFileSync(`${this.tailDir}/${id}.json`))
+    } catch (e) {
+      if (e instanceof Deno.errors.NotFound) return []
+      throw e
+    }
+  }
+
+  putTail(id: string, lines: string[]): void {
+    const p = `${this.tailDir}/${this.path(id).replace(/^.*\//, '')}`
+    Deno.writeTextFileSync(`${p}.tmp`, JSON.stringify(lines))
+    Deno.renameSync(`${p}.tmp`, p)
   }
 
   private path(id: string): string {
