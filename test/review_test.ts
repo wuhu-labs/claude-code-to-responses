@@ -639,3 +639,15 @@ Deno.test('a lane killed while its response commits fails the response and store
     assertEquals(run.tg.events('verify_error').length, 0)
   })
 })
+
+Deno.test('the backend refusing a prompt as too long maps to context_length_exceeded, like the local limit', async () => {
+  const run = new Run('upstream-too-long', false)
+  await run.run(async () => {
+    run.fake.reply({
+      blocks: [text('never')],
+      error: { status: 400, type: 'invalid_request_error', message: 'prompt is too long: 250000 tokens > 200000 maximum' },
+    })
+    const r = await run.send([user('a very long story')])
+    assertEquals([r.status, r.response.error.code], ['failed', 'context_length_exceeded'])
+  })
+})

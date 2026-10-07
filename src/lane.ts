@@ -820,7 +820,8 @@ export { MAX_RESULT_CHARS }
  */
 function resultError(f: Frame): GatewayError {
   const text = String(f.result ?? f.errors?.join?.('; ') ?? 'Claude Code reported an error')
-  if (f.terminal_reason === 'blocking_limit') {
+  // the local blocking limit, or the backend refusing the prompt as too long ("prompt is too long: N tokens > M maximum")
+  if (f.terminal_reason === 'blocking_limit' || /prompt is too long/i.test(text)) {
     return new GatewayError(400, 'invalid_request_error', 'context_length_exceeded', `The context is too long for the model: ${text}`)
   }
   const status = typeof f.api_error_status === 'number' ? f.api_error_status : null
