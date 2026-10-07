@@ -33,6 +33,7 @@ export function dirs(name: string): Dirs {
 }
 
 export interface GatewayOpts {
+  claudeBinary?: string
   dirs: Dirs
   backendEnv: Record<string, string>
   tz?: string
@@ -54,7 +55,7 @@ export class TestGateway {
       bridgePort: freePort(),
       stateDir: o.dirs.stateDir,
       workDir: o.dirs.workDir,
-      claudeBinary: CLAUDE,
+      claudeBinary: o.claudeBinary ?? CLAUDE,
       tz: o.tz ?? 'UTC',
       idleTimeoutMs: o.idleTimeoutMs ?? 600_000,
       holdTimeoutMs: o.holdTimeoutMs ?? 600_000,

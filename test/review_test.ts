@@ -486,36 +486,49 @@ Deno.test('a line Claude Code writes only to disk reaches the next record, throu
   }
 })
 
-Deno.test('a gateway that died without cleaning up has its Claude Code processes killed at the next start; a reused pid is spared', async () => {
-  const { alive, CLAUDE, TestGateway } = await import('./harness.ts')
-  const run = new Run('orphans', false)
-  await run.run(async () => {
-    run.fake.reply({ blocks: [text('one')] })
-    await run.turn('one')
-    const pid = run.tg.events('spawn')[0].data.pid
-    const epoch = run.tg.events('spawn')[0].data.epoch
-    const state = Deno.realPathSync(run.d.stateDir)
-    const runDir = `${state}/run`
-    // the registry entry exists as soon as the process does
-    const rec = JSON.parse(Deno.readTextFileSync(`${runDir}/${epoch}/proc.json`))
-    assertEquals([rec.pid, rec.binary], [pid, CLAUDE])
-    // a process that merely holds a recorded pid (another executable, another start time) must survive the sweep
-    const bystander = new Deno.Command('/bin/sleep', { args: ['30'] }).spawn()
-    Deno.mkdirSync(`${runDir}/ep_bystander`)
-    Deno.writeTextFileSync(`${runDir}/ep_bystander/proc.json`, JSON.stringify({ pid: bystander.pid, binary: CLAUDE, spawnedFrom: 0, spawnedTo: 1000 }))
-    // the first gateway "crashes": its lock now names a process that is gone, and its Claude Code still runs
-    Deno.writeTextFileSync(`${state}/gateway.lock`, JSON.stringify({ pid: 999999, started: 'Thu Jan  1 00:00:00 1970', comm: 'gone' }))
-    assert(alive(pid))
-    const second = await TestGateway.start({ dirs: run.d, backendEnv: run.backend() })
-    for (let i = 0; i < 100 && alive(pid); i++) await new Promise((r) => setTimeout(r, 20)) // until it is reaped
-    assert(!alive(pid), 'the orphan was killed')
-    assert(alive(bystander.pid), 'the bystander survived')
-    bystander.kill('SIGKILL')
-    await bystander.status
-    assertEquals([...Deno.readDirSync(runDir)].map((d) => d.name), [])
-    await second.close()
+for (const alias of [false, true]) {
+  Deno.test(`a crashed gateway using a ${alias ? 'symlinked' : 'direct'} Claude binary kills its orphans at the next start; a reused pid is spared`, async () => {
+    const { alive, CLAUDE, TestGateway } = await import('./harness.ts')
+    const run = new Run(`orphans-${alias}`, false)
+    const binary = alias ? `${run.d.stateDir}/claude-link` : CLAUDE
+    if (alias) {
+      Deno.mkdirSync(run.d.stateDir, { recursive: true })
+      Deno.symlinkSync(CLAUDE, binary)
+      run.opts.claudeBinary = binary
+    }
+    await run.run(async () => {
+      run.fake.reply({ blocks: [text('one')] })
+      await run.turn('one')
+      const pid = run.tg.events('spawn')[0].data.pid
+      const epoch = run.tg.events('spawn')[0].data.epoch
+      const state = Deno.realPathSync(run.d.stateDir)
+      const runDir = `${state}/run`
+      // the registry entry exists as soon as the process does
+      const rec = JSON.parse(Deno.readTextFileSync(`${runDir}/${epoch}/proc.json`))
+      assertEquals(run.tg.gw.config.claudeBinary, Deno.realPathSync(CLAUDE))
+      assertEquals([rec.pid, rec.binary], [pid, Deno.realPathSync(CLAUDE)])
+      if (alias) {
+        // Also accept an old registry that recorded the configured alias before canonicalization.
+        Deno.writeTextFileSync(`${runDir}/${epoch}/proc.json`, JSON.stringify({ ...rec, binary }))
+      }
+      // a process that merely holds a recorded pid (another executable, another start time) must survive the sweep
+      const bystander = new Deno.Command('/bin/sleep', { args: ['30'] }).spawn()
+      Deno.mkdirSync(`${runDir}/ep_bystander`)
+      Deno.writeTextFileSync(`${runDir}/ep_bystander/proc.json`, JSON.stringify({ pid: bystander.pid, binary: CLAUDE, spawnedFrom: 0, spawnedTo: 1000 }))
+      // the first gateway "crashes": its lock now names a process that is gone, and its Claude Code still runs
+      Deno.writeTextFileSync(`${state}/gateway.lock`, JSON.stringify({ pid: 999999, started: 'Thu Jan  1 00:00:00 1970', comm: 'gone' }))
+      assert(alive(pid))
+      const second = await TestGateway.start({ dirs: run.d, backendEnv: run.backend(), claudeBinary: binary })
+      for (let i = 0; i < 100 && alive(pid); i++) await new Promise((r) => setTimeout(r, 20)) // until it is reaped
+      assert(!alive(pid), 'the orphan was killed')
+      assert(alive(bystander.pid), 'the bystander survived')
+      bystander.kill('SIGKILL')
+      await bystander.status
+      assertEquals([...Deno.readDirSync(runDir)].map((d) => d.name), [])
+      await second.close()
+    })
   })
-})
+}
 
 Deno.test('a second gateway on a state dir in use is refused at startup, and the first keeps its processes', async () => {
   const { alive, TestGateway } = await import('./harness.ts')

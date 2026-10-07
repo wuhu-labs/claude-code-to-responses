@@ -1,4 +1,5 @@
 // Gateway configuration. Every setting is explicit; a missing or wrong one is an error at startup, never a guess.
+import { executableIdentity } from './claude/process.ts'
 import { BACKEND_ENV, CLAUDE_CODE_VERSION } from './claude/pins.ts'
 
 export interface Config {
@@ -201,6 +202,7 @@ function gitRootOf(path: string): string | null {
 
 /** Checks every setting first, then creates the folders (owner-only) and resolves them to real paths. */
 export function prepare(c: Config): Config {
+  const claudeBinary = executableIdentity(c.claudeBinary)
   const target = realTarget(c.workDir)
   const repo = gitRootOf(target)
   if (repo !== null) {
@@ -217,7 +219,7 @@ export function prepare(c: Config): Config {
   Deno.chmodSync(workDir, 0o700)
   const p = paths({ ...c, stateDir })
   for (const d of [p.configDir, p.homeDir, p.runDir]) Deno.mkdirSync(d, { recursive: true, mode: 0o700 })
-  return { ...c, stateDir, workDir, deviceId: c.deviceId ?? stateDeviceId(stateDir) }
+  return { ...c, claudeBinary, stateDir, workDir, deviceId: c.deviceId ?? stateDeviceId(stateDir) }
 }
 
 /** The device id generated on this state dir's first start and kept in <state-dir>/device-id. */

@@ -15,7 +15,7 @@ import {
   userMessageEntry,
 } from './claude/entries.ts'
 import { CLAUDE_CODE_VERSION, MCP_PREFIX, RESUME_LINE } from './claude/pins.ts'
-import { claudeVersion, processIdentity } from './claude/process.ts'
+import { claudeVersion, executableIdentity, processIdentity } from './claude/process.ts'
 import { type Config, ConfigError, paths } from './config.ts'
 import { GatewayError, invalid, previousResponseNotFound } from './errors.ts'
 import { Active, type ChainSpec, type Head, Lane, MAX_RESULT_CHARS, outputChars } from './lane.ts'
@@ -55,6 +55,7 @@ export class Gateway {
   }
 
   static async start(config: Config): Promise<Gateway> {
+    config = { ...config, claudeBinary: executableIdentity(config.claudeBinary) }
     const p = paths(config)
     const version = await claudeVersion(config.claudeBinary, {
       HOME: p.homeDir,
@@ -394,6 +395,7 @@ function resultEntries(ctx: LogContext, log: string[], calls: CallRef[], outputs
  * a proc.json whose pid has the same start time and executable as recorded. A pid alone is never trusted.
  */
 export async function sweepOrphans(runDir: string, binary: string, note: (kind: string, data: Json) => void): Promise<void> {
+  binary = executableIdentity(binary)
   for (const d of Deno.readDirSync(runDir)) {
     const dir = `${runDir}/${d.name}`
     try {
@@ -402,7 +404,7 @@ export async function sweepOrphans(runDir: string, binary: string, note: (kind: 
       // the same executable, started within the window the gateway recorded around its spawn (ps reports whole seconds)
       const started = now ? Date.parse(now.started) : NaN
       const inWindow = started >= Math.floor(rec.spawnedFrom / 1000) * 1000 - 1000 && started <= rec.spawnedTo + 1000
-      if (now && now.comm === binary && rec.binary === binary && inWindow) {
+      if (now && now.comm === binary && executableIdentity(rec.binary) === binary && inWindow) {
         try {
           Deno.kill(rec.pid, 'SIGKILL')
           note('orphan_killed', { pid: rec.pid, epoch: d.name })

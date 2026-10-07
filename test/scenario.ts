@@ -40,8 +40,15 @@ export class Run {
   constructor(
     readonly name: string,
     readonly live: boolean,
-    readonly opts: { mode?: 'previous' | 'history'; tz?: string; workDir?: string; idleTimeoutMs?: number; holdTimeoutMs?: number; recordTimeoutMs?: number } =
-      {},
+    readonly opts: {
+      claudeBinary?: string
+      mode?: 'previous' | 'history'
+      tz?: string
+      workDir?: string
+      idleTimeoutMs?: number
+      holdTimeoutMs?: number
+      recordTimeoutMs?: number
+    } = {},
   ) {
     this.fake = new FakeAnthropic(freePort())
     this.d = dirs(name)
@@ -55,6 +62,7 @@ export class Run {
   async start(): Promise<void> {
     this.tg = await TestGateway.start({
       dirs: this.d,
+      claudeBinary: this.opts.claudeBinary,
       backendEnv: this.backend(),
       tz: this.opts.tz,
       idleTimeoutMs: this.opts.idleTimeoutMs,
@@ -80,6 +88,7 @@ export class Run {
     else if (o.workDir) this.d = { ...this.d, workDir: o.workDir }
     this.tg = await TestGateway.start({
       dirs: this.d,
+      claudeBinary: this.opts.claudeBinary,
       backendEnv: this.backend(),
       tz: o.tz ?? this.opts.tz,
       idleTimeoutMs: this.opts.idleTimeoutMs,

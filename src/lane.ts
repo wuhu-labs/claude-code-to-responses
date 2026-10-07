@@ -5,7 +5,7 @@ import type { FnTool, InItem, Part } from './api/request.ts'
 import { newId, type ResponseState, type SseSink, type UsageTotals } from './api/stream.ts'
 import { type Bridge, type BridgeTarget, McpCallError, StaleEpoch } from './bridge.ts'
 import { userContentBlocks } from './claude/entries.ts'
-import { ClaudeProcess, type Frame } from './claude/process.ts'
+import { ClaudeProcess, executableIdentity, type Frame } from './claude/process.ts'
 import { type LaunchSpec, logPath, MAX_RESULT_CHARS, MCP_PREFIX, mcpConfigJson, projectDir, settingsJson } from './claude/pins.ts'
 import { type Config, paths } from './config.ts'
 import { type ErrorCode, GatewayError, serverError } from './errors.ts'
@@ -221,7 +221,7 @@ export class Lane implements BridgeTarget {
     // processes finds them at its next start (pid, executable, and a start-time window; a pid alone is never trusted)
     Deno.writeTextFileSync(
       `${this.runDir}/proc.json`,
-      JSON.stringify({ pid: this.proc.pid, binary: this.config.claudeBinary, spawnedFrom, spawnedTo: Date.now() }),
+      JSON.stringify({ pid: this.proc.pid, binary: executableIdentity(this.config.claudeBinary), spawnedFrom, spawnedTo: Date.now() }),
       { mode: 0o600 },
     )
     this.events.note('spawn', {

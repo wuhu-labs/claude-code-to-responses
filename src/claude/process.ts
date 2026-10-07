@@ -91,9 +91,14 @@ async function* lines(stream: ReadableStream<Uint8Array>) {
   if (buf) yield buf
 }
 
+/** One identity for configured executables, registries and process inspection, including symlink aliases. */
+export function executableIdentity(path: string): string {
+  return Deno.realPathSync(path)
+}
+
 /**
- * A process's start time and executable as `ps` reports them (never its arguments: they are not printed), so a
- * recorded pid is only ever matched with the process it was recorded for.
+ * A process's start time from `ps` and canonical executable from /proc (Linux) or ps comm (macOS),
+ * never its arguments. A recorded pid is only matched with the process it was recorded for.
  */
 export async function processIdentity(pid: number): Promise<{ started: string; comm: string } | null> {
   const run = async (field: string) => {
@@ -102,9 +107,9 @@ export async function processIdentity(pid: number): Promise<{ started: string; c
   }
   // Linux ps comm is a truncated process name, not the executable path used to fence orphan cleanup.
   const executable = async () => {
-    if (Deno.build.os !== 'linux') return await run('comm')
     try {
-      return await Deno.readLink(`/proc/${pid}/exe`)
+      const path = Deno.build.os === 'linux' ? await Deno.readLink(`/proc/${pid}/exe`) : await run('comm')
+      return executableIdentity(path)
     } catch {
       return ''
     }
