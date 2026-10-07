@@ -2,6 +2,7 @@
 // process rebuilt from the response store or from the client's history and the provider records it carries.
 import type { FnTool, InItem, NormRequest, Part } from './api/request.ts'
 import { type EventSink, ResponseState, SseSink } from './api/stream.ts'
+import { type CallAliases, matchRecordItems, remapItems } from './call_ids.ts'
 import { Bridge } from './bridge.ts'
 import {
   assistantEntries,
@@ -19,7 +20,7 @@ import { claudeVersion, executableIdentity, processIdentity } from './claude/pro
 import { type Config, ConfigError, paths } from './config.ts'
 import { asGatewayError, GatewayError, invalid, previousResponseNotFound } from './errors.ts'
 import { Active, type ChainSpec, type Head, Lane, MAX_RESULT_CHARS, outputChars } from './lane.ts'
-import { type CallRef, decodeRecord, decodeThinking, digestItems, type ProviderRecord, RecordError, sha256, THINKING_PREFIX } from './records.ts'
+import { type CallRef, decodeRecord, decodeThinking, type ProviderRecord, RecordError, sha256, THINKING_PREFIX } from './records.ts'
 import { ResponseStore } from './store.ts'
 
 // deno-lint-ignore no-explicit-any
@@ -235,7 +236,7 @@ export class Gateway {
       throw previousResponseNotFound(prev, 'instructions, tools, model, reasoning effort or max_output_tokens changed, which starts a new Claude Code session')
     }
     const head: Head = { responseId: rec.id, end: rec.end, calls: rec.calls }
-    const input = await this.withoutOwnReasoning(req.input, prev)
+    const input = remapItems(await this.withoutOwnReasoning(req.input, prev), rec.callAliases ?? [])
     const delivery = deliveryFor(head, input)
     this.reserve(rec.session, reservation)
     let lane = this.lanes.get(rec.session)
@@ -251,6 +252,7 @@ export class Gateway {
     const records = this.store.chain(prev)
     if (!records) throw previousResponseNotFound(prev, 'its chain is incomplete in the store')
     lane = new Lane(rec.session, this.workDir(rec.session), chain, head, this.config, this.bridge, this.store, this.laneEvents)
+    lane.callAliases = rec.callAliases ?? []
     this.addLane(lane)
     const log = records.flatMap((r) => r.entries)
     lane.pending = this.store.tail(prev)
@@ -302,7 +304,8 @@ export class Gateway {
   }
 
   private async fromHistory(req: NormRequest, chain: ChainSpec, state: ResponseState, reservation: Reservation): Promise<Plan> {
-    const { groups, tail } = segment(req.input)
+    const { groups, tail: originalTail } = segment(req.input)
+    let tail = originalTail
     if (tail.length === 0) throw invalid('input', 'The input ends with model output: there is nothing new to respond to.')
     if (groups.length === 0) {
       // a new conversation
@@ -320,6 +323,7 @@ export class Gateway {
     let synth: Group[] = []
     let headId: string | null = null
     let session: string | null = null
+    let aliases: CallAliases = []
     for (let gi = 0; gi < groups.length; gi++) {
       const g = groups[gi]
       pendingGroups.push(g)
@@ -328,17 +332,39 @@ export class Gateway {
       const recs = (await Promise.all(encrypted.map((e) => clientRecord(e, gi)))).filter((r) => r !== null)
       if (recs.length === 0) continue
       const r = recs[recs.length - 1]!
-      const fits = recs.length === 1 && r.chain === chain.key && (r.instructions === undefined || r.instructions === chain.instructions) && r.prev === headId &&
-        (session === null || r.session === session) &&
-        r.digest === await digestItems(pendingGroups.flatMap((x) => [...x.inputs, ...x.outputs]))
+      const candidate = recs.length === 1 && r.chain === chain.key && (r.instructions === undefined || r.instructions === chain.instructions) &&
+        r.prev === headId &&
+        (session === null || r.session === session)
+      const matched = candidate ? await matchRecordItems(pendingGroups.flatMap((x) => [...x.inputs, ...x.outputs]), r, aliases) : null
+      if (candidate && matched === null) {
+        used.length = 0
+        aliases = []
+        headId = null
+        session = null
+        pendingGroups = groups.slice(0, gi + 1)
+      }
+      const fits = matched !== null
       // a record that does not continue the log (another chain, an edited history) is ignored: its group is synthesized,
       // unless a later record covers it
       if (!fits) continue
+      aliases = matched!
       used.push(r)
       headId = r.id
       session = r.session
       pendingGroups = []
     }
+    const clientCalls = new Set(req.input.filter((it) => it.kind === 'function_call').map((it) => it.callId))
+    if (tail.some((it) => it.kind === 'function_call_output' && !clientCalls.has(it.callId))) {
+      used.length = 0
+      aliases = []
+      headId = null
+      session = null
+      pendingGroups = groups
+    }
+    // The provider log is never rewritten. Normalize the client-side delivery/digest instead.
+    const remapGroup = (g: Group): Group => ({ inputs: remapItems(g.inputs, aliases), outputs: remapItems(g.outputs, aliases) })
+    tail = remapItems(tail, aliases)
+    pendingGroups = pendingGroups.map(remapGroup)
     if (pendingGroups.length) synth = pendingGroups
     // Validate every synthesized group and the new delivery before taking over a live lane or importing records.
     // Log synthesis stays after the old process settles: it must include any tail that eviction stores.
@@ -403,6 +429,7 @@ export class Gateway {
     )
     this.addLane(lane)
     const covered = [...synth.flatMap((g) => [...g.inputs, ...g.outputs]), ...tail]
+    lane.callAliases = aliases
     lane.pending = tailLines
     let spawn
     if (delivery.kind === 'turn') {

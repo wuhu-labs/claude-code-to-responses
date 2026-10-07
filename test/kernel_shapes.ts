@@ -2,6 +2,12 @@ import type { Json } from './fake.ts'
 
 // Project exactly as ResponsesRequestBuilder + ResponsesWebSocketSession at monorepo def9ef929.
 // Basic prompt/user literals come from buildsBasicResponsesRequest; tool/history layouts come from its sibling tests.
+const committedIDs = new Map<string, string>()
+export function committedCallId(provider: string): string {
+  if (!committedIDs.has(provider)) committedIDs.set(provider, crypto.randomUUID())
+  return committedIDs.get(provider)!
+}
+
 export function kernelBody(body: Json): Json {
   const { instructions, ...rest } = body
   let messageIndex = 0
@@ -18,7 +24,8 @@ export function kernelBody(body: Json): Json {
       }
     }
     if (it.type === 'reasoning') return { type: 'reasoning', ...(it.id ? { id: it.id } : {}), summary: [], encrypted_content: it.encrypted_content }
-    if (it.type === 'function_call') return { type: 'function_call', call_id: it.call_id, name: it.name, arguments: it.arguments }
+    if (it.type === 'function_call') return { type: 'function_call', call_id: committedCallId(it.call_id), name: it.name, arguments: it.arguments }
+    if (it.type === 'function_call_output' && !body.previous_response_id) return { ...it, call_id: committedCallId(it.call_id) }
     return it
   })
   return {

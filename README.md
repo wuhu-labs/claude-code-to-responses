@@ -231,7 +231,10 @@ Their contract test validates both the original HTTP body and its WebSocket proj
 and cache key added). `test/kernel_shapes.ts` projects the current builder’s asserted wire layouts for dynamic
 histories, not a production capture. Existing scenario assertions run a third time with kernel-shaped bodies over
 WebSocket, including idle and held-call evictions, retained-store restarts and **lost-store full-history rebuild**.
-`test/kernel_test.ts` adds full/delta/forced-compaction contracts, durable prompt inheritance, cap/changed-prompt
+`test/kernel_alias_test.ts` adds the two-tool/image/forced-full reproduction, lost-store UUID replay, further
+aliased tool delivery, alias persistence and negative bijection/content tests. Dynamic full histories commit
+function-call ids as kernel UUIDs; warm deltas retain the provider ids exactly as the kernel’s acknowledgement
+translation does. `test/kernel_test.ts` adds full/delta/forced-compaction contracts, durable prompt inheritance, cap/changed-prompt
 rejections before tool release, literal prompt joining, legacy record compatibility and no-auth bearer acceptance.
 
 ## How it works
@@ -314,6 +317,16 @@ response is attached, so simultaneous requests never rebuild it twice. The next 
   chain and session, `prev` link, and a digest of the items it covers). The longest such run is written verbatim;
   items without a usable record are **synthesized** as plain log entries, which makes that request a cold cache miss
   (expected). The next response's record covers the synthesized part, so later rebuilds are warm again.
+  Record matching permits one difference: a consistent **one-to-one renaming of `call_id` across the whole history**,
+  as when Wuhu commits provider calls under kernel UUIDs. The gateway derives the original ordered tool ids from
+  each record’s unchanged log, binds the client ids bijectively, then verifies the existing digest after changing
+  only those ids. Item order, names, argument-string bytes, outputs, text and images must still match exactly.
+  Conflicting/many-to-one ids or any content mismatch prevent record reuse; that history is synthesized and
+  `x_gateway.records` / `synthesized_groups` expose the path. On a match the original session, provider ids, image
+  labels and log bytes are replayed verbatim. Input results are translated to provider ids before delivery, and
+  aliases are saved in subsequent provider records so they survive another process eviction, retained-store restart
+  or lost-store history rebuild. Provider ids remain the ids in Responses output; the kernel still translates warm
+  deltas normally. Already-issued records work too: no alternate digest or new-record-only matching is required.
 - When the log stops at held calls, the gateway appends the tool results plus one user message, and resumes with
   `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1`. The message contains the notices’ text and images that came with the outputs, else the fixed line
   `Continue from where you left off.`. It lands in that response's record, so every later rebuild repeats it exactly.

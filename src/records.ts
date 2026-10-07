@@ -1,5 +1,6 @@
 // Provider records: the Claude Code log entries behind each response, carried opaquely in a reasoning item's
 // encrypted_content and kept in the response store. log(r) = log(r.prev) + r.entries, byte for byte.
+import type { CallAliases } from './call_ids.ts'
 import type { InItem, Part } from './api/request.ts'
 
 export const RECORD_PREFIX = 'cc2r.record.v1.'
@@ -18,10 +19,12 @@ export interface ProviderRecord {
   id: string
   /** The response whose log this one continues; null when it starts the log. */
   prev: string | null
-  /** Chain key: instructions, tools, model and effort. */
+  /** Chain key: instructions, tools, model, effort and an explicit output cap. */
   chain: string
   /** Resolved chain instructions for continuations that omit the prompt (older records may lack it). */
   instructions?: string
+  /** Client call ids bound to the original provider ids; every pair is one-to-one. */
+  callAliases?: CallAliases
   /** Claude Code session id. */
   session: string
   /** The chain's Claude Code device id (its config folder's userID): with the session id, metadata.user_id. */
@@ -108,6 +111,19 @@ export function checkRecord(r: any): void {
   if (r.prev !== null && (typeof r.prev !== 'string' || !RESPONSE_ID.test(r.prev))) fail('bad prev')
   if (typeof r.chain !== 'string' || !HEX64.test(r.chain)) fail('bad chain')
   if (r.instructions !== undefined && (typeof r.instructions !== 'string' || !r.instructions)) fail('bad instructions')
+  if (r.callAliases !== undefined) {
+    if (!Array.isArray(r.callAliases)) fail('bad call aliases')
+    const clients = new Set<string>(), providers = new Set<string>()
+    for (const pair of r.callAliases) {
+      if (
+        !Array.isArray(pair) || pair.length !== 2 || typeof pair[0] !== 'string' || !pair[0] ||
+        typeof pair[1] !== 'string' || !CALL_ID.test(pair[1])
+      ) fail('bad call alias')
+      if (clients.has(pair[0]) || providers.has(pair[1])) fail('call aliases are not one-to-one')
+      clients.add(pair[0])
+      providers.add(pair[1])
+    }
+  }
   if (typeof r.digest !== 'string' || !HEX64.test(r.digest)) fail('bad digest')
   if (typeof r.session !== 'string' || !SESSION_ID.test(r.session)) fail('bad session')
   if (typeof r.device !== 'string' || !DEVICE_ID.test(r.device)) fail('bad device')

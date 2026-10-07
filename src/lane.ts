@@ -6,6 +6,7 @@ import { type EventSink, newId, type ResponseState, usageObject, type UsageTotal
 import { type Bridge, type BridgeTarget, McpCallError, StaleEpoch } from './bridge.ts'
 import { userContentBlocks } from './claude/entries.ts'
 import { ClaudeProcess, executableIdentity, type Frame } from './claude/process.ts'
+import type { CallAliases } from './call_ids.ts'
 import { type LaunchSpec, logPath, MAX_RESULT_CHARS, MCP_PREFIX, mcpConfigJson, projectDir, settingsJson } from './claude/pins.ts'
 import { type Config, paths } from './config.ts'
 import { asGatewayError, type ErrorCode, GatewayError, serverError } from './errors.ts'
@@ -83,6 +84,7 @@ export class Lane implements BridgeTarget {
   proc: ClaudeProcess | null = null
   epoch = ''
   head: Head | null
+  callAliases: CallAliases = []
   /**
    * Log lines since `head`'s record, verbatim, as they are on disk: the head's tail, the gateway's own writes for this
    * attempt, then whatever Claude Code appended. The log file is the truth; the mirror only says when to read it.
@@ -781,6 +783,7 @@ export class Lane implements BridgeTarget {
       prev: a.prevId,
       chain: this.chain.key,
       instructions: this.chain.instructions,
+      callAliases: this.callAliases,
       session: this.sessionId,
       device: this.config.deviceId!,
       end,
