@@ -1,0 +1,16 @@
+{
+  "tasks": {
+    "start": "deno run -A src/main.ts",
+    "test": "deno test -A --no-check=remote test/",
+    "test:deepseek": "deno test -A test_deepseek/",
+    "probe": "deno test -A probe/",
+    "compile": "deno compile -A --output .state/bin/claude-code-to-responses src/main.ts",
+    "check": "deno check src/main.ts test/ probe/ test_deepseek/"
+  },
+  "imports": {
+    "openai": "npm:openai@^6",
+    "@std/assert": "jsr:@std/assert@^1"
+  },
+  "fmt": { "lineWidth": 160, "semiColons": false, "singleQuote": true },
+  "lint": { "rules": { "exclude": ["no-explicit-any"] } }
+}

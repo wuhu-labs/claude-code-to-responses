@@ -1,0 +1,53 @@
+// The response store: response id -> provider record, one JSON file per response under <state>/responses.
+// It survives gateway restarts; a request with a known previous_response_id rebuilds Claude Code's log from it.
+import type { ProviderRecord } from './records.ts'
+
+export class ResponseStore {
+  readonly dir: string
+  constructor(stateDir: string) {
+    this.dir = `${stateDir}/responses`
+    Deno.mkdirSync(this.dir, { recursive: true })
+  }
+
+  private path(id: string): string {
+    if (!/^[A-Za-z0-9_-]+$/.test(id)) throw new Error(`bad response id ${id}`)
+    return `${this.dir}/${id}.json`
+  }
+
+  get(id: string): ProviderRecord | null {
+    if (!/^[A-Za-z0-9_-]+$/.test(id)) return null
+    try {
+      return JSON.parse(Deno.readTextFileSync(this.path(id)))
+    } catch (e) {
+      if (e instanceof Deno.errors.NotFound) return null
+      throw e
+    }
+  }
+
+  has(id: string): boolean {
+    return this.get(id) !== null
+  }
+
+  put(r: ProviderRecord): void {
+    const p = this.path(r.id)
+    const tmp = `${p}.tmp`
+    Deno.writeTextFileSync(tmp, JSON.stringify(r))
+    Deno.renameSync(tmp, p)
+  }
+
+  /** The chain of records ending at `id`, oldest first; null if any link is missing. */
+  chain(id: string): ProviderRecord[] | null {
+    const out: ProviderRecord[] = []
+    let cur: string | null = id
+    const seen = new Set<string>()
+    while (cur !== null) {
+      if (seen.has(cur)) return null
+      seen.add(cur)
+      const r = this.get(cur)
+      if (!r) return null
+      out.push(r)
+      cur = r.prev
+    }
+    return out.reverse()
+  }
+}
