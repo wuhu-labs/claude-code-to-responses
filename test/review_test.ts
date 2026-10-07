@@ -229,9 +229,11 @@ Deno.test('MCP calls with an unknown tool id are refused; duplicate ids share th
         body: JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'echo', arguments: {}, _meta: { 'claudecode/toolUseId': id } } }),
       }).then((r) => r.json())
     // an id the model never produced
-    const unknown = await mcp('toolu_bogus')
-    assertEquals(unknown.error.code, -32602)
-    assert(run.tg.events('unknown_call').length === 1)
+    const unknown = await Promise.all(['toolu_bogus', 'toolu_bogus', 'toolu_bogus2'].map(mcp))
+    for (const u of unknown) assertEquals(u.error.code, -32602)
+    assertEquals(run.tg.events('unknown_call').length, 3)
+    // their waits are gone once they time out
+    assertEquals([...run.tg.gw.lanes.values()][0].unknownCallWaiters, 0)
     // a duplicate of the held call waits beside it and gets the same output
     const dup = mcp('toolu_m1')
     await run.tg.waitEvent('duplicate_call', (d) => d.call === 'toolu_m1')

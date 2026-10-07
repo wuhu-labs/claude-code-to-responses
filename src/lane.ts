@@ -363,15 +363,28 @@ export class Lane implements BridgeTarget {
 
   private whenKnown(callId: string, ms: number): Promise<void> {
     return new Promise((resolve) => {
-      const t = setTimeout(done, ms)
-      const ws = this.knownWaiters.get(callId) ?? []
-      ws.push(done)
-      this.knownWaiters.set(callId, ws)
-      function done() {
+      const done = () => {
         clearTimeout(t)
         resolve()
       }
+      const t = setTimeout(() => {
+        // a waiter that timed out leaves, so bogus ids cannot pile up
+        const ws = (this.knownWaiters.get(callId) ?? []).filter((w) => w !== done)
+        if (ws.length) this.knownWaiters.set(callId, ws)
+        else this.knownWaiters.delete(callId)
+        done()
+      }, ms)
+      const ws = this.knownWaiters.get(callId) ?? []
+      ws.push(done)
+      this.knownWaiters.set(callId, ws)
     })
+  }
+
+  /** MCP calls waiting to learn whether the model made their tool_use id (for tests). */
+  get unknownCallWaiters(): number {
+    let n = 0
+    for (const ws of this.knownWaiters.values()) n += ws.length
+    return n
   }
 
   private learn(callId: string): void {
