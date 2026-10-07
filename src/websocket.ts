@@ -151,7 +151,13 @@ class SocketSink implements EventSink {
   cancel(): void {
     if (this.closed) return
     this.closed = true
-    this.onCancel?.()
+    try {
+      this.onCancel?.()
+    } finally {
+      // cancel marks the sink closed before notifying the lane, so its re-entrant close cannot release
+      // the single-flight slot. Release it here even for a socket lost during asynchronous planning.
+      this.done()
+    }
   }
 }
 

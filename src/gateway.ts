@@ -17,7 +17,7 @@ import {
 import { CLAUDE_CODE_VERSION, MCP_PREFIX, RESUME_LINE } from './claude/pins.ts'
 import { claudeVersion, executableIdentity, processIdentity } from './claude/process.ts'
 import { type Config, ConfigError, paths } from './config.ts'
-import { GatewayError, invalid, previousResponseNotFound } from './errors.ts'
+import { asGatewayError, GatewayError, invalid, previousResponseNotFound } from './errors.ts'
 import { Active, type ChainSpec, type Head, Lane, MAX_RESULT_CHARS, outputChars } from './lane.ts'
 import { type CallRef, decodeRecord, decodeThinking, digestItems, type ProviderRecord, RecordError, sha256, THINKING_PREFIX } from './records.ts'
 import { ResponseStore } from './store.ts'
@@ -158,25 +158,31 @@ export class Gateway {
   private start(state: ResponseState, plan: Plan, sink: EventSink): void {
     const active = new Active(state, sink, plan.prevId, plan.covered)
     const lane = plan.lane
-    lane.attach(active)
-    // A socket may close while the asynchronous history/store plan is being built. Never launch or release
-    // anything in that case; attach first so the same lane cancellation rolls back the attempt.
-    if (sink.isClosed) {
-      sink.onCancel?.()
-      return
+    try {
+      lane.attach(active)
+      // A socket may close while the asynchronous history/store plan is being built. Never launch or release
+      // anything in that case; attach first so the same lane cancellation rolls back the attempt.
+      if (sink.isClosed) {
+        sink.onCancel?.()
+        return
+      }
+      sink.send('response.created', { response: state.object() })
+      sink.send('response.in_progress', { response: state.object() })
+      // Initial event serialization can itself overflow the socket budget. Do not launch the model on a
+      // request whose transport has already failed; later emission failures cancel at a microtask boundary.
+      if (sink.isClosed) {
+        sink.onCancel?.()
+        return
+      }
+      this.note('request', { session: lane.sessionId, response: state.id, path: state.gateway.path })
+      if (plan.spawn) lane.spawn(plan.spawn)
+      if (plan.delivery?.kind === 'turn') void lane.startTurn(plan.delivery.parts)
+      else if (plan.delivery?.kind === 'outputs') lane.release(plan.delivery.outputs, plan.delivery.notices?.hookText ?? null)
+    } catch (error) {
+      // Once attached, both transports own a streaming response. Never bubble an exception back to the
+      // route's pre-stream error handler: fail/close that response and clear/kill its lane instead.
+      lane.fail(asGatewayError(error))
     }
-    sink.send('response.created', { response: state.object() })
-    sink.send('response.in_progress', { response: state.object() })
-    // Initial event serialization can itself overflow the socket budget. Do not launch the model on a
-    // request whose transport has already failed; later emission failures cancel at a microtask boundary.
-    if (sink.isClosed) {
-      sink.onCancel?.()
-      return
-    }
-    this.note('request', { session: lane.sessionId, response: state.id, path: state.gateway.path })
-    if (plan.spawn) lane.spawn(plan.spawn)
-    if (plan.delivery?.kind === 'turn') void lane.startTurn(plan.delivery.parts)
-    else if (plan.delivery?.kind === 'outputs') lane.release(plan.delivery.outputs, plan.delivery.notices?.hookText ?? null)
   }
 
   cancel(id: string): Json {

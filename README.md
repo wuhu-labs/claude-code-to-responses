@@ -131,7 +131,9 @@ There is **one response in flight per connection**, including the asynchronous s
 second create is rejected, not queued, without disturbing the first. Request/protocol errors are messages shaped
 as `{"type":"error","status":400,"error":{"message":"…","type":"invalid_request_error","param":null,"code":"…"}}`.
 Ordinary validation errors leave the connection usable; after generation has started, model errors still arrive
-as `response.failed`, exactly as on SSE. Unknown client events, binary JSON, `stream_id`, `generate` (including
+as `response.failed`, exactly as on SSE. This includes a process-start/rebuild exception after the response is
+attached: it terminates that response, kills any partially started process, discards the attempt's tail and releases
+the conversation and socket single-flight slot, so the previous completed response can be retried. Unknown client events, binary JSON, `stream_id`, `generate` (including
 warm-up), steering and interrupt/cancel messages are typed `unsupported` errors. There is no automatic recovery
 or transport fallback: after `previous_response_not_found`, the client may explicitly resend full history on the
 same WebSocket.
@@ -345,6 +347,10 @@ HTTP cancellation, refused upgrades, oversized messages, shutdown and bounded ba
 is a raw TCP WebSocket peer, since a JS WebSocket still drains network input without a message listener. The
 incomplete-terminal transport test injects at the shared event-sink boundary (Claude Code may auto-continue a
 model-level `max_tokens` stop).
+
+`test/start_failure_test.ts` checks post-attach spawn exceptions before and after the process starts, preserves
+typed error codes, and exercises a real torn Claude config. Both WebSocket (same socket) and HTTP receive
+`response.failed`, then can retry the same parent with byte-identical model input after the failure is removed.
 
 `test/terminal_test.ts` reproduces a normally-reading WebSocket whose seventeen 1 MiB text blocks stream
 successfully but exceed the aggregate terminal limit, asserts terminal-batch backpressure preflight, and checks
