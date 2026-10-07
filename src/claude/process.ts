@@ -100,7 +100,16 @@ export async function processIdentity(pid: number): Promise<{ started: string; c
     const out = await new Deno.Command('/bin/ps', { args: ['-o', `${field}=`, '-p', String(pid)], stdout: 'piped', stderr: 'null' }).output()
     return out.success ? new TextDecoder().decode(out.stdout).trim() : ''
   }
-  const [started, comm] = await Promise.all([run('lstart'), run('comm')])
+  // Linux ps comm is a truncated process name, not the executable path used to fence orphan cleanup.
+  const executable = async () => {
+    if (Deno.build.os !== 'linux') return await run('comm')
+    try {
+      return await Deno.readLink(`/proc/${pid}/exe`)
+    } catch {
+      return ''
+    }
+  }
+  const [started, comm] = await Promise.all([run('lstart'), executable()])
   return started && comm ? { started, comm } : null
 }
 

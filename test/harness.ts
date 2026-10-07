@@ -5,7 +5,7 @@ import { Gateway } from '../src/gateway.ts'
 import { handler } from '../src/server.ts'
 import type { Exchange, Json } from './fake.ts'
 
-export const CLAUDE = `${Deno.env.get('HOME')}/.wuhu/vendors/claude/2.1.284/claude`
+export const CLAUDE = Deno.env.get('CLAUDE_BINARY') ?? `${Deno.env.get('HOME')}/.wuhu/vendors/claude/2.1.284/claude`
 export const REPO = new URL('..', import.meta.url).pathname.replace(/\/$/, '')
 
 /** Ports 18300-18399 only. */
