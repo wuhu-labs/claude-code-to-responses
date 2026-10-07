@@ -1,6 +1,7 @@
 // Scenario runs: the same conversation driven twice, once on one live process (the control) and once with
 // evictions and gateway restarts in between. The model must see byte-identical requests either way.
 import { assertEquals } from '@std/assert'
+import { kernelBody } from './kernel_shapes.ts'
 import { FakeAnthropic, type Json } from './fake.ts'
 import { cleanup, type Dirs, dirs, Driver, freePort, type Result, TestGateway } from './harness.ts'
 
@@ -106,8 +107,12 @@ export class Run {
   private setTransport(): void {
     if ((this.opts.transport ?? scenarioTransport) === 'websocket') {
       const ws = this.tg.websocket()
-      this.drv.sender = (body) => ws.send(body)
+      this.drv.sender = (body) => ws.send(this.shape(body))
     }
+  }
+
+  shape(body: Json): Json {
+    return scenarioKernelShape ? kernelBody(body) : body
   }
 
   /** Sends through the driver; a lost store answers previous_response_not_found, and the full history goes instead. */
@@ -167,6 +172,7 @@ export class Run {
 // Re-run the existing fake-endpoint assertions, not a new approximation of the scenarios. Deno runs these
 // tests serially in each module; restore the selector even on failure. Direct HTTP checks stay HTTP.
 let scenarioTransport: 'sse' | 'websocket' = 'sse'
+let scenarioKernelShape = false
 export function scenarioTest(name: string, fn: () => Promise<void>): void {
   Deno.test(name, fn)
   Deno.test(`WebSocket: ${name}`, async () => {
@@ -175,6 +181,16 @@ export function scenarioTest(name: string, fn: () => Promise<void>): void {
       await fn()
     } finally {
       scenarioTransport = 'sse'
+    }
+  })
+  Deno.test(`Kernel WebSocket: ${name}`, async () => {
+    scenarioTransport = 'websocket'
+    scenarioKernelShape = true
+    try {
+      await fn()
+    } finally {
+      scenarioTransport = 'sse'
+      scenarioKernelShape = false
     }
   })
 }

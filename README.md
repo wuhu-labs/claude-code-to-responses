@@ -42,14 +42,41 @@ reads `~/.claude`.
 
 ## The API: a subset of OpenAI Responses
 
-- `POST /v1/responses` with `stream: true`. Accepted: `model`, `instructions` (required), `tools` (function tools),
+- `POST /v1/responses` with `stream: true`. Accepted: `model`, `instructions` (or a leading input system/developer prompt on a full create), `tools` (function tools),
   `input` (a string, or `message`, `function_call`, `function_call_output` and `reasoning` items), `previous_response_id`,
-  `reasoning.effort` (`low`, `medium`, `high`, `xhigh`, `max`; default `high`), `metadata`, `store` (boolean), and the neutral values of
-  `tool_choice` (`auto`), `parallel_tool_calls`, `truncation`, `text`, `include` (`reasoning.encrypted_content`),
+  `reasoning.effort` (`low`, `medium`, `high`, `xhigh`, `max`; default `high`), `reasoning.summary: "auto"`,
+  `max_output_tokens` (a positive safe integer or `null`), `metadata`, `store` (boolean),
+  `tool_choice` (`auto` or a named function), and the neutral values of `parallel_tool_calls`, `truncation`, `text`, `include` (`reasoning.encrypted_content`),
   `service_tier`, `user`, `prompt_cache_key`, `safety_identifier`.
 - Anything else is a `400` with `code: unsupported` and the offending `param`: other tool types, `strict: true`,
-  `background`, `max_output_tokens`, `temperature`, `top_p`, non-text output formats, `system` or
+  `background: true`, `temperature`, `top_p`, non-text output formats, misplaced `system` or
   `developer` messages, item references, images outside base64 data URLs or formats other than PNG, JPEG, GIF and WebP.
+- **Instructions.** A full create (no `previous_response_id`) requires either nonempty top-level `instructions` or
+  a nonempty prompt from the maximal leading run of `system`/`developer` input messages (`type: "message"` or
+  omitted `type`). Each message’s content is a string or an array of `input_text` parts. Flatten all these strings
+  in message/part order and concatenate with **zero added bytes**: no separator, trimming, Unicode normalization
+  or newline conversion. Empty parts contribute nothing; explicit whitespace remains. The resulting prompt is
+  removed from conversation history and passed exactly as top-level instructions would be. Both prompt sources
+  together are `400 invalid_request` (`param: instructions`), even if they agree. Other prompt parts, a system/developer
+  message after any other item, or any system/developer input message in a continuation are typed `400 unsupported`.
+  A continuation may omit `instructions`; its resolved prompt is retained in the response’s provider record/store
+  and inherited across process eviction or gateway restart. Explicit continuation instructions must match byte for
+  byte, else `400 previous_response_not_found`; a full create is how the client starts a changed chain. Older records
+  without a saved prompt still work with explicit instructions; if the live chain is also gone, omission gives
+  `previous_response_not_found`, never an invented prompt or automatic detour.
+- **Output cap.** `max_output_tokens` becomes `CLAUDE_CODE_MAX_OUTPUT_TOKENS` on every launch/rebuild. On 2.1.284
+  the paired fake-endpoint probe measures upstream `max_tokens`: unset = 128000, 4096 = 4096, 8192 = 8192.
+  Positive safe integers are accepted; absent or `null` leaves Claude Code’s default. The cap is fixed per chain:
+  changing it, adding it, or removing it with `previous_response_id` gives `400 previous_response_not_found` before
+  any release/spawn. Start a full create to change it (old history is then synthesized, not claimed cache-identical).
+  The response echoes the configured cap, or `null` for Claude Code’s default. This caps each upstream model request,
+  not the sum of a multi-request response; Claude Code can auto-continue a model-level output-limit stop.
+- **Named tool choice.** `{"type":"function","name":"…"}` must name a declared function tool. It is accepted but
+  **not forced**: Claude Code has no per-request selection knob, and the response reports effective `tool_choice: "auto"`.
+  The client must handle a response without that call (as Wuhu does for forced compaction). `required`, `none` and
+  other shapes remain typed `400 unsupported`. A named hint does not change chain identity.
+- **Reasoning summary.** `reasoning.summary: "auto"` is accepted and ignored: Claude Code’s thinking is returned as
+  reasoning text, not summarized. Other non-null summary modes and `reasoning.max_tokens` are typed `400 unsupported`.
 - `store: false`, `store: true` and absent `store` are all accepted on both HTTP and WebSocket. `store` does not
   change the gateway's retention: every response's provider records are retained for continuation and rebuilds,
   so `previous_response_id` keeps working after a reconnect. The response object reports `store: true`, reflecting
@@ -63,10 +90,10 @@ reads `~/.claude`.
 
   | Code | When |
   |---|---|
-  | `invalid_request` | A malformed request (missing `model` or `instructions`, wrong types, invalid image base64). |
+  | `invalid_request` | A malformed request (missing `model` or a full create’s prompt, conflicting prompt sources, wrong types, invalid image base64). |
   | `unsupported` | A field or value outside the subset (above). |
   | `invalid_api_key` | `401`: the bearer token is missing or wrong (with `--auth-token-env`). |
-  | `previous_response_not_found` | The id is unknown, or `instructions`, `tools`, `model` or effort changed (a new Claude Code session): send the full history instead. |
+  | `previous_response_not_found` | The id is unknown, or `instructions`, `tools`, `model`, effort or output cap changed (a new Claude Code session): send the full history instead. |
   | `invalid_function_arguments` | A history `function_call` whose arguments are not a JSON object. |
   | `invalid_provider_record` | A malformed provider record in the history. |
   | `unexpected_reasoning_item` | A reasoning item next to new input that the gateway did not issue in this conversation. |
@@ -120,8 +147,9 @@ but **omit `stream`** (even `stream: false` is unsupported). Streaming is implic
 
 Each server text message is one of the same JSON streaming events as SSE, including `type` and a
 `sequence_number` starting at zero for each response. Finish a turn at `response.completed`, `response.failed`
-or `response.incomplete`, **not at socket EOF**. The socket stays open for later turns. Resend instructions, tools
-and other request properties on every create; they are not socket configuration.
+or `response.incomplete`, **not at socket EOF**. The socket stays open for later turns. Resend tools and other request properties on every create; they are not socket configuration. Instructions may be
+omitted in a continuation to inherit the chain’s prompt; if present they must match it exactly. Do not resend a
+system/developer input message in a continuation.
 
 ```json
 {"type":"response.create","model":"claude-opus-5-5","instructions":"Answer briefly.","previous_response_id":"resp_…","input":[{"role":"user","content":"And another question"}]}
@@ -165,10 +193,51 @@ parsed the bytes. Overflow before that boundary cancels active work. Fatal size/
 close; a client that never reads cannot be guaranteed to see that error. No output is silently dropped to keep an
 inference running.
 
+## Wuhu kernel request compatibility
+
+Checked against monorepo **def9ef929**, `ResponsesRequestBuilder.swift`, `ResponsesWebSocketSession.swift`,
+`ResponsesRequestBuilderTests.swift`, `ResponsesWebSocketTests.swift`, stock endpoint customization and
+InferenceKit’s executor/catalog. The `responses` dialect is not the `codex` dialect.
+
+| Kernel field/item | Gateway decision |
+|---|---|
+| `type: "response.create"` | WebSocket envelope, required; removed before shared request validation. |
+| `model` | Required, forwarded to Claude Code, fixed per chain. |
+| `stream: true` | HTTP/SSE only; kernel removes it on WebSocket (sending it there is unsupported). |
+| `store: false` | Accepted; records still retained; response reports actual `store: true`. |
+| Leading `{role:"system",content:"…"}` | Full create’s chain instructions, removed from history. Leading developer/text-part variants obey the literal-concatenation rule above. |
+| `previous_response_id` | Warm delta names the store/chain; unknown id is a typed miss. |
+| `input` on a warm delta | Only new items after the acknowledged baseline; no system message or top-level instructions. Tool-output ids are translated back to the provider’s ids by the kernel. |
+| `max_output_tokens` | Always set by the kernel executor, forwarded as the fixed process cap above. |
+| `reasoning: {effort,summary:"auto"}` | Effort forwarded/fixed per chain; summary accepted, ignored. `include:["reasoning.encrypted_content"]` accepted (records always returned). |
+| `tools: [{type:"function",name,description,parameters,strict:false}]` | MCP function tools, fixed per chain; object-schema/name/size checks still apply. `strict:true` and hosted tools are unsupported. |
+| `tool_choice: {type:"function",name:"compact"}` | Forced-compaction create is accepted without forcing. The changed request properties make the kernel send full history, not a warm delta. |
+| `prompt_cache_key` | Kernel catalog supplies session id; accepted string, not forwarded. Claude Code’s cache identity remains its device/session `metadata.user_id`. |
+| User `{role:"user",content:[{type:"input_text",text}]}` | Text preserved; builder joins multiple user text blocks with LF before sending. |
+| User `{type:"input_image",image_url,detail:"original"}` | Existing base64 PNG/JPEG/GIF/WebP support; detail is harmless/ignored. Remote URLs, other formats and oversized images remain typed errors, never downloaded. |
+| Assistant `{type:"message",role:"assistant",content:[{type:"output_text",text,annotations:[]}],status:"completed",id:"msg_N",phase?}` | Text replay accepted; id/status/phase are replay metadata, not Claude prompt fields; nonempty annotations unsupported. |
+| `{type:"function_call",call_id,name,arguments}` | Accepted; arguments must be a JSON object string. |
+| `{type:"function_call_output",call_id,output:"…"}` | Accepted; validates held call ids/inline size. Empty tool text becomes `(no output)` in the kernel builder. |
+| `{type:"reasoning",id?,summary:[],encrypted_content}` (or summary_text array) | Gateway opaque records/thinking replayed; id/summary accepted as metadata. Unencrypted reasoning is not sent by the builder. |
+| Arbitrary hosted output items | Typed `400 unsupported`; the gateway implements function tools only. |
+| `temperature`, `reasoning.max_tokens`, `tool_choice:"required"` | Builder can emit these for non-kernel/custom callers; typed `400 unsupported`, never silently changed. The kernel executor uses effort plus named compaction, not these options. |
+| `parallel_tool_calls`, `text`, `metadata` | Not sent by today’s `responses` kernel/catalog; neutral `true`, plain text/medium verbosity and string-valued metadata remain accepted. Metadata is echoed, not forwarded. |
+| `prompt_cache_retention`, other text verbosity | Not configured by today’s kernel catalog; custom stock-endpoint long retention/low-or-high verbosity remains typed `400 unsupported`. |
+| `Authorization: Bearer …` | Always sent by the kernel. Without `--auth-token-env` it is ignored on HTTP and WebSocket; a placeholder credential is sufficient. With auth configured the ordinary bearer check remains mandatory. |
+
+`test/fixtures/wuhu-full-create.json` and `wuhu-forced-compact.json` are the body objects copied unchanged from
+monorepo def9ef929’s `gpt-5.4-forced-compact/{1,2}.request.json` integration recordings (no handshake headers).
+Their contract test validates both the original HTTP body and its WebSocket projection (stream omitted, kernel cap
+and cache key added). `test/kernel_shapes.ts` projects the current builder’s asserted wire layouts for dynamic
+histories, not a production capture. Existing scenario assertions run a third time with kernel-shaped bodies over
+WebSocket, including idle and held-call evictions, retained-store restarts and **lost-store full-history rebuild**.
+`test/kernel_test.ts` adds full/delta/forced-compaction contracts, durable prompt inheritance, cap/changed-prompt
+rejections before tool release, literal prompt joining, legacy record compatibility and no-auth bearer acceptance.
+
 ## How it works
 
-**Chains.** A chain is one Claude Code session: fixed `instructions` (passed as `--system-prompt-file`, kept off argv,
-which Claude Code snapshots on the first request), tools, model and effort. Every session runs in the one working
+**Chains.** A chain is one Claude Code session: fixed resolved `instructions` (passed as `--system-prompt-file`, kept off argv,
+which Claude Code snapshots on the first request), tools, model, effort and output cap. Every session runs in the one working
 folder (`--work-dir`); with no native tools it only shows up in the environment block, which therefore reads the same
 in every conversation and on every machine. All sessions share the gateway's Claude Code config folder
 (`<state-dir>/claude/config`); each session's log is `projects/<working folder>/<session>.jsonl` there. A test runs five
@@ -282,6 +351,7 @@ the table). The source of truth is `src/claude/pins.ts`.
 | `CLAUDE_CODE_SILENT_TURN_REMINDER` | `0` | No "The user hasn't heard from you in a while" after silent tool rounds | CLAUDE_CODE_SILENT_TURN_REMINDER=0 … (paired) |
 | `MAX_MCP_OUTPUT_TOKENS` | `1000000` | Lifts Claude Code's 25,000-token cap on MCP results. With the size annotation a 500,000-character result stays inline even without it, so it is a backstop | MAX_MCP_OUTPUT_TOKENS … (paired, without the annotation) |
 | `CLAUDE_CODE_RESUME_INTERRUPTED_TURN` | `1` on the held-call resume only | Resumes the turn from tool results + user content with nothing foreign | CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1 … (paired) |
+| `CLAUDE_CODE_MAX_OUTPUT_TOKENS` | request cap, else unset | Fixed per chain, reapplied on every rebuild; changes upstream `max_tokens` | CLAUDE_CODE_MAX_OUTPUT_TOKENS … (paired: unset, 4096, 8192) |
 | `CLAUDE_CODE_MAX_RETRIES` | `0` | An upstream error ends the turn at once as `terminal_reason: api_error` with `api_error_status`; the client owns retries | CLAUDE_CODE_MAX_RETRIES=0 … (paired: unset retries) |
 
 Set but **not verified** by the probe:
@@ -410,7 +480,8 @@ Whether Anthropic's own cache depends on `metadata` is unknown: no request in th
   state directory; the tests check that the real image blocks and full request prefix survive both idle eviction
   and lost-store replay. Config-rooted label regeneration is not guaranteed byte-identical across state directories.
   Live MCP delivery may add a source label that evicted delivery does not; it is saved in the provider record and persists in every later replay.
-- No per-request `tool_choice`, `max_output_tokens` or forced compaction: Claude Code has no per-request knob.
+- No forced `tool_choice` or forced compaction: named choices are accepted as unforced hints. The output cap is
+  per-process, fixed per chain, not mutable per request.
 - A model stream Claude Code retries mid-message fails the response (`upstream_stream_cut`): streamed output cannot be
   withdrawn. The client retries; the rebuild is warm.
 - The fake endpoint can't answer what only Anthropic can: first-party tool search, real cache hits and TTLs, real

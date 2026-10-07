@@ -1,0 +1,103 @@
+{
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "input": [
+    {
+      "content": "You are a long-running session agent. Keep answers to one sentence.",
+      "role": "system"
+    },
+    {
+      "content": [
+        {
+          "text": "What is the capital of France?",
+          "type": "input_text"
+        }
+      ],
+      "role": "user"
+    },
+    {
+      "encrypted_content": "gAAAAABqSqc-TnCm7qLMGJN3RPbh0CNorV1ja6LAOyNWN5d0DcE0uhGl9ndmsGayDNt5QIsnzqeuy2aAfo-5NwhoKqG9oH3YfIVrQ8n2sAI1R1R9VhJ_DPbIh0hg0kxIKf6DtZgEBcZ8wY6B__s91RA0LCwRs4qfp-jHO2bxAO-ZPlofnBkQUsjDnPaoU9XTUMBi-uT-KwU92BrrTBogq0U348BQLgxa9OcVeQZt2s8rVfiyHzn9_LJ3s_Sb0hFUAeA9MEBQzsDT8hL7h-zAPWSAYNW1NS6mMJgio7ZEgCAS4oHQQu6YIAmDANJaCD2mFjZ4SGf_IrMBQcI8Qu62DUBv6iD6b9ZM-TQ9VRsmnVsEt-apPtkm5DwUu9wILda6EdY1NlOjfSzzpIsw8ZDAr3tZ771yOd5pr5v6EYMUHrDr3DVZGRvqj9kRNlNsAK1p8nJzeOQZCWsnNvQONzLOAVihzayfe9vl0OQQ3QGEd1JFGMqSGCzYBnJOCJItpkqec_vbjTg7SxeVp4YItL8O_YE8p9oOPdX9ZN-kTsN7qq-kBbOhSQu3qOPwkljZY4bb6eOK1Ibku_4CK-SZ_X9KRHVMakqgBr4S1vQMAMeJ1ALxmzXbciCitXGZ8hejBPCur2fNjIkROVQ5CPLUQOMSqHB8BtXP1-lLHcIa0ZnwNqU0jX3X_MCewRm72UA-TgLda01rooY7ctTMZUV8ID9h11Hy0wifTiwoad9LNhwzPg9dmLvgcDgmekyqk1set5CtXtPgVyxHu2W7kiCN0Ylx4jL4Gcsq7uo4ls4EzAv8yllpGWk0PQ-9z40WcHOqDLyp2xta6Ruwl-6hlq_WE8nLsUOsyPUtBqFMTT8hXdK8vUC5HY38zR73xIWcCjqix5bNVMZ3y9Cu4bM_bFq5OktazSAwia4NQWzIDa8S4qVnAC1ahAGzbRN3o4SLifPby1ZpkACL6cIE2lXEaKSou6_CroQszvRY0qwRcTvh9SL65RQHDH74dCndp329NKX9StoA4yMtOYL0v2o5s-FaN80xXAeSVDoCGA8egr8Gs4E03O8M0p55uL4CBB9-aaFrSJQ7plCXHclf_QrmIoZ1fDSQyrGudT8KPkuL11Q4SQLYnuu326BR4hXlnDY=",
+      "id": "rs_02df1f5a581b040e016a4aa73cde8c819995e6a9af18cf305a",
+      "summary": [
+        {
+          "text": "**Keeping answers concise**\n\nI need to provide a straightforward answer to the user's request. According to the developer's instruction, I should keep my responses to just one sentence. No need for any tools here; I’ll stick to being direct and clear. It feels good to be focused on giving the user the information they need without any fluff!",
+          "type": "summary_text"
+        }
+      ],
+      "type": "reasoning"
+    },
+    {
+      "content": [
+        {
+          "annotations": [],
+          "text": "The capital of France is Paris.",
+          "type": "output_text"
+        }
+      ],
+      "id": "msg_0",
+      "phase": "final_answer",
+      "role": "assistant",
+      "status": "completed",
+      "type": "message"
+    },
+    {
+      "content": [
+        {
+          "text": "Please continue with your tasks.",
+          "type": "input_text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "model": "gpt-5.4",
+  "reasoning": {
+    "effort": "high",
+    "summary": "auto"
+  },
+  "store": false,
+  "stream": true,
+  "tool_choice": {
+    "name": "compact",
+    "type": "function"
+  },
+  "tools": [
+    {
+      "description": "Returns the current weather for a city.",
+      "name": "get_weather",
+      "parameters": {
+        "properties": {
+          "city": {
+            "description": "City name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ],
+        "type": "object"
+      },
+      "strict": false,
+      "type": "function"
+    },
+    {
+      "description": "Folds the conversation so far into a durable summary. Call with a summary of everything above.",
+      "name": "compact",
+      "parameters": {
+        "properties": {
+          "summary": {
+            "description": "Summary of the conversation so far",
+            "type": "string"
+          }
+        },
+        "required": [
+          "summary"
+        ],
+        "type": "object"
+      },
+      "strict": false,
+      "type": "function"
+    }
+  ]
+}

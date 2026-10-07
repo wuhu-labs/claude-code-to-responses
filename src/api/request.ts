@@ -24,7 +24,8 @@ export interface FnTool {
 
 export interface NormRequest {
   model: string
-  instructions: string
+  instructions: string | null
+  maxOutputTokens: number | null
   tools: FnTool[]
   effort: string
   previousResponseId: string | null
@@ -78,11 +79,18 @@ export function parseRequest(body: unknown, transport: 'sse' | 'websocket' = 'ss
   if (body.store !== undefined && typeof body.store !== 'boolean') {
     throw invalid('store', "'store' must be a boolean when present; it does not change gateway retention.")
   }
-  for (const k of ['max_output_tokens', 'temperature', 'top_p']) {
+  for (const k of ['temperature', 'top_p']) {
     if (body[k] !== undefined && body[k] !== null) throw unsupported(k, `'${k}' is not supported: Claude Code sets it.`)
   }
+  const maxOutputTokens = body.max_output_tokens ?? null
+  if (maxOutputTokens !== null && (!Number.isSafeInteger(maxOutputTokens) || maxOutputTokens <= 0)) {
+    throw invalid('max_output_tokens', "'max_output_tokens' must be a positive safe integer.")
+  }
   if (body.tool_choice !== undefined && body.tool_choice !== null && body.tool_choice !== 'auto') {
-    throw unsupported('tool_choice', "Only 'tool_choice: auto' is supported.")
+    const t = body.tool_choice
+    if (!isObj(t) || t.type !== 'function' || typeof t.name !== 'string' || !t.name || Object.keys(t).some((k) => k !== 'type' && k !== 'name')) {
+      throw unsupported('tool_choice', "Only 'auto' or a named function choice is supported; named choices are accepted but not forced.")
+    }
   }
   if (body.parallel_tool_calls !== undefined && body.parallel_tool_calls !== null && body.parallel_tool_calls !== true) {
     throw unsupported('parallel_tool_calls', "'parallel_tool_calls: false' is not supported.")
@@ -118,15 +126,13 @@ export function parseRequest(body: unknown, transport: 'sse' | 'websocket' = 'ss
   }
 
   if (typeof body.model !== 'string' || !body.model) throw invalid('model', "'model' is required.")
-  if (typeof body.instructions !== 'string' || !body.instructions) {
-    throw invalid('instructions', "'instructions' is required: it becomes Claude Code's --system-prompt, frozen per chain.")
-  }
 
   let effort = DEFAULT_EFFORT
   if (body.reasoning !== undefined && body.reasoning !== null) {
     if (!isObj(body.reasoning)) throw invalid('reasoning', "'reasoning' must be an object.")
     for (const k of Object.keys(body.reasoning)) {
       if (k === 'effort') continue
+      if (k === 'summary' && body.reasoning[k] === 'auto') continue
       if ((k === 'summary' || k === 'generate_summary') && (body.reasoning[k] === null || body.reasoning[k] === undefined)) continue
       throw unsupported(`reasoning.${k}`, `'reasoning.${k}' is not supported: thinking is returned as reasoning text, never summarized.`)
     }
@@ -181,15 +187,50 @@ export function parseRequest(body: unknown, transport: 'sse' | 'websocket' = 'ss
     }
   }
 
-  const input = parseInput(body.input)
+  if (isObj(body.tool_choice) && !tools.some((t) => t.name === body.tool_choice.name)) {
+    throw invalid('tool_choice.name', 'A named tool choice must name one of the request’s function tools.')
+  }
+  const { instructions, input } = parseInstructionsAndInput(body, previousResponseId)
   if (input.length === 0) throw invalid('input', "'input' must not be empty.")
-  return { model: body.model, instructions: body.instructions, tools, effort, previousResponseId, input, metadata, body }
+  return { model: body.model, instructions, maxOutputTokens, tools, effort, previousResponseId, input, metadata, body }
 }
 
-function parseInput(input: unknown): InItem[] {
-  if (typeof input === 'string') return [{ kind: 'message', role: 'user', parts: [{ type: 'text', text: input }] }]
-  if (!Array.isArray(input)) throw invalid('input', "'input' must be a string or an array of items.")
-  return input.map((it, i) => parseItem(it, `input[${i}]`))
+function parseInstructionsAndInput(body: Json, previous: string | null): { instructions: string | null; input: InItem[] } {
+  const input = body.input
+  const leading: string[] = []
+  let first = 0
+  if (Array.isArray(input)) {
+    while (first < input.length) {
+      const it = input[first]
+      if (!isObj(it) || (it.type !== undefined && it.type !== 'message') || (it.role !== 'system' && it.role !== 'developer')) break
+      const p = `input[${first}]`
+      if (previous !== null) throw unsupported(`${p}.role`, 'System/developer input messages are only accepted at the beginning of a full create.')
+      if ('instructions' in body) throw invalid('instructions', 'Use top-level instructions or leading system/developer messages, never both.')
+      if (typeof it.content === 'string') leading.push(it.content)
+      else if (Array.isArray(it.content)) {
+        for (let j = 0; j < it.content.length; j++) {
+          const part = it.content[j]
+          if (!isObj(part) || part.type !== 'input_text') throw unsupported(`${p}.content[${j}].type`, 'Instructions accept only input_text parts.')
+          if (typeof part.text !== 'string') throw invalid(`${p}.content[${j}].text`, 'Instruction text must be a string.')
+          leading.push(part.text)
+        }
+      } else throw invalid(`${p}.content`, 'Instructions must be a string or an array of input_text parts.')
+      first++
+    }
+  }
+  let instructions: string | null = null
+  if ('instructions' in body) {
+    if (typeof body.instructions !== 'string' || !body.instructions) throw invalid('instructions', "'instructions' must be a nonempty string.")
+    instructions = body.instructions
+  } else if (first > 0) instructions = leading.join('')
+  let items: InItem[]
+  if (typeof input === 'string') items = [{ kind: 'message', role: 'user', parts: [{ type: 'text', text: input }] }]
+  else if (Array.isArray(input)) items = input.slice(first).map((it, i) => parseItem(it, `input[${i + first}]`))
+  else throw invalid('input', "'input' must be a string or an array of items.")
+  if (previous === null && !instructions) {
+    throw invalid('instructions', 'A full create requires nonempty top-level instructions or leading system/developer text.')
+  }
+  return { instructions, input: items }
 }
 
 function parseItem(it: unknown, p: string): InItem {
@@ -199,7 +240,7 @@ function parseItem(it: unknown, p: string): InItem {
     case 'message': {
       const role = it.role
       if (role !== 'user' && role !== 'assistant') {
-        throw unsupported(`${p}.role`, `Message role '${role}' is not supported: use 'instructions' for the system prompt, and 'user' or 'assistant' messages.`)
+        throw unsupported(`${p}.role`, `Message role '${role}' is not supported here: system/developer messages must lead a full create.`)
       }
       return { kind: 'message', role, parts: parseContent(it.content, `${p}.content`, role) }
     }

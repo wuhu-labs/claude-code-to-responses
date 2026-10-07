@@ -134,11 +134,23 @@ export class Gateway {
   /** Both transports use the same validation, reservations, processes and durable response store. */
   async createInto(req: NormRequest, sink: EventSink): Promise<void> {
     this.assertOpen()
+    if (req.instructions === null) {
+      const prev = req.previousResponseId!
+      const rec = this.store.get(prev)
+      if (!rec) throw previousResponseNotFound(prev, "it is not in this gateway's store")
+      const instructions = rec.instructions ?? this.lanes.get(rec.session)?.chain.instructions
+      if (instructions === undefined) throw previousResponseNotFound(prev, 'this older record requires explicit instructions')
+      req = { ...req, instructions }
+    }
+    // Preserve keys of pre-cap chains; an explicit cap is a process property, never an ignored request hint.
+    const properties: unknown[] = [req.model, req.effort, req.instructions, req.tools]
+    if (req.maxOutputTokens !== null) properties.push(req.maxOutputTokens)
     const chain: ChainSpec = {
-      key: await sha256(JSON.stringify([req.model, req.effort, req.instructions, req.tools])),
+      key: await sha256(JSON.stringify(properties)),
       model: req.model,
       effort: req.effort,
-      instructions: req.instructions,
+      instructions: req.instructions!,
+      maxOutputTokens: req.maxOutputTokens,
       tools: req.tools,
     }
     const state = new ResponseState(req)
@@ -220,7 +232,7 @@ export class Gateway {
     const rec = this.store.get(prev)
     if (!rec) throw previousResponseNotFound(prev, "it is not in this gateway's store")
     if (rec.chain !== chain.key) {
-      throw previousResponseNotFound(prev, 'instructions, tools, model or reasoning effort changed, which starts a new Claude Code session')
+      throw previousResponseNotFound(prev, 'instructions, tools, model, reasoning effort or max_output_tokens changed, which starts a new Claude Code session')
     }
     const head: Head = { responseId: rec.id, end: rec.end, calls: rec.calls }
     const input = await this.withoutOwnReasoning(req.input, prev)
@@ -316,7 +328,8 @@ export class Gateway {
       const recs = (await Promise.all(encrypted.map((e) => clientRecord(e, gi)))).filter((r) => r !== null)
       if (recs.length === 0) continue
       const r = recs[recs.length - 1]!
-      const fits = recs.length === 1 && r.chain === chain.key && r.prev === headId && (session === null || r.session === session) &&
+      const fits = recs.length === 1 && r.chain === chain.key && (r.instructions === undefined || r.instructions === chain.instructions) && r.prev === headId &&
+        (session === null || r.session === session) &&
         r.digest === await digestItems(pendingGroups.flatMap((x) => [...x.inputs, ...x.outputs]))
       // a record that does not continue the log (another chain, an edited history) is ignored: its group is synthesized,
       // unless a later record covers it

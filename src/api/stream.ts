@@ -61,7 +61,7 @@ export class ResponseState {
       error: this.error,
       incomplete_details: this.incomplete,
       instructions: this.req.instructions,
-      max_output_tokens: null,
+      max_output_tokens: this.req.maxOutputTokens,
       model: this.req.model,
       output: this.output,
       parallel_tool_calls: true,

@@ -30,6 +30,7 @@ export interface LaunchSpec {
   resume: boolean
   model: string
   effort: string
+  maxOutputTokens?: number | null
   /** File holding the system prompt (the request's instructions): on argv every local user could read it. */
   systemPromptPath: string
   workDir: string
@@ -90,6 +91,7 @@ export function launchEnv(s: LaunchSpec): Record<string, string> {
     CLAUDE_CODE_SILENT_TURN_REMINDER: '0',
     MAX_MCP_OUTPUT_TOKENS,
     CLAUDE_CODE_MAX_RETRIES: '0',
+    ...(s.maxOutputTokens != null ? { CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(s.maxOutputTokens) } : {}),
     ...(s.interruptedTurn ? { CLAUDE_CODE_RESUME_INTERRUPTED_TURN: '1' } : {}),
     ...s.backendEnv,
   }

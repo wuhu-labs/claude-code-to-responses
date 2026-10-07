@@ -739,3 +739,15 @@ Deno.test('concurrent probes own separate temp roots; closing one leaves the oth
   }
   assert(!exists(second.root))
 })
+
+probe('CLAUDE_CODE_MAX_OUTPUT_TOKENS changes upstream max_tokens (paired: unset)', async (p, fake) => {
+  fake.reply({ blocks: [text('a')] }, { blocks: [text('b')] }, { blocks: [text('c')] })
+  await p.launch({ name: 'cap-unset', fake, target: new ProbeTarget() }).turn('x')
+  await p.launch({ name: 'cap-4096', fake, target: new ProbeTarget(), env: { CLAUDE_CODE_MAX_OUTPUT_TOKENS: '4096' } }).turn('x')
+  await p.launch({ name: 'cap-8192', fake, target: new ProbeTarget(), env: { CLAUDE_CODE_MAX_OUTPUT_TOKENS: '8192' } }).turn('x')
+  const [normal, low, high] = fake.main().map((e) => e.body.max_tokens)
+  console.log(`output-cap probe: unset=${normal}, 4096=${low}, 8192=${high}`)
+  assertEquals(low, 4096)
+  assertEquals(high, 8192)
+  assertNotEquals(normal, low)
+})

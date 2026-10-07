@@ -19,6 +19,7 @@ export interface ChainSpec {
   key: string
   model: string
   effort: string
+  maxOutputTokens: number | null
   instructions: string
   tools: FnTool[]
 }
@@ -200,6 +201,7 @@ export class Lane implements BridgeTarget {
       resume: opts.resume,
       model: this.chain.model,
       effort: this.chain.effort,
+      maxOutputTokens: this.chain.maxOutputTokens,
       systemPromptPath,
       workDir: this.workDir,
       configDir: this.configDir,
@@ -778,6 +780,7 @@ export class Lane implements BridgeTarget {
       id: a.state.id,
       prev: a.prevId,
       chain: this.chain.key,
+      instructions: this.chain.instructions,
       session: this.sessionId,
       device: this.config.deviceId!,
       end,

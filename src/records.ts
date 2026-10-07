@@ -20,6 +20,8 @@ export interface ProviderRecord {
   prev: string | null
   /** Chain key: instructions, tools, model and effort. */
   chain: string
+  /** Resolved chain instructions for continuations that omit the prompt (older records may lack it). */
+  instructions?: string
   /** Claude Code session id. */
   session: string
   /** The chain's Claude Code device id (its config folder's userID): with the session id, metadata.user_id. */
@@ -105,6 +107,7 @@ export function checkRecord(r: any): void {
   if (typeof r.id !== 'string' || !RESPONSE_ID.test(r.id)) fail('bad id')
   if (r.prev !== null && (typeof r.prev !== 'string' || !RESPONSE_ID.test(r.prev))) fail('bad prev')
   if (typeof r.chain !== 'string' || !HEX64.test(r.chain)) fail('bad chain')
+  if (r.instructions !== undefined && (typeof r.instructions !== 'string' || !r.instructions)) fail('bad instructions')
   if (typeof r.digest !== 'string' || !HEX64.test(r.digest)) fail('bad digest')
   if (typeof r.session !== 'string' || !SESSION_ID.test(r.session)) fail('bad session')
   if (typeof r.device !== 'string' || !DEVICE_ID.test(r.device)) fail('bad device')

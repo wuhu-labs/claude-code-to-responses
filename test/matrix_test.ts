@@ -162,7 +162,7 @@ scenarioTest('cancel mid-stream: the response fails as cancelled, the process go
     run.fake.reply({ blocks: [text('partial'), text('never sent')], gapMs: 1500 })
     let id = ''
     const body = { model: MODEL, instructions: INSTRUCTIONS, tools: TOOLS, previous_response_id: run.drv.prevId, input: [user('C2 slow')] }
-    const final = await streamUntil(run.tg, body, (ev) => ev.type === 'response.output_text.delta', async (ev) => {
+    const final = await streamUntil(run.tg, run.shape(body), (ev) => ev.type === 'response.output_text.delta', async (ev) => {
       id = ev.item_id && (run.tg.gw.lanes.values().next().value!.active!.state.id)
       const res = await fetch(`${run.tg.url}/v1/responses/${id}/cancel`, { method: 'POST' })
       assertEquals(res.status, 200)
@@ -201,7 +201,7 @@ scenarioTest('interrupt while the released calls continue: the outputs come agai
       previous_response_id: r1.response.id,
       input: [{ type: 'function_call_output', call_id: 'toolu_i', output: 'I-OUT' }],
     }
-    const final = await streamUntil(run.tg, body, (ev) => ev.type === 'response.output_text.delta', async () => {
+    const final = await streamUntil(run.tg, run.shape(body), (ev) => ev.type === 'response.output_text.delta', async () => {
       const id = run.tg.gw.lanes.values().next().value!.active!.state.id
       await (await fetch(`${run.tg.url}/v1/responses/${id}/cancel`, { method: 'POST' })).body?.cancel()
     })
@@ -287,16 +287,16 @@ scenarioTest('typed errors: the subset, unknown ids, wrong outputs, a busy chain
     await expect({ ...base, input: 'x', stream: true, background: true }, 400, 'unsupported')
     await expect({ ...base, input: 'x', stream: true, tools: [{ type: 'web_search' }] }, 400, 'unsupported')
     await expect({ ...base, input: 'x', stream: true, tool_choice: 'required' }, 400, 'unsupported')
-    await expect({ ...base, input: [{ role: 'system', content: 'x' }], stream: true }, 400, 'unsupported')
+    await expect({ ...base, input: [{ role: 'system', content: 'x' }], stream: true }, 400, 'invalid_request')
     await expect({ ...base, input: [{ type: 'item_reference', id: 'x' }], stream: true }, 400, 'unsupported')
-    await expect({ ...base, input: 'x', stream: true, max_output_tokens: 5 }, 400, 'unsupported')
+    await expect({ ...base, input: 'x', stream: true, max_output_tokens: 0 }, 400, 'invalid_request')
     await expect({ ...base, input: 'x', stream: true, frequency_penalty: 1 }, 400, 'unsupported')
     await expect({ ...base, input: 'x', stream: true, previous_response_id: 'resp_nope' }, 400, 'previous_response_not_found')
     await expect({ ...base, instructions: undefined, input: 'x', stream: true }, 400, 'invalid_request')
 
     run.fake.reply({ blocks: [call('toolu_e', 'echo', { text: 'e' })] })
     const r1 = await run.send([user('E1')])
-    const prev = { ...base, stream: true, previous_response_id: r1.response.id }
+    const prev = { ...run.shape({ ...base, previous_response_id: r1.response.id, input: [] }), stream: true }
     await expect({ ...prev, input: [user('no outputs')] }, 400, 'missing_tool_output')
     await expect({ ...prev, input: [{ type: 'function_call_output', call_id: 'toolu_zz', output: 'x' }] }, 400, 'unexpected_tool_output')
     await expect({ ...prev, input: [{ type: 'function_call_output', call_id: 'toolu_e', output: 'x'.repeat(500_001) }] }, 400, 'tool_output_too_large')
