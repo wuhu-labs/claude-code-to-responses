@@ -291,6 +291,36 @@ probe(
   },
 )
 
+Deno.test("a device id seeded as userID in the config folder's .claude.json becomes metadata.user_id's device_id (paired with a fresh folder)", async () => {
+  const fake = new FakeAnthropic(freePort())
+  const device = 'd'.repeat(32) + 'e'.repeat(32)
+  const seen: string[] = []
+  try {
+    for (const seed of [true, false, true]) {
+      const p = new Probe()
+      try {
+        Deno.mkdirSync(`${p.root}/config`, { recursive: true })
+        if (seed) Deno.writeTextFileSync(`${p.root}/config/.claude.json`, JSON.stringify({ userID: device }))
+        fake.reply({ blocks: [text('a')] })
+        const r = p.launch({ name: 'device', fake, target: new ProbeTarget() })
+        await r.turn('x')
+        const meta = JSON.parse(fake.main().at(-1)!.body.metadata.user_id)
+        assertEquals(meta.session_id, r.spec.sessionId)
+        seen.push(meta.device_id)
+        // Claude Code keeps the seeded id (and writes a generated one to the same key)
+        assertEquals(JSON.parse(Deno.readTextFileSync(`${p.root}/config/.claude.json`)).userID, meta.device_id)
+      } finally {
+        await p.close()
+      }
+    }
+  } finally {
+    await fake.close()
+  }
+  assertEquals(seen[0], device)
+  assertEquals(seen[2], device)
+  assert(/^[0-9a-f]{64}$/.test(seen[1]) && seen[1] !== device, 'a fresh folder generates its own id')
+})
+
 probe('a log rebuilt from the mirrored entries resumes into a byte-identical request', async (p, fake) => {
   const work = '/tmp/cc2r-probe/rebuild'
   const script = () => {
