@@ -19,7 +19,8 @@ deno run -A src/main.ts \
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--listen host:port` | `127.0.0.1:18330` | Responses API address. There is no authentication: keep it on loopback. |
+| `--listen host:port` | `127.0.0.1:18330` | Responses API address. Off loopback the gateway refuses to start without `--auth-token-env`. |
+| `--auth-token-env VAR` | none | Clients must send `Authorization: Bearer $VAR` (`401 invalid_api_key` otherwise). The token is read from the environment, never from argv. |
 | `--state-dir` | required | Response store (`responses/`), Claude Code's config dir and scratch home (`claude/`), per-process files (`run/`). |
 | `--work-root` | required | Parent of the per-chain working folders. Must be outside any git repository (checked at startup). |
 | `--claude` | required | The Claude Code 2.1.284 binary. |
@@ -27,6 +28,7 @@ deno run -A src/main.ts \
 | `--tz` | `UTC` | `TZ` of every Claude Code process. |
 | `--idle-timeout` | 1800 s | Kill a process that sits at a finished turn this long. |
 | `--hold-timeout` | 600 s | Kill a process whose held tool calls wait this long. |
+| (startup) | | Kills the Claude Code processes a crashed gateway left behind: each run folder records its process's pid, start time and executable, and only a process matching all three is killed. |
 | `--verify-logs` | off | After each process exits, check its log starts with the stored records, byte for byte (the tests turn it on). |
 
 The backend comes from the gateway's own environment: `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`,
@@ -53,8 +55,13 @@ Claude Code uses whatever login its isolated config dir (`<state-dir>/claude/con
     the client's job).
   - `missing_tool_output`, `unexpected_tool_output`, `tool_output_too_large` (over 500,000 characters),
     `invalid_function_arguments` (a history `function_call` whose arguments are not a JSON object),
-    `invalid_provider_record` (a malformed record in the history), `conversation_busy` (`409`: another response of the
-    chain is streaming or starting), `cancelled`.
+    `invalid_provider_record` (a malformed record in the history), `unexpected_reasoning_item`, `conversation_busy`
+    (`409`: another response of the chain is streaming or starting), `cancelled`.
+  - Upstream errors end the response at once (Claude Code's own retries are off, so the client's retry policy is the
+    only one): `upstream_invalid_request` (400), `upstream_authentication_error` (401/403), `rate_limit_exceeded`
+    (429), `upstream_overloaded` (529), `upstream_error` (5xx), `upstream_stream_cut` (an error in mid-stream).
+  - Gateway-side failures: `malformed_model_message` (a tool-use stop without a tool call), `record_incomplete`,
+    `claude_code_exited`, `claude_code_stdin`, `internal_error`.
 - Events are the standard streaming events: `response.created`, `response.in_progress`, `response.output_item.added`
   / `.done`, `response.content_part.added` / `.done`, `response.output_text.delta` / `.done`,
   `response.reasoning_text.delta` / `.done`, `response.function_call_arguments.delta` / `.done`, and one final
@@ -62,7 +69,9 @@ Claude Code uses whatever login its isolated config dir (`<state-dir>/claude/con
 - Output items: Claude's thinking blocks become `reasoning` items (text in `content`, the signature in
   `encrypted_content`); text blocks become assistant `message` items; tool calls become `function_call` items whose
   `call_id` is Claude's `tool_use` id. The last item is always one `reasoning` item whose `encrypted_content` is the
-  **provider record** (below). Store the items and send them back unchanged.
+  **provider record** (below). Store the items and send them back unchanged. With `previous_response_id`, the
+  gateway's own reasoning items may come back next to the new input and are ignored (they are the state the id names);
+  any other reasoning item there is a `400 unexpected_reasoning_item`.
 - Usage: `input_tokens` is uncached + cache-read + cache-written input, `input_tokens_details.cached_tokens` is
   Anthropic's `cache_read_input_tokens`, and `usage.anthropic` holds the raw numbers, summed over the model messages of
   the response.
@@ -71,8 +80,8 @@ Claude Code uses whatever login its isolated config dir (`<state-dir>/claude/con
 
 ## How it works
 
-**Chains.** A chain is one Claude Code session: fixed `instructions` (passed as `--system-prompt`, which Claude Code
-snapshots on the first request), tools, model and effort. Its working folder is `<work-root>/<session id>`, the same
+**Chains.** A chain is one Claude Code session: fixed `instructions` (passed as `--system-prompt-file`, kept off argv,
+which Claude Code snapshots on the first request), tools, model and effort. Its working folder is `<work-root>/<session id>`, the same
 absolute path every time.
 
 **Tool rounds.** The request's tools are served to Claude Code as MCP tools (`mcp__fn__<name>`) by a loopback HTTP
@@ -86,9 +95,15 @@ in through the PostToolUse hook of the response's last call. If that hook never 
 itself, e.g. an unknown tool), they go in at the end-of-turn Stop hook, and the inference that follows is part of the
 same response. With no held calls, new `message` items go in through stdin as one user turn.
 
-**Provider records.** Every line Claude Code writes to its session log reaches the gateway through
-`--session-mirror`. A response's record is every line written since the previous response, verbatim, so
-`log(response) = log(previous) + record`. A response that ends the model's turn completes at the turn's result, once
+**Undefined tools.** A model call of a tool the request doesn't define is answered by Claude Code itself, with its
+`<tool_use_error>Error: No such tool available: …` result. The client still receives the `function_call` and must
+send an output; the model never sees that output. A rebuild after an eviction writes Claude Code's exact entry, so
+the model sees the same thing on every path.
+
+**Provider records.** A response's record is every line Claude Code wrote to its session log since the previous
+response, read verbatim from the log file, so `log(response) = log(previous) + record`. `--session-mirror` tells the
+gateway when Claude Code has logged what it streamed; the file is the truth, so a line Claude Code writes only to disk
+reaches a record too. A response that ends the model's turn completes at the turn's result, once
 Claude Code has logged its end-of-turn hook, so the record holds the whole turn; one that ends in tool calls completes
 at `message_stop`. Records live in the response store (one file per response under `<state-dir>/responses`, owner-only)
 and travel with the response in `encrypted_content` (gzip + base64, not encrypted). A record from the client is
@@ -124,12 +139,12 @@ run that drops the pin to show its effect. The source of truth is `src/claude/pi
 | `--include-partial-messages` | | Stream events, so the response streams and ends at `message_stop` | headless stream-json … |
 | `--session-mirror` | | `transcript_mirror` frames carry every log line verbatim, in order (the provider records) | headless stream-json … |
 | `--model`, `--effort` | request `model`, `reasoning.effort` | Fixed per chain | headless stream-json … |
-| `--system-prompt` | `instructions` | Replaces Claude Code's default prompt; Claude Code still prepends its billing header and "You are a Claude agent, built on Anthropic's Claude Agent SDK." | headless stream-json … |
+| `--system-prompt-file` | a 0600 file holding `instructions` | Replaces Claude Code's default prompt, byte for byte as `--system-prompt` would, without putting it on argv where every local user could read it. Claude Code still prepends its billing header and "You are a Claude agent, built on Anthropic's Claude Agent SDK." | `--system-prompt-file` … (paired with `--system-prompt`) |
 | `--tools ""` (passed once) | | No native tools, no Skill tool: the request's tools are the only tools | `--tools ""` … (paired with `default`) |
 | `--permission-mode dontAsk` + settings `permissions.allow: ["mcp__fn"]` | | MCP calls run without a permission prompt | every probe: no `control_request` |
-| `--setting-sources ""` | | No user or project settings (hooks, env, permissions) | `--setting-sources ""` … (paired) |
+| `--setting-sources ""` | | No user or project settings (hooks, env, permissions), and no user or project MCP servers | `--setting-sources ""` … (two probes, each paired) |
 | `--settings <file>` | gateway-written | The gateway's own hooks: PostToolUse, PostToolUseFailure, Stop (HTTP) | headless …, Stop hook … |
-| `--strict-mcp-config --mcp-config <file>` | gateway-written | Only the gateway's MCP server (`fn`, HTTP, `timeout: 2147483647`) | `--setting-sources ""` … (paired) |
+| `--strict-mcp-config --mcp-config <file>` | gateway-written | Only the gateway's MCP server (`fn`, HTTP, `timeout: 2147483647`), even with settings open | `--strict-mcp-config` … (paired, planted user and project servers) |
 | `--session-id` / `--resume` | chain's session | New session, or a rebuilt log | headless …, a log rebuilt … |
 | MCP server `timeout` | `2147483647` | The longest Claude Code accepts; holds end by eviction, never by this | MCP server timeout … (65 s hold) |
 | MCP tool `_meta["anthropic/maxResultSizeChars"]` | `500000` | Results up to 500,000 characters stay inline, never moved to a file (the gateway refuses longer outputs) | anthropic/maxResultSizeChars … (paired) |
@@ -142,8 +157,12 @@ run that drops the pin to show its effect. The source of truth is `src/claude/pi
 | `CLAUDE_CODE_SILENT_TURN_REMINDER` | `0` | No "The user hasn't heard from you in a while" after silent tool rounds | CLAUDE_CODE_SILENT_TURN_REMINDER=0 … (paired) |
 | `MAX_MCP_OUTPUT_TOKENS` | `1000000` | Backstop against truncating a result the gateway accepted | anthropic/maxResultSizeChars … |
 | `CLAUDE_CODE_RESUME_INTERRUPTED_TURN` | `1` on the held-call resume only | Resumes the turn from tool results + user text with nothing foreign | CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1 … (paired) |
-| `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` | `1` | Hygiene; the backend sees only the conversation's requests and `/api/hello` | headless … (request paths) |
-| `DISABLE_AUTOUPDATER` | `1` | The pinned binary never updates itself | DISABLE_AUTOUPDATER=1 … (binary hash) |
+| `CLAUDE_CODE_MAX_RETRIES` | `0` | An upstream error ends the turn at once as `terminal_reason: api_error` with `api_error_status`; the client owns retries | CLAUDE_CODE_MAX_RETRIES=0 … (paired: unset retries) |
+
+Set but **not verified** by the probe, because the fake endpoint gives them nothing to act on:
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (the fake sees the same requests with or without it: the conversation's
+and `/api/hello`) and `DISABLE_AUTOUPDATER=1` (an update needs Claude Code to reach Anthropic's release server, which no
+test may do). Both are hygiene only; nothing in the gateway depends on them.
 
 Claude Code internals the gateway also relies on, asserted by the probe: the log a process mirrored resumes into a
 byte-identical request (`a log rebuilt from the mirrored entries …`), and a resumed log missing the `atis-latch` line
@@ -181,8 +200,6 @@ _Filled in by the DeepSeek run (M3)._
 
 - Images go in only at a turn start (stdin); notices sent with tool outputs are text, since hooks carry text only.
 - No per-request `tool_choice`, `max_output_tokens` or forced compaction: Claude Code has no per-request knob.
-- A model call of a tool the request doesn't define is answered by Claude Code itself ("No such tool available");
-  the client still receives the `function_call` and must send an output, which the model does not see.
 - A model stream Claude Code retries mid-message fails the response (`upstream_stream_cut`): streamed output cannot be
   withdrawn. The client retries; the rebuild is warm.
 - The fake endpoint can't answer what only Anthropic can: first-party tool search, real cache hits and TTLs, real

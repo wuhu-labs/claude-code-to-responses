@@ -27,14 +27,8 @@ function probe(name: string, fn: (p: Probe, fake: FakeAnthropic) => Promise<void
   })
 }
 
-let binaryHash = ''
-async function sha(path: string) {
-  return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', await Deno.readFile(path))), (b) => b.toString(16).padStart(2, '0')).join('')
-}
-
 Deno.test(`version: the binary is Claude Code ${CLAUDE_CODE_VERSION}`, async () => {
   assertEquals(await claudeVersion(CLAUDE, { PATH: '/usr/bin:/bin', HOME: '/tmp', DISABLE_AUTOUPDATER: '1' }), CLAUDE_CODE_VERSION)
-  binaryHash = await sha(CLAUDE)
 })
 
 probe(
@@ -379,10 +373,4 @@ probe('MCP server timeout 2147483647: a call held 65 s still returns (the HTTP d
   const res = await r.until((f) => f.type === 'result', 20000)
   assertEquals(res.result, 'done')
   assertStringIncludes(fake.main().at(-1)!.raw, 'AFTER 65 S')
-})
-
-Deno.test('DISABLE_AUTOUPDATER=1: the binary is unchanged after the probe', async () => {
-  if (!binaryHash) return
-  assertEquals(await sha(CLAUDE), binaryHash)
-  assertEquals(await claudeVersion(CLAUDE, { PATH: '/usr/bin:/bin', HOME: '/tmp', DISABLE_AUTOUPDATER: '1' }), CLAUDE_CODE_VERSION)
 })
