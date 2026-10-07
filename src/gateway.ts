@@ -98,7 +98,20 @@ export class Gateway {
       tools: req.tools,
     }
     const state = new ResponseState(req)
-    const plan = req.previousResponseId !== null ? await this.fromPrevious(req, chain, state) : await this.fromHistory(req, chain, state)
+    // the chain is reserved from the moment its session is known until the response is attached to its lane,
+    // so two requests can never both rebuild (or both continue) one chain
+    const reservation: Reservation = { session: null }
+    try {
+      const plan = req.previousResponseId !== null
+        ? await this.fromPrevious(req, chain, state, reservation)
+        : await this.fromHistory(req, chain, state, reservation)
+      return this.start(state, plan)
+    } finally {
+      if (reservation.session) this.reserved.delete(reservation.session)
+    }
+  }
+
+  private start(state: ResponseState, plan: Plan): ReadableStream<Uint8Array> {
     const sink = new SseSink()
     const active = new Active(state, sink, plan.prevId, plan.covered)
     sink.send('response.created', { response: state.object() })
@@ -124,11 +137,18 @@ export class Gateway {
     throw new GatewayError(404, 'not_found_error', 'not_found', `Response '${id}' not found.`, 'response_id')
   }
 
-  private busy(lane: Lane | undefined): void {
-    if (lane?.active) throw new GatewayError(409, 'conflict_error', 'conversation_busy', 'Another response of this conversation is in progress.')
+  private reserved = new Set<string>()
+
+  /** Takes the chain for this request, synchronously: busy if a response is streaming or another request holds it. */
+  private reserve(session: string, r: Reservation): void {
+    if (this.reserved.has(session) || this.lanes.get(session)?.active) {
+      throw new GatewayError(409, 'conflict_error', 'conversation_busy', 'Another response of this conversation is in progress.')
+    }
+    this.reserved.add(session)
+    r.session = session
   }
 
-  private async fromPrevious(req: NormRequest, chain: ChainSpec, state: ResponseState) {
+  private async fromPrevious(req: NormRequest, chain: ChainSpec, state: ResponseState, reservation: Reservation): Promise<Plan> {
     const prev = req.previousResponseId!
     const rec = this.store.get(prev)
     if (!rec) throw previousResponseNotFound(prev, "it is not in this gateway's store")
@@ -137,8 +157,8 @@ export class Gateway {
     }
     const head: Head = { responseId: rec.id, end: rec.end, calls: rec.calls }
     const delivery = deliveryFor(head, req.input)
+    this.reserve(rec.session, reservation)
     let lane = this.lanes.get(rec.session)
-    this.busy(lane)
     if (lane && !lane.dead && lane.head?.responseId === prev) {
       state.gateway = { path: 'live', session: rec.session }
       return { lane, delivery, prevId: prev, covered: req.input, spawn: null }
@@ -171,13 +191,14 @@ export class Gateway {
     return out
   }
 
-  private async fromHistory(req: NormRequest, chain: ChainSpec, state: ResponseState) {
+  private async fromHistory(req: NormRequest, chain: ChainSpec, state: ResponseState, reservation: Reservation): Promise<Plan> {
     const { groups, tail } = segment(req.input)
     if (tail.length === 0) throw invalid('input', 'The input ends with model output: there is nothing new to respond to.')
     if (groups.length === 0) {
       // a new conversation
       const sessionId = crypto.randomUUID()
       const delivery = deliveryFor(null, tail)
+      this.reserve(sessionId, reservation)
       const lane = new Lane(sessionId, this.workDir(sessionId), chain, null, this.config, this.bridge, this.store, this.laneEvents)
       this.addLane(lane)
       state.gateway = { path: 'new', session: sessionId }
@@ -209,8 +230,8 @@ export class Gateway {
     }
     if (pendingGroups.length) synth = pendingGroups
     const sessionId = session ?? crypto.randomUUID()
+    this.reserve(sessionId, reservation)
     const existing = this.lanes.get(sessionId)
-    this.busy(existing)
     if (existing) await existing.kill('superseded')
     for (const r of used) if (!this.store.has(r.id)) this.store.put(r)
 
@@ -277,6 +298,18 @@ export class Gateway {
     }
     return { lane, delivery: spawn.interruptedTurn ? null : delivery, prevId: headId, covered, spawn }
   }
+}
+
+interface Reservation {
+  session: string | null
+}
+
+interface Plan {
+  lane: Lane
+  delivery: Delivery | null
+  prevId: string | null
+  covered: InItem[]
+  spawn: { resume: boolean; interruptedTurn: boolean; log?: string[] } | null
 }
 
 interface Group {

@@ -5,12 +5,10 @@ import { call, type Json, text } from './fake.ts'
 import { freePort, user } from './harness.ts'
 import { INSTRUCTIONS, MODEL, Run, TOOLS } from './scenario.ts'
 
-async function post(url: string, body: Json) {
+/** Posts a request; an event stream is read to its end (dropping it would cancel the response). */
+async function post(url: string, body: Json): Promise<{ status: number; body: Json; events?: string }> {
   const res = await fetch(`${url}/v1/responses`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
-  if (res.headers.get('content-type')?.includes('event-stream')) {
-    await res.body?.cancel()
-    return { status: res.status, body: null }
-  }
+  if (res.headers.get('content-type')?.includes('event-stream')) return { status: res.status, body: null, events: await res.text() }
   return { status: res.status, body: await res.json() }
 }
 
@@ -97,5 +95,37 @@ Deno.test('a killed lane answers late MCP calls and hooks as stale, without touc
     const timeout = new Promise((_, no) => setTimeout(() => no(new Error('a late call was held by a dead lane')), 1000))
     await assertRejects(() => Promise.race([late, timeout]), StaleEpoch)
     assertThrows(() => lane.hook({ hook_event_name: 'PostToolUse', tool_use_id: 'toolu_d1' }), StaleEpoch)
+  })
+})
+
+Deno.test('two simultaneous continuations of one chain: one runs, the other is conversation_busy, no process is lost', async () => {
+  const { parseRequest } = await import('../src/api/request.ts')
+  const { GatewayError } = await import('../src/errors.ts')
+  const run = new Run('concurrent', false)
+  await run.run(async () => {
+    run.fake.reply({ blocks: [text('one')] })
+    await run.turn('one')
+    for (const evict of [true, false]) {
+      if (evict) await run.disrupt('idle')
+      run.fake.reply({ blocks: [text('slow')], gapMs: 300 })
+      const body = {
+        model: MODEL,
+        instructions: INSTRUCTIONS,
+        tools: TOOLS,
+        stream: true,
+        previous_response_id: run.drv.prevId,
+        input: [user(evict ? 'two' : 'three')],
+      }
+      // both enter the gateway in the same tick
+      const outcomes = await Promise.allSettled([run.tg.gw.create(parseRequest(body)), run.tg.gw.create(parseRequest(body))])
+      const won = outcomes.filter((o) => o.status === 'fulfilled') as PromiseFulfilledResult<ReadableStream<Uint8Array>>[]
+      const lost = outcomes.filter((o) => o.status === 'rejected') as PromiseRejectedResult[]
+      assertEquals([won.length, lost.length], [1, 1])
+      assert(lost[0].reason instanceof GatewayError && lost[0].reason.code === 'conversation_busy', String(lost[0].reason))
+      const events = await new Response(won[0].value).text()
+      assert(events.includes('response.completed'), JSON.stringify(/"error":(\{[^}]*\})/.exec(events)?.[1]) + ' evict=' + evict)
+      assertEquals(run.tg.events('spawn').length, 2)
+      run.drv.prevId = run.tg.events('completed').at(-1)!.data.response
+    }
   })
 })

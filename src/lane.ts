@@ -61,6 +61,8 @@ export class Active {
   /** Output items as the client will replay them, for the record digest. */
   outputs: InItem[] = []
   mirrorTimer: ReturnType<typeof setTimeout> | undefined
+  /** Claude Code's current turn is this response's (its input went in), so the turn's result is its business. */
+  ownsTurn = false
   constructor(
     readonly state: ResponseState,
     readonly sink: SseSink,
@@ -147,6 +149,8 @@ export class Lane implements BridgeTarget {
     this.bridge.register(this.epoch, this)
     const epoch = this.epoch
     this.turnOpen = opts.interruptedTurn
+    // the interrupted-turn resume starts the active response's turn by itself
+    if (opts.interruptedTurn && this.active) this.active.ownsTurn = true
     this.proc = new ClaudeProcess(spec, (f) => this.onFrame(f), (s) => this.onExit(epoch, s))
     this.events.note('spawn', { session: this.sessionId, pid: this.proc.pid, epoch, resume: opts.resume, interruptedTurn: opts.interruptedTurn })
   }
@@ -235,11 +239,14 @@ export class Lane implements BridgeTarget {
     await this.turnClosed()
     if (this.dead) return
     this.turnOpen = true
+    if (this.active) this.active.ownsTurn = true
     await this.proc!.write({ type: 'user', session_id: '', parent_tool_use_id: null, message: { role: 'user', content: contentFor(parts) } })
   }
 
   /** Releases held calls with the client's outputs. Notices are staged on the last call's hook first. */
   release(outputs: Map<string, Part[]>, notices: string | null): void {
+    // the held calls are the open turn's: this response continues it
+    if (this.active) this.active.ownsTurn = true
     const calls = this.head!.calls
     this.staged = notices !== null ? { callId: calls[calls.length - 1].id, text: notices } : null
     for (const [id, parts] of outputs) this.results.set(id, mcpResult(parts))
@@ -358,7 +365,8 @@ export class Lane implements BridgeTarget {
     this.turnOpen = false
     this.wakeTurn()
     const a = this.active
-    if (!a || a.finished) return
+    // a result can only end the active response's own turn, never the previous one's
+    if (!a || a.finished || !a.ownsTurn) return
     if (f.is_error) return this.fail(resultError(f))
     if (a.msg?.stopped) return // the record is still on its way from the mirror
     this.fail(serverError('turn_ended_without_message', `Claude Code ended its turn without a model message: ${String(f.result ?? '').slice(0, 300)}`))
