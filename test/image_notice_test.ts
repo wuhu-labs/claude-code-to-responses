@@ -4,7 +4,7 @@ import { MAX_IMAGE_BASE64_CHARS } from '../src/api/request.ts'
 import { decodeRecord } from '../src/records.ts'
 import { call, type Json, text } from './fake.ts'
 import { assertOneUserId, assertPrefix, output, user } from './harness.ts'
-import { IMAGE, IMAGE_BLOCK } from './images.ts'
+import { IMAGE, IMAGE_BLOCK, noisePng } from './images.ts'
 import { Run } from './scenario.ts'
 
 for (const path of ['live', 'evicted', 'history'] as const) {
@@ -158,6 +158,84 @@ for (const path of ['live', 'lost-store'] as const) {
       assertEquals(run.drv.text(corrected), 'corrected retry')
       assertEquals(corrected.response.x_gateway.path, 'history')
       assertEquals(run.fake.main().at(-1)!.body.messages.at(-1).content.find((b: Json) => b.type === 'image'), IMAGE_BLOCK)
+    })
+  })
+}
+
+for (const [path, size] of [['live', 'small'], ['evicted', 'small'], ['lost-store', 'small'], ['live', 'large'], ['evicted', 'large']] as const) {
+  Deno.test(`${size} images inside tool outputs on a ${path} hold survive idle eviction and lost-store record replay`, async () => {
+    const image = size === 'small' ? IMAGE : { type: 'input_image', image_url: `data:image/png;base64,${await noisePng()}` }
+    const imageBlock = size === 'small'
+      ? IMAGE_BLOCK
+      : { type: 'image', source: { type: 'base64', media_type: 'image/png', data: image.image_url.split(',')[1] } }
+    if (size === 'large') assertEquals(imageBlock.source.data.length, 810940)
+    const run = new Run(`tool-output-image-${path}-${size}`, false)
+    await run.run(async () => {
+      if (size === 'large') run.drv.opts.model += '[1m]' // fake count_tokens counts encoded characters as text
+      run.fake.reply({ blocks: [call('toolu_outputimg', 'echo', { text: 'image' })] })
+      await run.send([{ role: 'user', content: [IMAGE, { type: 'input_text', text: 'tool image' }] }])
+      assertEquals(run.fake.main()[0].body.messages[0].content.find((b: Json) => b.type === 'image'), IMAGE_BLOCK)
+      await run.tg.waitEvent('hold')
+      if (path === 'evicted') await run.disrupt('hold')
+      if (path === 'lost-store') await run.disrupt('restart-lost-store')
+      const configDir = `${run.d.stateDir}/claude/config`
+      run.fake.reply({ blocks: [text('saw tool image')] })
+      const completed = await run.send([{
+        type: 'function_call_output',
+        call_id: 'toolu_outputimg',
+        output: size === 'large' ? [image] : [{ type: 'input_text', text: 'before tool image' }, image, { type: 'input_text', text: 'after tool image' }],
+      }])
+      assertEquals(completed.status, 'completed')
+      const direct = run.fake.main()[1]
+      const result = direct.body.messages.at(-1).content.find((b: Json) => b.type === 'tool_result')
+      const actualImages = result.content.filter((b: Json) => b.type === 'image')
+      assertEquals(actualImages.length, 1)
+      if (size === 'small' || path !== 'live') assertEquals(actualImages, [imageBlock])
+      else {
+        const source = actualImages[0].source
+        assert(['image/png', 'image/jpeg'].includes(source.media_type))
+        assert(source.data.startsWith(source.media_type === 'image/jpeg' ? '/9j/' : 'iVBOR'))
+      }
+      assertEquals(
+        result.content.filter((b: Json) => b.type === 'text' && !b.text.startsWith('[Image: source: ')),
+        size === 'large' ? [] : [
+          { type: 'text', text: 'before tool image' },
+          { type: 'text', text: 'after tool image' },
+        ],
+      )
+      if (path === 'live') {
+        assertEquals(result.content.length, size === 'large' ? 2 : 4)
+        const label = result.content.find((b: Json) => b.type === 'text' && b.text.startsWith('[Image: source: '))
+        assertEquals(label.type, 'text')
+        assert(label.text.startsWith(`[Image: source: ${configDir}/projects/`))
+        assert(label.text.includes('/tool-results/mcp-fn-blob-'))
+        assert(/\.(png|jpeg|jpg)\]$/.test(label.text))
+      } else {
+        assertEquals(result.content.length, size === 'large' ? 1 : 3, 'appended tool-result images have no nested source label')
+      }
+      const record = await decodeRecord(completed.response.output.at(-1).encrypted_content)
+      assertExists(record)
+      const imageResults = record.entries.flatMap((entry) => JSON.parse(entry).message?.content ?? [])
+        .filter((b: Json) => b.type === 'tool_result' && b.tool_use_id === 'toolu_outputimg')
+      assertEquals(imageResults.length, 1)
+      assertEquals(imageResults[0].content, result.content, 'saved tool result includes any native MCP source label')
+      await run.disrupt('idle')
+      run.fake.reply({ blocks: [text('after idle')] })
+      await run.turn('next')
+      const sameConfig = run.fake.main()[2]
+      assertPrefix(direct, sameConfig)
+      await run.disrupt('restart-lost-store')
+      assert(configDir !== `${run.d.stateDir}/claude/config`)
+      run.fake.reply({ blocks: [text('after lost store')] })
+      const rebuilt = await run.turn('last')
+      assertEquals(rebuilt.response.x_gateway.path, 'history')
+      assertEquals(rebuilt.response.x_gateway.synthesized_groups, 0)
+      const recovered = run.fake.main()[3]
+      const rebuiltResult = recovered.body.messages.flatMap((m: Json) => m.content)
+        .find((b: Json) => b.type === 'tool_result' && b.tool_use_id === 'toolu_outputimg')
+      assertEquals(rebuiltResult.content, result.content, 'verbatim provider-record replay retains old label and real image bytes')
+      assertPrefix(sameConfig, recovered)
+      assertOneUserId(run.fake.main())
     })
   })
 }

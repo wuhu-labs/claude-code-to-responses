@@ -309,9 +309,14 @@ Whether Anthropic's own cache depends on `metadata` is unknown: no request in th
   limits are Claude Code’s and the backend’s responsibility.
 - Image notices require an eviction/resume and therefore cost a process restart. Claude Code 2.1.284 sends the real
   images, then adds its own `[Image: source: …/images/N.png]` text labels. These are not replacements for the images.
-  Their temporary paths are deterministic for the same user, working folder and session (the rebuild tests check
-  them), but changing those paths/user across machines can change these labels. Keep that environment stable for
-  byte-identical model requests.
+  User/notice-image label paths are deterministic for the same OS user, working folder and session (the rebuild
+  tests check them). Native MCP tool-output image labels instead depend on Claude Code’s configuration directory
+  (`state-dir/claude/config/projects/…`, including `tool-results/mcp-fn-blob-….png`) and can include generated names.
+  Do not generalize the user/notice-image path guarantee to tool outputs or newly generated labels after moving
+  state directories. Verbatim provider-record replay preserves existing tool-output labels, even into a different
+  state directory; the tests check that the real image blocks and full request prefix survive both idle eviction
+  and lost-store replay. Config-rooted label regeneration is not guaranteed byte-identical across state directories.
+  Live MCP delivery may add a source label that evicted delivery does not: this changes the new tail, not faithful replay of each saved record.
 - No per-request `tool_choice`, `max_output_tokens` or forced compaction: Claude Code has no per-request knob.
 - A model stream Claude Code retries mid-message fails the response (`upstream_stream_cut`): streamed output cannot be
   withdrawn. The client retries; the rebuild is warm.
