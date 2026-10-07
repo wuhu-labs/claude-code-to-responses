@@ -52,7 +52,9 @@ Claude Code uses whatever login its isolated config dir (`<state-dir>/claude/con
   - `context_length_exceeded`: Claude Code hit its blocking context limit (auto-compaction is off, so compaction is
     the client's job).
   - `missing_tool_output`, `unexpected_tool_output`, `tool_output_too_large` (over 500,000 characters),
-    `conversation_busy` (`409`: another response of the chain is streaming), `cancelled`.
+    `invalid_function_arguments` (a history `function_call` whose arguments are not a JSON object),
+    `invalid_provider_record` (a malformed record in the history), `conversation_busy` (`409`: another response of the
+    chain is streaming or starting), `cancelled`.
 - Events are the standard streaming events: `response.created`, `response.in_progress`, `response.output_item.added`
   / `.done`, `response.content_part.added` / `.done`, `response.output_text.delta` / `.done`,
   `response.reasoning_text.delta` / `.done`, `response.function_call_arguments.delta` / `.done`, and one final
@@ -86,12 +88,18 @@ same response. With no held calls, new `message` items go in through stdin as on
 
 **Provider records.** Every line Claude Code writes to its session log reaches the gateway through
 `--session-mirror`. A response's record is every line written since the previous response, verbatim, so
-`log(response) = log(previous) + record`. Records live in the response store (one file per response under
-`<state-dir>/responses`) and travel with the response in `encrypted_content` (gzip + base64, not encrypted).
+`log(response) = log(previous) + record`. A response that ends the model's turn completes at the turn's result, once
+Claude Code has logged its end-of-turn hook, so the record holds the whole turn; one that ends in tool calls completes
+at `message_stop`. Records live in the response store (one file per response under `<state-dir>/responses`, owner-only)
+and travel with the response in `encrypted_content` (gzip + base64, not encrypted). A record from the client is
+checked field by field (the session must be a UUID, links must be response ids, entries single-line JSON objects)
+before anything touches a file; a malformed one is a `400`.
 
 **Eviction and rebuild.** A process is killed after `--idle-timeout` at a finished turn, after `--hold-timeout`
 holding calls, on cancel, and on any failure. Killing only ends the gateway's wait: the client's tools keep running.
-The next request then rebuilds:
+Anything Claude Code logged after the last response (its tail) is stored with that response and carried into the next
+record; a cancelled or failed attempt is never kept. A chain is reserved from the moment a request names it until the
+response is attached, so simultaneous requests never rebuild it twice. The next request then rebuilds:
 
 - A known `previous_response_id` rebuilds the log from the store and resumes with `--resume`.
 - Without one, the gateway reads the history: each response group's record must continue the previous one (same
@@ -102,7 +110,8 @@ The next request then rebuilds:
   `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1`. The text is the notices that came with the outputs, else the fixed line
   `Continue from where you left off.`. It lands in that response's record, so every later rebuild repeats it exactly.
 - Each process gets a random epoch in its MCP and hook URLs; a call from a killed process finds no epoch and is
-  rejected (`410`), so it can never reach the process that replaced it.
+  rejected (`410`), so it can never reach the process that replaced it. An MCP call for a tool_use id the model never
+  produced is refused; a duplicate call of one id gets the same output.
 
 ## Claude Code pins (measured on 2.1.284)
 
