@@ -111,8 +111,6 @@ export class Lane implements BridgeTarget {
 
   constructor(
     readonly sessionId: string,
-    /** The chain's device id, seeded into its config folder so metadata.user_id is the same on every rebuild. */
-    readonly device: string,
     readonly workDir: string,
     readonly chain: ChainSpec,
     head: Head | null,
@@ -227,7 +225,7 @@ export class Lane implements BridgeTarget {
     )
     this.events.note('spawn', {
       session: this.sessionId,
-      device: this.device,
+      device: this.config.deviceId!,
       pid: this.proc.pid,
       epoch,
       resume: opts.resume,
@@ -237,8 +235,8 @@ export class Lane implements BridgeTarget {
 
   /**
    * Claude Code takes its device id (metadata.user_id's device_id) from its config folder's .claude.json `userID` and
-   * generates one only when there is none (probed). Seeding the chain's own id there before every launch makes
-   * metadata.user_id the same wherever and whenever the chain is rebuilt.
+   * generates one only when there is none (probed). The gateway's device id is seeded there before every launch (it
+   * writes only when the id differs), so every session sends the gateway's id, on every machine configured with it.
    */
   private seedDevice(): void {
     const path = `${this.configDir}/.claude.json`
@@ -249,8 +247,8 @@ export class Lane implements BridgeTarget {
     } catch (e) {
       if (!(e instanceof Deno.errors.NotFound)) throw e
     }
-    if (state.userID === this.device) return
-    state.userID = this.device
+    if (state.userID === this.config.deviceId) return
+    state.userID = this.config.deviceId
     Deno.writeTextFileSync(path, JSON.stringify(state, null, 2), { mode: 0o600 })
   }
 
@@ -778,7 +776,7 @@ export class Lane implements BridgeTarget {
       prev: a.prevId,
       chain: this.chain.key,
       session: this.sessionId,
-      device: this.device,
+      device: this.config.deviceId!,
       end,
       calls,
       digest: await digestItems([...a.covered, ...a.outputs]),

@@ -34,6 +34,8 @@ export class Run {
   d: Dirs
   gateways: TestGateway[] = []
   disruptions: { kind: Disruption; beforeRequest: number }[] = []
+  /** The device id every gateway of this run is configured with (the same across restarts and fresh state dirs). */
+  deviceId = Array.from(crypto.getRandomValues(new Uint8Array(32)), (x) => x.toString(16).padStart(2, '0')).join('')
 
   constructor(
     readonly name: string,
@@ -58,6 +60,7 @@ export class Run {
       idleTimeoutMs: this.opts.idleTimeoutMs,
       holdTimeoutMs: this.opts.holdTimeoutMs,
       recordTimeoutMs: this.opts.recordTimeoutMs,
+      deviceId: this.deviceId,
     })
     this.gateways.push(this.tg)
     this.drv = new Driver(this.tg.client, { instructions: INSTRUCTIONS, tools: TOOLS, model: MODEL, mode: this.opts.mode ?? 'previous' })
@@ -82,6 +85,7 @@ export class Run {
       idleTimeoutMs: this.opts.idleTimeoutMs,
       holdTimeoutMs: this.opts.holdTimeoutMs,
       recordTimeoutMs: this.opts.recordTimeoutMs,
+      deviceId: this.deviceId,
     })
     this.gateways.push(this.tg)
     this.drv.client = this.tg.client

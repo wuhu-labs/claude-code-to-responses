@@ -210,13 +210,13 @@ Deno.test("chains running in parallel share one Claude config folder without cor
   })
 })
 
-Deno.test("a chain's device id is in its records and seeded into its config folder: metadata.user_id is the chain's", async () => {
+Deno.test("the gateway's device id is seeded into the shared config folder, sent as metadata.user_id's device_id and noted in records", async () => {
   const run = new Run('device-id', false)
   await run.run(async () => {
     run.fake.reply({ blocks: [text('one')] })
     const r = await run.turn('one')
     const rec = (await recordOf(r))!
-    assert(/^[0-9a-f]{64}$/.test(rec.device))
+    assertEquals(rec.device, run.deviceId)
     const meta = JSON.parse(run.fake.main()[0].body.metadata.user_id)
     assertEquals([meta.device_id, meta.session_id], [rec.device, rec.session])
     const lane = [...run.tg.gw.lanes.values()][0]
@@ -224,7 +224,7 @@ Deno.test("a chain's device id is in its records and seeded into its config fold
   })
 })
 
-Deno.test('a rebuild on a completely fresh state dir from client records sends the same metadata.user_id', async () => {
+Deno.test('a rebuild on a completely fresh state dir configured with the same device id sends the same metadata.user_id', async () => {
   const run = new Run('fresh-state-metadata', false)
   await run.run(async () => {
     run.fake.reply({ blocks: [text('one')] })
@@ -254,5 +254,28 @@ Deno.test('every session runs in the one working folder, whatever the conversati
     assertEquals(JSON.stringify(x.body.messages[1]), JSON.stringify(y.body.messages[1]))
     assertStringIncludes(JSON.stringify(x.body.messages[1]), `Primary working directory: ${run.tg.gw.config.workDir}\\n`)
     assertEquals([...Deno.readDirSync(run.tg.gw.config.workDir)].length, 0, 'nothing is created in it')
+  })
+})
+
+Deno.test('a fresh state dir with another device id rebuilds the same model bytes; only metadata.user_id differs, and the mismatch is noted', async () => {
+  const run = new Run('other-device', false)
+  await run.run(async () => {
+    run.fake.reply({ blocks: [text('one')] })
+    await run.turn('one')
+    const first = run.deviceId
+    run.deviceId = 'f'.repeat(64)
+    await run.disrupt('restart-lost-store')
+    run.fake.reply({ blocks: [text('two')] })
+    const r = await run.turn('two')
+    assertEquals([r.response.x_gateway.path, r.response.x_gateway.records, r.response.x_gateway.synthesized_groups], ['history', 1, 0])
+    const [x, y] = run.fake.main()
+    const mx = JSON.parse(x.body.metadata.user_id), my = JSON.parse(y.body.metadata.user_id)
+    assertEquals([mx.device_id, my.device_id], [first, 'f'.repeat(64)])
+    assertEquals(my.session_id, mx.session_id)
+    // everything the model sees repeats what it saw before
+    assertPrefix({ ...x, body: { ...x.body, metadata: null } }, { ...y, body: { ...y.body, metadata: null } })
+    assertEquals(run.tg.events('device_mismatch').map((e) => e.data.records), [[first]])
+    // and the gateway keeps its own id: the shared folder is not re-seeded with the records' one
+    assertEquals(JSON.parse(Deno.readTextFileSync(`${run.tg.gw.config.stateDir}/claude/config/.claude.json`)).userID, 'f'.repeat(64))
   })
 })

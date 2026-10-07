@@ -40,6 +40,8 @@ export interface GatewayOpts {
   holdTimeoutMs?: number
   recordTimeoutMs?: number
   authToken?: string
+  /** The gateway's device id; without one the state dir generates its own. */
+  deviceId?: string
 }
 
 export class TestGateway {
@@ -60,6 +62,7 @@ export class TestGateway {
       verifyLogs: true,
       recordTimeoutMs: o.recordTimeoutMs,
       authToken: o.authToken,
+      deviceId: o.deviceId,
     })
     const gw = await Gateway.start(config)
     const server = Deno.serve({ hostname: config.hostname, port: config.port, onListen: () => {} }, handler(gw))

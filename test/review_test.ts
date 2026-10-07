@@ -677,3 +677,20 @@ Deno.test('the backend refusing a prompt as too long maps to context_length_exce
     assertEquals([r.status, r.response.error.code], ['failed', 'context_length_exceeded'])
   })
 })
+
+Deno.test('the device id: a typed error when malformed, from the flag or the environment, else generated once per state dir', async () => {
+  const { parseArgs, prepare, ConfigError, DEVICE_ID_ENV } = await import('../src/config.ts')
+  const { CLAUDE } = await import('./harness.ts')
+  const base = ['--state-dir', `/tmp/cc2r-test/device-state-${Date.now().toString(36)}`, '--work-dir', '/tmp/cc2r-test/device-work', '--claude', CLAUDE]
+  for (const bad of ['xyz', 'A'.repeat(64), 'a'.repeat(63)]) {
+    assertThrows(() => parseArgs([...base, '--device-id', bad], {}), ConfigError, '64 lowercase hex')
+    assertThrows(() => parseArgs(base, { [DEVICE_ID_ENV]: bad }), ConfigError, '64 lowercase hex')
+  }
+  assertEquals(parseArgs([...base, '--device-id', 'a'.repeat(64)], {}).deviceId, 'a'.repeat(64))
+  assertEquals(parseArgs(base, { [DEVICE_ID_ENV]: 'b'.repeat(64) }).deviceId, 'b'.repeat(64))
+  const generated = prepare(parseArgs(base, {})).deviceId!
+  assert(/^[0-9a-f]{64}$/.test(generated))
+  assertEquals(prepare(parseArgs(base, {})).deviceId, generated, 'kept in the state dir')
+  assertEquals(prepare(parseArgs([...base, '--device-id', 'c'.repeat(64)], {})).deviceId, 'c'.repeat(64), 'the flag wins')
+  Deno.removeSync(base[1], { recursive: true })
+})

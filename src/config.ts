@@ -25,7 +25,15 @@ export interface Config {
   verifyLogs: boolean
   /** How long a stopped model message may wait for its log entries and its turn's result (default 15 s). */
   recordTimeoutMs?: number
+  /**
+   * The gateway's Claude Code device id, sent in every request's metadata.user_id: from --device-id or
+   * CLAUDE_CODE_TO_RESPONSES_DEVICE_ID, else generated once into <state-dir>/device-id. Set by prepare().
+   */
+  deviceId?: string
 }
+
+export const DEVICE_ID_ENV = 'CLAUDE_CODE_TO_RESPONSES_DEVICE_ID'
+const DEVICE_ID = /^[0-9a-f]{64}$/
 
 export interface Paths {
   /** Claude Code's config folder, shared by every session: each session's log is projects/<work dir>/<session>.jsonl. */
@@ -62,6 +70,9 @@ Usage: claude-code-to-responses [options]
   --tz <zone>                TZ for every Claude Code process (default UTC)
   --idle-timeout <seconds>   kill a process idle at a finished turn after this long (default 1800)
   --hold-timeout <seconds>   kill a process holding tool calls after this long (default 600)
+  --device-id <64 hex>       the Claude Code device id sent in metadata.user_id (or CLAUDE_CODE_TO_RESPONSES_DEVICE_ID);
+                             default: generated once into <state-dir>/device-id. Give every gateway that should share
+                             a backend cache the same one
   --verify-logs              check each exited process's log against the stored records
 
 Backend: ${BACKEND_ENV.join(', ')} are read from the gateway's environment and handed to Claude Code.
@@ -78,7 +89,10 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
       flags.add(a)
       continue
     }
-    if (!['--listen', '--auth-token-env', '--bridge-port', '--state-dir', '--work-dir', '--claude', '--tz', '--idle-timeout', '--hold-timeout'].includes(a)) {
+    if (
+      !['--listen', '--auth-token-env', '--device-id', '--bridge-port', '--state-dir', '--work-dir', '--claude', '--tz', '--idle-timeout', '--hold-timeout']
+        .includes(a)
+    ) {
       throw new ConfigError(`unknown option ${a}\n\n${USAGE}`)
     }
     const v = argv[++i]
@@ -109,6 +123,10 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
   if (!isLoopback(m[1]) && !authToken) {
     throw new ConfigError(`--listen ${listen} is reachable beyond this machine: configure a token with --auth-token-env, or listen on loopback`)
   }
+  const deviceId = opts.get('--device-id') ?? env[DEVICE_ID_ENV]
+  if (deviceId !== undefined && !DEVICE_ID.test(deviceId)) {
+    throw new ConfigError(`the device id must be 64 lowercase hex digits (from --device-id or ${DEVICE_ID_ENV})`)
+  }
   const backendEnv: Record<string, string> = {}
   for (const k of BACKEND_ENV) {
     const v = env[k]
@@ -118,6 +136,7 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
     hostname: m[1],
     port: Number(m[2]),
     authToken,
+    deviceId,
     bridgePort: Number(opts.get('--bridge-port') ?? 0),
     stateDir: need('--state-dir'),
     workDir: opts.get('--work-dir') ?? '/tmp/claude-code-to-responses',
@@ -176,5 +195,22 @@ export function prepare(c: Config): Config {
   Deno.chmodSync(workDir, 0o700)
   const p = paths({ ...c, stateDir })
   for (const d of [p.configDir, p.homeDir, p.runDir]) Deno.mkdirSync(d, { recursive: true, mode: 0o700 })
-  return { ...c, stateDir, workDir }
+  return { ...c, stateDir, workDir, deviceId: c.deviceId ?? stateDeviceId(stateDir) }
+}
+
+/** The device id generated on this state dir's first start and kept in <state-dir>/device-id. */
+function stateDeviceId(stateDir: string): string {
+  const path = `${stateDir}/device-id`
+  try {
+    const id = Deno.readTextFileSync(path).trim()
+    if (!DEVICE_ID.test(id)) throw new ConfigError(`${path} does not hold a device id (64 lowercase hex digits)`)
+    return id
+  } catch (e) {
+    if (!(e instanceof Deno.errors.NotFound)) throw e
+  }
+  const b = new Uint8Array(32)
+  crypto.getRandomValues(b)
+  const id = Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('')
+  Deno.writeTextFileSync(path, id + '\n', { mode: 0o600 })
+  return id
 }
