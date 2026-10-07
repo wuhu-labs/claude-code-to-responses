@@ -38,7 +38,8 @@ export class Run {
   constructor(
     readonly name: string,
     readonly live: boolean,
-    readonly opts: { mode?: 'previous' | 'history'; tz?: string; workRoot?: string; idleTimeoutMs?: number; holdTimeoutMs?: number } = {},
+    readonly opts: { mode?: 'previous' | 'history'; tz?: string; workRoot?: string; idleTimeoutMs?: number; holdTimeoutMs?: number; recordTimeoutMs?: number } =
+      {},
   ) {
     this.fake = new FakeAnthropic(freePort())
     this.d = dirs(name)
@@ -56,6 +57,7 @@ export class Run {
       tz: this.opts.tz,
       idleTimeoutMs: this.opts.idleTimeoutMs,
       holdTimeoutMs: this.opts.holdTimeoutMs,
+      recordTimeoutMs: this.opts.recordTimeoutMs,
     })
     this.gateways.push(this.tg)
     this.drv = new Driver(this.tg.client, { instructions: INSTRUCTIONS, tools: TOOLS, model: MODEL, mode: this.opts.mode ?? 'previous' })
@@ -79,6 +81,7 @@ export class Run {
       tz: o.tz ?? this.opts.tz,
       idleTimeoutMs: this.opts.idleTimeoutMs,
       holdTimeoutMs: this.opts.holdTimeoutMs,
+      recordTimeoutMs: this.opts.recordTimeoutMs,
     })
     this.gateways.push(this.tg)
     this.drv.client = this.tg.client

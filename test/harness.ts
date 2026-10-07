@@ -38,6 +38,7 @@ export interface GatewayOpts {
   tz?: string
   idleTimeoutMs?: number
   holdTimeoutMs?: number
+  recordTimeoutMs?: number
 }
 
 export class TestGateway {
@@ -56,6 +57,7 @@ export class TestGateway {
       holdTimeoutMs: o.holdTimeoutMs ?? 600_000,
       backendEnv: o.backendEnv,
       verifyLogs: true,
+      recordTimeoutMs: o.recordTimeoutMs,
     })
     const gw = await Gateway.start(config)
     const server = Deno.serve({ hostname: config.hostname, port: config.port, onListen: () => {} }, handler(gw))

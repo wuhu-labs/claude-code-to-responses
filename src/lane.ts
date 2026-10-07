@@ -472,6 +472,8 @@ export class Lane implements BridgeTarget {
         return this.fail(serverError('upstream_stream_cut', 'The model stream was cut short and Claude Code retried; the partial output cannot be withdrawn.'))
       }
       this.continuing = false
+      // the response goes on with a new model message: the wait for the last one's record is over
+      clearTimeout(a.mirrorTimer)
       const u = ev.message?.usage ?? {}
       a.msg = {
         id: ev.message?.id,
@@ -584,7 +586,7 @@ export class Lane implements BridgeTarget {
         clearTimeout(a.mirrorTimer)
         a.mirrorTimer = setTimeout(() => {
           if (this.active === a && !a.finished) this.fail(serverError('record_incomplete', 'Claude Code did not log every block of the model message.'))
-        }, 15000)
+        }, this.config.recordTimeoutMs ?? 15000)
         this.maybeFinish()
         return
       }

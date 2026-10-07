@@ -20,6 +20,8 @@ export interface Config {
   backendEnv: Record<string, string>
   /** Check after every process exit that its log on disk starts with the stored records, byte for byte. */
   verifyLogs: boolean
+  /** How long a stopped model message may wait for its log entries and its turn's result (default 15 s). */
+  recordTimeoutMs?: number
 }
 
 export interface Paths {

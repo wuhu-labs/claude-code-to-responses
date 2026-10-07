@@ -3,7 +3,7 @@ import { assert, assertEquals, assertRejects, assertThrows } from '@std/assert'
 import { decodeRecord, encodeRecord } from '../src/records.ts'
 import { parseRequest } from '../src/api/request.ts'
 import { call, type Json, text } from './fake.ts'
-import { assertPrefix, freePort, user } from './harness.ts'
+import { assertPrefix, freePort, output, user } from './harness.ts'
 import { INSTRUCTIONS, MODEL, Run, TOOLS } from './scenario.ts'
 
 /** Posts a request; an event stream is read to its end (dropping it would cancel the response). */
@@ -285,4 +285,19 @@ Deno.test('a work root inside git is refused before anything is created or chang
   assertThrows(() => Deno.statSync(stateDir))
   assertThrows(() => Deno.statSync(`${inGit}/not`))
   Deno.removeSync(inGit, { recursive: true })
+})
+
+Deno.test('an end-of-turn continuation may stream longer than the record timeout', async () => {
+  const run = new Run('long-continuation', false, { recordTimeoutMs: 800 })
+  await run.run(async () => {
+    run.fake.reply(
+      { blocks: [call('toolu_k', 'echo', { text: 'k' }), call('toolu_u', 'nonexistent', {})] },
+      { blocks: [text('first part')] },
+      { blocks: [text('second'), text(' part'), text(' streams slowly')], gapMs: 600 },
+    )
+    await run.send([user('T1')])
+    const r = await run.send([output('toolu_k', 'K'), output('toolu_u', 'unknown tool'), user('NOTICE-STOP')])
+    assertEquals(r.status, 'completed', JSON.stringify(r.response.error))
+    assertEquals(run.drv.text(r), 'first partsecond part streams slowly')
+  })
 })
