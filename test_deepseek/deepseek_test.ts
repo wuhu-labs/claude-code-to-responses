@@ -96,10 +96,13 @@ Deno.test('DeepSeek: real tool rounds, and the cache stays warm after every kind
   const backendEnv = { ANTHROPIC_BASE_URL: BASE_URL, ANTHROPIC_AUTH_TOKEN: key }
   let d: Dirs = dirs('deepseek')
   const firstDirs = d
-  let tg = await TestGateway.start({ dirs: d, backendEnv })
+  // the gateway's device id, configured the same on every start (a fresh state dir included)
+  const deviceId = Array.from(crypto.getRandomValues(new Uint8Array(32)), (x) => x.toString(16).padStart(2, '0')).join('')
+  let tg = await TestGateway.start({ dirs: d, backendEnv, deviceId })
   const gateways = [tg]
   const drv = new Driver(tg.client, { instructions: INSTRUCTIONS, tools: TOOLS, model: MODEL, mode: 'previous' })
-  /** 'keep': same state; 'store': the response store is lost, Claude Code's config dir kept; 'all': a fresh state dir. */
+  /** 'keep': same state; 'store': the response store is lost, Claude Code's config dir kept; 'all': a fresh state dir
+   * (configured with the same device id). */
   const restart = async (lose: 'keep' | 'store' | 'all') => {
     await tg.close()
     if (lose === 'store') {
@@ -107,7 +110,7 @@ Deno.test('DeepSeek: real tool rounds, and the cache stays warm after every kind
       for (const sub of ['responses', 'tails']) Deno.removeSync(`${state}/${sub}`, { recursive: true })
     }
     if (lose === 'all') d = { stateDir: dirs('deepseek-fresh').stateDir, workDir: d.workDir }
-    tg = await TestGateway.start({ dirs: d, backendEnv })
+    tg = await TestGateway.start({ dirs: d, backendEnv, deviceId })
     gateways.push(tg)
     drv.client = tg.client
   }
@@ -180,11 +183,11 @@ Deno.test('DeepSeek: real tool rounds, and the cache stays warm after every kind
     last = t5.at(-1)!
     await pause()
 
-    // 5. a completely fresh state dir: the chain's device id comes back from its records and is seeded into the new
-    //    config folder, so metadata.user_id (which DeepSeek keys its cache on) is the same as before
+    // 5. a completely fresh state dir, configured with the same device id: metadata.user_id (which DeepSeek keys its
+    //    cache on) is the same as before
     await restart('all')
     const t6 = await turn('Thank you. Reply with one word.')
-    const fresh = measure('after a restart with a fresh state dir', t6[0], last)
+    const fresh = measure('after a restart with a fresh state dir (same device id)', t6[0], last)
     assertEquals([t6[0].response.x_gateway.path, t6[0].response.x_gateway.synthesized_groups], ['history', 0])
     last = t6.at(-1)!
     await pause()
