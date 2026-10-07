@@ -146,9 +146,14 @@ export class ProbeRun {
   }
 
   async user(text: string): Promise<void> {
+    await this.userContent([{ type: 'text', text }])
+  }
+
+  /** Raw SDK input shape: probes compare string and block slash-command handling. */
+  async userContent(content: string | Json[]): Promise<void> {
     await this.stdin.write(
       new TextEncoder().encode(
-        JSON.stringify({ type: 'user', session_id: '', parent_tool_use_id: null, message: { role: 'user', content: [{ type: 'text', text }] } }) + '\n',
+        JSON.stringify({ type: 'user', session_id: '', parent_tool_use_id: null, message: { role: 'user', content } }) + '\n',
       ),
     )
   }

@@ -4,6 +4,7 @@
 import type { FnTool, InItem, Part } from './api/request.ts'
 import { newId, type ResponseState, type SseSink, type UsageTotals } from './api/stream.ts'
 import { type Bridge, type BridgeTarget, McpCallError, StaleEpoch } from './bridge.ts'
+import { userContentBlocks } from './claude/entries.ts'
 import { ClaudeProcess, type Frame } from './claude/process.ts'
 import { type LaunchSpec, logPath, MAX_RESULT_CHARS, MCP_PREFIX, mcpConfigJson, projectDir, settingsJson } from './claude/pins.ts'
 import { type Config, paths } from './config.ts'
@@ -830,9 +831,7 @@ export class Lane implements BridgeTarget {
 }
 
 export function contentFor(parts: Part[]): Json[] {
-  return parts.map((p) =>
-    p.type === 'text' ? { type: 'text', text: p.text } : { type: 'image', source: { type: 'base64', media_type: p.mediaType, data: p.data } }
-  )
+  return userContentBlocks(parts)
 }
 
 export function mcpResult(parts: Part[]): Json {

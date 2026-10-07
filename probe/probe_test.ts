@@ -521,3 +521,195 @@ probe('appended large images may be re-encoded by Claude Code; both boundary and
     assertEquals(disk.map((l, i) => l === expected[i]), expected.map(() => true), 'image processing does not rewrite appended log bytes')
   }
 })
+
+const SLASH_COMMANDS = ['/compact', '/cost', '/context', '/foo']
+
+function assertSlashDispatch(command: string, r: { frames: Json[] }, fake: FakeAnthropic, n: number, from: number, result: Json) {
+  const requests = fake.exchanges.slice(n)
+  if (command === '/compact') assert(r.frames.slice(from).some((f) => f.subtype === 'compact_boundary'), 'native compaction ran')
+  else if (command === '/cost') {
+    assertStringIncludes(result.result, 'Total cost:')
+    assertEquals(requests.filter((e) => e.kind === 'main').length, 0)
+  } else if (command === '/context') {
+    assertStringIncludes(result.result, 'Context Usage')
+    assert(requests.some((e) => e.kind === 'count_tokens'))
+  } else {
+    assertStringIncludes(requests.find((e) => e.kind === 'main')!.raw, "The user's message starts with the slash command /foo")
+  }
+}
+
+probe('slash dispatch: string and block stdin input; only an initial command-shaped token in the last block triggers', async (p, fake) => {
+  for (const shape of ['string', 'blocks']) {
+    const r = p.launch({ name: `slash-${shape}`, fake, target: new ProbeTarget() })
+    await r.turn('seed')
+    for (const prefix of ['', ' ', '\n', '\t', 'ordinary ', '\u200b']) {
+      for (const command of SLASH_COMMANDS) {
+        const input = prefix + command, n = fake.exchanges.length, from = r.frames.length
+        await r.userContent(shape === 'string' ? input : [{ type: 'text', text: input }])
+        const result = await r.until((f) => f.type === 'result', 30000, from)
+        if (prefix === '') assertSlashDispatch(command, r, fake, n, from, result)
+        else {
+          assertEquals(result.result, 'FAKE-DEFAULT')
+          const requests = fake.exchanges.slice(n)
+          assertEquals(requests.map((e) => e.kind), ['main'])
+          assertEquals(requests[0].body.messages.at(-1).content[0].text, input)
+        }
+      }
+    }
+    await r.kill()
+  }
+})
+
+probe('slash dispatch lexical boundary: arguments, case, command punctuation, and path-like text', async (p, fake) => {
+  const r = p.launch({ name: 'slash-tokens', fake, target: new ProbeTarget() })
+  await r.turn('seed')
+  for (const input of ['/cost hello', '/cost\nhello', '/cost\thello', '/cost\rhello']) {
+    const n = fake.exchanges.length, from = r.frames.length
+    await r.user(input)
+    assertSlashDispatch('/cost', r, fake, n, from, await r.until((f) => f.type === 'result', 30000, from))
+  }
+  const commandLike = ['/COST', '/costX', '/123', '/foo-bar', '/foo:bar', '/_foo', '/foo_', '/foo\u00a0arg']
+  const ordinary = [
+    '/',
+    '/ cost',
+    '//cost',
+    '/foo/bar',
+    '/tmp/file',
+    '/!',
+    '/foo.bar',
+    '/é',
+    '/\\cost',
+    '/-foo',
+    '/:foo',
+    '/-',
+    '/:',
+    '/foo!',
+    '/foo?',
+    '\\/cost',
+  ]
+  for (const input of [...commandLike, ...ordinary]) {
+    const n = fake.main().length
+    await r.turn(input)
+    const last = fake.main()[n].body.messages.at(-1).content
+    assertEquals(last.at(-1).text, input)
+    assertEquals(last.some((b: Json) => b.text?.includes("The user's message starts with the slash command")), commandLike.includes(input), input)
+  }
+})
+
+probe('slash dispatch uses the last block, including text after images, not concatenated text or the first block', async (p, fake) => {
+  const cases: [Json[], boolean][] = [
+    [[{ type: 'text', text: 'prefix ' }, { type: 'text', text: '/cost' }], true],
+    [[{ type: 'text', text: '' }, { type: 'text', text: '/cost' }], true],
+    [[IMAGE_BLOCK, { type: 'text', text: '/cost' }], true],
+    [[{ type: 'text', text: '/cost' }, IMAGE_BLOCK], false],
+    [[{ type: 'text', text: '/co' }, { type: 'text', text: 'st' }], false],
+    [[{ type: 'text', text: '/cost' }, { type: 'text', text: '' }], false],
+  ]
+  for (const [content, dispatch] of cases) {
+    const r = p.launch({ name: `slash-blocks-${p.runs.length}`, fake, target: new ProbeTarget() })
+    const n = fake.exchanges.length, from = r.frames.length
+    await r.userContent(content)
+    const result = await r.until((f) => f.type === 'result')
+    if (dispatch) assertSlashDispatch('/cost', r, fake, n, from, result)
+    else {
+      assertEquals(result.result, 'FAKE-DEFAULT')
+      assertEquals(fake.exchanges.slice(n).filter((e) => e.kind === 'main').length, 1)
+    }
+    await r.kill()
+  }
+})
+
+probe('slash notices: PostToolUse context never dispatches; appended text dispatches, image-ending entries do not', async (p, fake) => {
+  const hook = new ProbeTarget(['echo'])
+  const live = p.launch({ name: 'slash-hook', fake, target: hook })
+  for (const command of SLASH_COMMANDS) {
+    hook.postToolNotice = command
+    fake.reply({ blocks: [call(`toolu_slash${fake.main().length}`, 'echo', {})] })
+    const n = fake.exchanges.length
+    await live.turn('tool')
+    assertEquals(fake.exchanges.slice(n).filter((e) => e.kind === 'main').length, 2)
+    assertEquals(fake.main().at(-1)!.body.messages.at(-1).content[0].text, `PostToolUse:mcp__fn__echo hook additional context: ${command}`)
+  }
+  await live.kill()
+  const t = new ProbeTarget(['hold'])
+  fake.reply({ blocks: [call('toolu_slashhold', 'hold', {})] })
+  const a = p.launch({ name: 'slash-resume-seed', fake, target: t })
+  await a.user('hold')
+  while (!t.held.has('toolu_slashhold')) await new Promise((res) => setTimeout(res, 50))
+  await new Promise((res) => setTimeout(res, 300))
+  await a.kill()
+  const log = a.log()
+  const cases: { image: string; shape: string; prefix: string }[] = [
+    ...['string', 'blocks'].flatMap((shape) => ['', ' ', '\n', 'ordinary '].map((prefix) => ({ image: 'none', shape, prefix }))),
+    ...['first', 'last'].map((image) => ({ image, shape: 'blocks', prefix: '' })),
+  ]
+  for (const { image, shape, prefix } of cases) {
+    for (const command of SLASH_COMMANDS) {
+      const input = prefix + command
+      const ctx = contextOf(log, a.spec.sessionId, a.spec.workDir)
+      const result = toolResultEntry(ctx, 'toolu_slashhold', [{ type: 'text', text: 'RESULT' }], assistantUuidFor(log, 'toolu_slashhold'))
+      const entry = userContentEntry(ctx, [{ type: 'text', text: input }])
+      // Deliberately bypass the gateway's neutralization to measure native dispatch in both log shapes.
+      entry.message.content = shape === 'string'
+        ? input
+        : [...(image === 'first' ? [IMAGE_BLOCK] : []), { type: 'text', text: input }, ...(image === 'last' ? [IMAGE_BLOCK] : [])]
+      const tail = [result, entry].map((e) => JSON.stringify(e))
+      const n = fake.exchanges.length
+      const b = p.launch({
+        name: `slash-resume-${p.runs.length}`,
+        fake,
+        target: t,
+        workDir: a.spec.workDir,
+        sessionId: a.spec.sessionId,
+        resume: true,
+        interruptedTurn: true,
+        log: [...log, ...tail],
+      })
+      const res = await b.until((f) => f.type === 'result')
+      if (image !== 'last' && prefix === '') assertSlashDispatch(command, b, fake, n, 0, res)
+      else {
+        assertEquals(res.result, 'FAKE-DEFAULT')
+        const requests = fake.exchanges.slice(n).filter((e) => e.kind !== 'other')
+        assertEquals(requests.map((e) => e.kind), ['main'])
+        assertEquals(requests[0].body.messages.at(-1).content[1].text, input)
+        assert(!requests[0].raw.includes("The user's message starts with the slash command"))
+      }
+      await b.kill()
+    }
+  }
+})
+
+probe('--setting-sources "" ignores planted slash commands and skills; dropping it enables both; a leading space neutralizes them', async (p, fake) => {
+  const work = '/tmp/cc2r-probe/slash-planted'
+  for (const dir of [`${p.root}/config`, `${work}/.claude`]) {
+    Deno.mkdirSync(`${dir}/commands`, { recursive: true })
+    Deno.writeTextFileSync(`${dir}/commands/planted.md`, '---\ndescription: planted command\n---\nPLANTED-COMMAND-BODY $ARGUMENTS')
+    Deno.mkdirSync(`${dir}/skills/plantedskill`, { recursive: true })
+    Deno.writeTextFileSync(`${dir}/skills/plantedskill/SKILL.md`, '---\nname: plantedskill\ndescription: planted skill\n---\nPLANTED-SKILL-BODY $ARGUMENTS')
+  }
+  for (const pinned of [true, false]) {
+    for (const prefix of ['', ' ']) {
+      for (const name of ['planted', 'plantedskill']) {
+        const n = fake.main().length
+        const r = p.launch({
+          name: `slash-planted-${p.runs.length}`,
+          fake,
+          target: new ProbeTarget(),
+          workDir: work,
+          args: pinned ? undefined : without('--setting-sources'),
+        })
+        await r.turn(`${prefix}/${name} hello`)
+        const request = fake.main()[n]
+        assertEquals(request.raw.includes(name === 'planted' ? 'PLANTED-COMMAND-BODY' : 'PLANTED-SKILL-BODY'), !pinned && prefix === '')
+        if (prefix) {
+          assert(
+            request.body.messages.some((m: Json) =>
+              m.role === 'user' && m.content.some((b: Json) => b.type === 'text' && b.text === `${prefix}/${name} hello`)
+            ),
+          )
+        }
+        await r.kill()
+      }
+    }
+  }
+})

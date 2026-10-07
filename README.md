@@ -137,6 +137,18 @@ is unchanged. Images must be valid base64 data URLs with media type `image/png`,
 `image/webp`, within the per-image limit below. Unsupported formats/URLs are `400 unsupported`, oversized payloads
 are `400 image_too_large`, and malformed base64 is `400 invalid_request`, all before eviction or tool-output release.
 
+**Slash-command safety.** Client text is model input, never a Claude Code command; `/compact` is client-owned.
+Claude Code 2.1.284 dispatches a slash command from the **last content block** of stdin user input or the last
+appended user entry on an interrupted-turn resume, even when earlier blocks contain text or images. For a final
+text block beginning with a command-shaped token (`/^\/\w[\w:-]*(?=\s|$)/`), the gateway prepends **one ASCII
+space** to that block only: `/compact` becomes ` /compact`. The text is not dropped or escaped, and all other
+blocks keep their order and bytes. This also prevents native unknown-command context for `/foo`. Leading
+whitespace/newlines, a slash later within text, path-like tokens such as `/tmp/file`, and an image-ending message
+already bypass dispatch and are unchanged. Text-only PostToolUse/Stop hook notices, assistant content and tool
+outputs are not command input and are unchanged. Synthesized user history uses the same boundary; provider
+records keep the actual transformed log bytes, so evictions and lost-store rebuilds do not add another space.
+`--setting-sources ""` separately prevents user/project commands and skills from loading.
+
 **Undefined tools.** A model call of a tool the request doesn't define is answered by Claude Code itself, with its
 `<tool_use_error>Error: No such tool available: …` result. The client still receives the `function_call` and must
 send an output; the model never sees that output. A rebuild after an eviction during such a hold keeps Claude Code's
@@ -226,6 +238,12 @@ results sends actual base64 PNG image blocks (correct media type and unchanged p
 results in the same user turn, retains the prior request’s prefix and leaves the appended log bytes unchanged.
 The large-image probe shows that Claude Code can resize/re-encode appended images, even over its nominal API
 limit; the gateway caps input before that processing, rather than relying on it as a fallback.
+
+The slash probes cover string versus content-block stdin input, `/compact`, `/cost`, `/context`, `/foo`, leading
+whitespace/newlines and non-initial slashes, token punctuation/arguments, multiple text blocks and both image
+orders. They also exercise native dispatch on raw appended resume entries versus text-only PostToolUse notices,
+and pair planted user/project commands and skills with settings sources closed/open. The one-space bypass is
+asserted against the pinned binary; rerun these probes before supporting another Claude Code version.
 
 Not pinned on purpose: `CLAUDE_CODE_RESUME_INTERRUPTED_TURN_MAX_AGE_MS` (unset means no age limit on resuming a
 held call in 2.1.284), `CLAUDE_CODE_OVERRIDE_DATE` (no effect in 2.1.284), the prompt-cache TTL variables.

@@ -58,6 +58,19 @@ export function contentBlocks(parts: Part[]): Json[] {
   )
 }
 
+/**
+ * 2.1.284 dispatches a command-shaped slash token in the LAST user content block (also on interrupted
+ * resume), even after other text/images. One ASCII space disables dispatch without hiding the text.
+ * Leading whitespace, paths/punctuation and an image-ending message already bypass dispatch.
+ * Do not use this for tool results, assistant blocks or hook context: none is command input.
+ */
+export function userContentBlocks(parts: Part[]): Json[] {
+  const blocks = contentBlocks(parts)
+  const last = blocks.at(-1)
+  if (last?.type === 'text' && /^\/\w[\w:-]*(?=\s|$)/.test(last.text)) last.text = ' ' + last.text
+  return blocks
+}
+
 /** A tool result as Claude Code logs an MCP result (text and image content). */
 export function toolResultEntry(ctx: LogContext, callId: string, parts: Part[], assistantUuid: string | null): Json {
   const content = contentBlocks(parts)
@@ -100,13 +113,13 @@ export function userContentEntry(ctx: LogContext, parts: Part[]): Json {
   return base(ctx, {
     ...(ctx.promptId ? { promptId: ctx.promptId } : {}),
     type: 'user',
-    message: { role: 'user', content: contentBlocks(parts) },
+    message: { role: 'user', content: userContentBlocks(parts) },
   })
 }
 
 export function userMessageEntry(ctx: LogContext, parts: Part[]): Json {
   ctx.promptId = crypto.randomUUID()
-  return base(ctx, { promptId: ctx.promptId, type: 'user', message: { role: 'user', content: contentBlocks(parts) }, promptSource: 'sdk' })
+  return base(ctx, { promptId: ctx.promptId, type: 'user', message: { role: 'user', content: userContentBlocks(parts) }, promptSource: 'sdk' })
 }
 
 /** uuid of the assistant entry holding a tool_use block, for sourceToolAssistantUUID. */
