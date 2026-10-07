@@ -227,7 +227,14 @@ export class Lane implements BridgeTarget {
       JSON.stringify({ pid: this.proc.pid, binary: this.config.claudeBinary, spawnedFrom, spawnedTo: Date.now() }),
       { mode: 0o600 },
     )
-    this.events.note('spawn', { session: this.sessionId, pid: this.proc.pid, epoch, resume: opts.resume, interruptedTurn: opts.interruptedTurn })
+    this.events.note('spawn', {
+      session: this.sessionId,
+      device: this.device,
+      pid: this.proc.pid,
+      epoch,
+      resume: opts.resume,
+      interruptedTurn: opts.interruptedTurn,
+    })
   }
 
   /**

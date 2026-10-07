@@ -114,7 +114,9 @@ export class Run {
   /** Replaces this run's working folders with a placeholder, for comparing two runs. */
   normalize = (s: string): string => {
     const sessions = new Set(this.gateways.flatMap((g) => g.events('spawn').map((e) => e.data.session as string)))
-    for (const sid of sessions) s = s.replaceAll(new RegExp(`/private/tmp/cc2r-test/[^/"]+/${sid}`, 'g'), '<WORK>')
+    for (const sid of sessions) s = s.replaceAll(new RegExp(`/private/tmp/cc2r-test/[^/"]+/${sid}`, 'g'), '<WORK>').replaceAll(sid, '<SESSION>')
+    const devices = new Set(this.gateways.flatMap((g) => g.events('spawn').map((e) => e.data.device as string)))
+    for (const d of devices) s = s.replaceAll(d, '<DEVICE>')
     return s
   }
 

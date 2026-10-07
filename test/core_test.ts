@@ -2,7 +2,7 @@
 import { assert, assertEquals, assertExists, assertStringIncludes } from '@std/assert'
 import { decodeRecord } from '../src/records.ts'
 import { call, type Json, text, think } from './fake.ts'
-import { assertPrefix, assertSameRequests, output, user } from './harness.ts'
+import { assertOneUserId, assertPrefix, assertSameRequests, output, user } from './harness.ts'
 import { Run } from './scenario.ts'
 
 function recordOf(r: { response: Json }) {
@@ -138,6 +138,9 @@ Deno.test('kill/resume and gateway restarts: every request is byte-identical to 
     await conversation(evicted)
     const a = control.fake.main(), b = evicted.fake.main()
     assertSameRequests(a, b, control.normalize, evicted.normalize)
+    // one metadata.user_id for the whole conversation, through every rebuild (the lost store restarted on a fresh state dir)
+    assertOneUserId(a)
+    assertOneUserId(b)
     // and each post-disruption request repeats the one before it, up to the new tail
     for (const d of evicted.disruptions) assertPrefix(b[d.beforeRequest - 1], b[d.beforeRequest])
     assertEquals(evicted.disruptions.map((d) => d.kind), ['idle', 'restart', 'restart-lost-store', 'idle'])
@@ -200,5 +203,22 @@ Deno.test("a chain's device id is in its records and seeded into its config fold
     assertEquals([meta.device_id, meta.session_id], [rec.device, rec.session])
     const lane = [...run.tg.gw.lanes.values()][0]
     assertEquals(JSON.parse(Deno.readTextFileSync(`${lane.configDir}/.claude.json`)).userID, rec.device)
+  })
+})
+
+Deno.test('a rebuild on a completely fresh state dir from client records sends the same metadata.user_id', async () => {
+  const run = new Run('fresh-state-metadata', false)
+  await run.run(async () => {
+    run.fake.reply({ blocks: [text('one')] })
+    await run.turn('one')
+    const before = Deno.realPathSync(run.d.stateDir)
+    await run.disrupt('restart-lost-store')
+    assert(Deno.realPathSync(run.d.stateDir) !== before)
+    run.fake.reply({ blocks: [text('two')] })
+    const r = await run.turn('two')
+    assertEquals([r.response.x_gateway.path, r.response.x_gateway.records], ['history', 1])
+    const [x, y] = run.fake.main()
+    assertEquals(y.body.metadata, x.body.metadata)
+    assertPrefix(x, y)
   })
 })

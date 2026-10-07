@@ -3,7 +3,7 @@ import { assert, assertEquals, assertExists } from '@std/assert'
 import { RESUME_LINE } from '../src/claude/pins.ts'
 import { decodeRecord } from '../src/records.ts'
 import { call, type Json, text, think } from './fake.ts'
-import { assertPrefix, output, user } from './harness.ts'
+import { assertOneUserId, assertPrefix, output, user } from './harness.ts'
 import { Run } from './scenario.ts'
 
 /** The messages of a request from the assistant tool_use message on. */
@@ -65,6 +65,8 @@ for (const withNotice of [true, false]) {
       assertPrefix(afterHold, h3)
       assertPrefix(h3, h4)
       assertEquals(run.drv.results.at(-1)!.response.x_gateway.path, 'history')
+      // the same metadata.user_id through the hold eviction, an idle eviction and a fresh state dir
+      assertOneUserId(reqs)
     })
   })
 }

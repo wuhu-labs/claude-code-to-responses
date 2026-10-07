@@ -213,6 +213,9 @@ export function assertPrefix(before: Exchange, after: Exchange): void {
   const b = before.body, a = after.body
   if (JSON.stringify(b.system) !== JSON.stringify(a.system)) throw new Error(`system differs:\n${JSON.stringify(b.system)}\n${JSON.stringify(a.system)}`)
   if (JSON.stringify(b.tools) !== JSON.stringify(a.tools)) throw new Error('tools differ')
+  if (JSON.stringify(b.metadata) !== JSON.stringify(a.metadata)) {
+    throw new Error(`metadata differs:\n${JSON.stringify(b.metadata)}\n${JSON.stringify(a.metadata)}`)
+  }
   const bm = messagesOf(before), am = messagesOf(after)
   if (am.length < bm.length) throw new Error(`after has ${am.length} messages, before ${bm.length}`)
   for (let i = 0; i < bm.length - 1; i++) {
@@ -226,14 +229,16 @@ export function assertPrefix(before: Exchange, after: Exchange): void {
 
 export type Normalize = (s: string) => string
 
-/** Raw request equality, metadata aside (it carries Claude Code's session and device ids). Each run's own
- * working folder is replaced by a placeholder, since two runs cannot share one session's folder. */
+/** Raw request equality, metadata included. Each run's own working folder, session id and device id are replaced by
+ * placeholders, since two runs cannot share one session. */
 export function sameRequest(x: Exchange, y: Exchange, nx: Normalize = (s) => s, ny: Normalize = (s) => s): boolean {
-  const strip = (e: Exchange, n: Normalize) => {
-    const { metadata: _m, ...rest } = e.body
-    return n(JSON.stringify(rest))
-  }
-  return strip(x, nx) === strip(y, ny)
+  return nx(JSON.stringify(x.body)) === ny(JSON.stringify(y.body))
+}
+
+/** Every request of one conversation carries the same metadata.user_id (device id + session id), rebuilds included. */
+export function assertOneUserId(xs: Exchange[]): void {
+  const ids = [...new Set(xs.map((x) => x.body.metadata?.user_id))]
+  if (ids.length !== 1) throw new Error(`metadata.user_id differs across the conversation: ${ids.join(' | ')}`)
 }
 
 export function assertSameRequests(xs: Exchange[], ys: Exchange[], nx: Normalize = (s) => s, ny: Normalize = (s) => s): void {
