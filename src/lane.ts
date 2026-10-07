@@ -3,7 +3,7 @@
 // delivers notices through hooks, and records every log entry so the process can be killed and rebuilt.
 import type { FnTool, InItem, Part } from './api/request.ts'
 import { newId, type ResponseState, type SseSink, type UsageTotals } from './api/stream.ts'
-import type { Bridge, BridgeTarget } from './bridge.ts'
+import { type Bridge, type BridgeTarget, StaleEpoch } from './bridge.ts'
 import { ClaudeProcess, type Frame } from './claude/process.ts'
 import { type LaunchSpec, logPath, MAX_RESULT_CHARS, MCP_PREFIX, mcpConfigJson, projectDir, settingsJson } from './claude/pins.ts'
 import { type Config, paths } from './config.ts'
@@ -287,6 +287,7 @@ export class Lane implements BridgeTarget {
   }
 
   toolCall(callId: string, _name: string, _args: Json, signal: AbortSignal): Promise<Json> {
+    if (this.dead) return Promise.reject(new StaleEpoch('stale Claude Code process: it was killed'))
     const ready = this.results.get(callId)
     if (ready !== undefined) {
       this.results.delete(callId)
@@ -302,6 +303,7 @@ export class Lane implements BridgeTarget {
   }
 
   hook(body: Json): Json {
+    if (this.dead) throw new StaleEpoch('stale Claude Code process: it was killed')
     const event = body?.hook_event_name
     if ((event === 'PostToolUse' || event === 'PostToolUseFailure') && this.staged && body.tool_use_id === this.staged.callId) {
       const text = this.staged.text
