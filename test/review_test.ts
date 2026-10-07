@@ -795,3 +795,26 @@ Deno.test('terminal orphan registries emit one unmatched event and are removed i
     Deno.removeSync(root, { recursive: true })
   }
 })
+
+Deno.test('missing or unresolvable --claude paths produce ConfigError before creating state or work folders', async () => {
+  const { ConfigError, parseArgs, prepare } = await import('../src/config.ts')
+  const root = Deno.makeTempDirSync({ prefix: 'cc2r-missing-claude-' })
+  const missing = `${root}/not-installed`, dangling = `${root}/dangling`, loop = `${root}/loop`
+  Deno.symlinkSync(missing, dangling)
+  Deno.symlinkSync(loop, loop)
+  try {
+    for (const binary of [missing, dangling, loop]) {
+      const stateDir = `${root}/state`, workDir = `${root}/work`
+      const error = assertThrows(
+        () => prepare(parseArgs(['--claude', binary, '--state-dir', stateDir, '--work-dir', workDir], OAUTH)),
+        ConfigError,
+        '--claude',
+      )
+      assertStringIncludes(error.message, binary)
+      assertThrows(() => Deno.statSync(stateDir), Deno.errors.NotFound)
+      assertThrows(() => Deno.statSync(workDir), Deno.errors.NotFound)
+    }
+  } finally {
+    Deno.removeSync(root, { recursive: true })
+  }
+})

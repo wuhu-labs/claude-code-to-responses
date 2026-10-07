@@ -202,7 +202,12 @@ function gitRootOf(path: string): string | null {
 
 /** Checks every setting first, then creates the folders (owner-only) and resolves them to real paths. */
 export function prepare(c: Config): Config {
-  const claudeBinary = executableIdentity(c.claudeBinary)
+  let claudeBinary: string
+  try {
+    claudeBinary = executableIdentity(c.claudeBinary)
+  } catch {
+    throw new ConfigError(`--claude ${c.claudeBinary} cannot be resolved; provide an existing accessible Claude Code executable.`)
+  }
   const target = realTarget(c.workDir)
   const repo = gitRootOf(target)
   if (repo !== null) {
