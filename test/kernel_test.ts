@@ -30,6 +30,53 @@ Deno.test('real monorepo recording bodies: full create and named forced compacti
   }
 })
 
+Deno.test('kernel projection joins user text with LF and emits one msg_N item per assistant text block', () => {
+  const body = kernelBody({
+    model: MODEL,
+    instructions: 'prompt',
+    tools: [],
+    input: [
+      {
+        role: 'user',
+        content: [{ type: 'input_text', text: 'first' }, { type: 'input_image', image_url: 'data:image/png;base64,AA==' }, {
+          type: 'input_text',
+          text: 'second',
+        }],
+      },
+      { role: 'assistant', phase: 'final_answer', content: [{ type: 'output_text', text: 'a' }, { type: 'output_text', text: 'b' }] },
+      user('  \n'),
+      { role: 'assistant', content: [{ type: 'output_text', text: 'c' }] },
+    ],
+  })
+  assertEquals(body.input, [
+    { role: 'system', content: 'prompt' },
+    {
+      role: 'user',
+      content: [{ type: 'input_text', text: 'first\nsecond' }, { type: 'input_image', image_url: 'data:image/png;base64,AA==', detail: 'original' }],
+    },
+    {
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: 'a', annotations: [] }],
+      status: 'completed',
+      id: 'msg_0',
+      phase: 'final_answer',
+    },
+    {
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: 'b', annotations: [] }],
+      status: 'completed',
+      id: 'msg_1',
+      phase: 'final_answer',
+    },
+    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'c', annotations: [] }], status: 'completed', id: 'msg_2' },
+  ])
+  for (const instructions of [null, '']) {
+    assertEquals(kernelBody({ model: MODEL, instructions, input: [user('Hello')] }).input, [{ role: 'user', content: [{ type: 'input_text', text: 'Hello' }] }])
+  }
+})
+
 Deno.test('kernel full create and warm delta normalize without putting instructions in history', () => {
   const b = base()
   const r = parseRequest(b, 'websocket')
