@@ -154,7 +154,12 @@ Application messages/events are limited to **16 MiB of UTF-8 bytes** (binary mes
 Deno reassembles inbound frames before this application limit is checked; this is not a wire-level frame or
 preallocation limit. The writer never waits on a client from the Claude Code lane: it caps buffered outbound bytes
 at **16 MiB** and closes if they make no draining progress for **5 seconds**, even after a response's terminal event.
-Overflow cancels active work. Fatal size/backpressure errors get one small best-effort typed error followed by
+The entire final batch (provider-record events plus terminal) is serialized and checked against the message and
+buffer budgets **before success is committed**. A rejected final enqueue cancels the attempt, removes its record,
+and preserves the previous chain head for a retry. HTTP/SSE uses the same boundary: a terminal batch must be
+accepted by its stream before the response becomes a continuation point. After acceptance, a later disconnect
+retains the completed response on either transport; enqueue is not an acknowledgement that the peer read or
+parsed the bytes. Overflow before that boundary cancels active work. Fatal size/backpressure errors get one small best-effort typed error followed by
 close; a client that never reads cannot be guaranteed to see that error. No output is silently dropped to keep an
 inference running.
 
@@ -340,6 +345,11 @@ HTTP cancellation, refused upgrades, oversized messages, shutdown and bounded ba
 is a raw TCP WebSocket peer, since a JS WebSocket still drains network input without a message listener. The
 incomplete-terminal transport test injects at the shared event-sink boundary (Claude Code may auto-continue a
 model-level `max_tokens` stop).
+
+`test/terminal_test.ts` reproduces a normally-reading WebSocket whose seventeen 1 MiB text blocks stream
+successfully but exceed the aggregate terminal limit, asserts terminal-batch backpressure preflight, and checks
+SSE abort/refusal before terminal enqueue (including synchronous store rollback) versus cancellation after an
+accepted terminal. Failed attempts do not advance the store/head, and retries retain byte-identical model input.
 
 `test/image_notice_test.ts` checks real image delivery against live/evicted/rebuilt holds, prefix stability within
 each run, and verbatim provider-record replay through idle eviction and lost-store rebuilds. It does not assert

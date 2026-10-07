@@ -2,7 +2,7 @@
 // It turns Claude Code's stream into Responses events, holds MCP calls until the client's outputs come,
 // delivers notices through hooks, and records every log entry so the process can be killed and rebuilt.
 import type { FnTool, InItem, Part } from './api/request.ts'
-import { type EventSink, newId, type ResponseState, type UsageTotals } from './api/stream.ts'
+import { type EventSink, newId, type ResponseState, usageObject, type UsageTotals } from './api/stream.ts'
 import { type Bridge, type BridgeTarget, McpCallError, StaleEpoch } from './bridge.ts'
 import { userContentBlocks } from './claude/entries.ts'
 import { ClaudeProcess, executableIdentity, type Frame } from './claude/process.ts'
@@ -369,6 +369,7 @@ export class Lane implements BridgeTarget {
     if (this.proc && !this.dead) this.readLog()
     this.pendingAtAttach = this.pending.length
     a.sink.onCancel = () => {
+      if (this.active !== a || a.state.status !== 'in_progress') return
       this.events.note('client_disconnect', { session: this.sessionId, response: a.state.id })
       this.cancel(a.state.id, 'client_disconnected')
     }
@@ -766,9 +767,9 @@ export class Lane implements BridgeTarget {
   beforeCommit: (() => Promise<void>) | null = null
 
   /**
-   * Prepares the record (asynchronously), then commits in one synchronous step: the record goes to the store, the head
-   * moves and the client is told it completed. A lane killed before that step fails the response and stores nothing,
-   * so the client and the store never disagree.
+   * Prepares the record asynchronously, then preflights the final events and commits synchronously only
+   * if their whole batch is accepted by the transport. Refused terminal emissions cancel the active attempt;
+   * the previous head/log cursor remains intact, and no successful record is kept.
    */
   private async complete(a: Active, end: 'turn' | 'calls', calls: CallRef[], cut: number, stopReason: string): Promise<void> {
     const entries = this.pending.slice(0, cut)
@@ -787,28 +788,41 @@ export class Lane implements BridgeTarget {
     const item = { type: 'reasoning', id: newId('rs'), summary: [], encrypted_content: await encodeRecord(record) }
     await this.beforeCommit?.()
     if (this.dead || a.state.status !== 'in_progress') return // failed meanwhile: the store never hears of it
-    // ---- commit: synchronous from here on
+    const outputIndex = a.state.output.length
+    const status = stopReason === 'max_tokens' ? 'incomplete' : 'completed'
+    const incomplete = status === 'incomplete' ? { reason: 'max_output_tokens' } : null
+    const response = { ...a.state.object(), output: [...a.state.output, item], usage: usageObject(a.usage), status, incomplete_details: incomplete }
+    // Serialize and preflight EVERY final event while this attempt is still active and uncommitted.
+    // In particular the aggregate terminal may overflow even when every streamed block drained normally.
+    const enqueue = a.sink.prepare([
+      { type: 'response.output_item.added', data: { output_index: outputIndex, item } },
+      { type: 'response.output_item.done', data: { output_index: outputIndex, item } },
+      { type: `response.${status}`, data: { response } },
+    ])
+    if (!enqueue) {
+      a.sink.onCancel?.()
+      return
+    }
+    // No await from preflight through enqueue/commit. Write disk first, so a storage error cannot publish
+    // success; if the transport refuses its enqueue, roll disk back before touching the head/log cursor.
+    this.store.put(record)
+    if (!enqueue()) {
+      this.store.remove(record.id)
+      a.sink.onCancel?.()
+      return
+    }
+    // ---- commit: the entire terminal batch was synchronously accepted by the transport
     this.pending = this.pending.slice(cut)
     const taken = new Set(entries)
     this.mirroredLines = this.mirroredLines.filter((l) => !taken.has(l))
     this.mirrored.clear()
-    this.store.put(record)
     this.head = { responseId: a.state.id, end, calls }
     this.pendingAtAttach = null
     if (this.active === a) this.active = null
-    const outputIndex = a.state.output.length
     a.state.output.push(item)
-    a.sink.send('response.output_item.added', { output_index: outputIndex, item })
-    a.sink.send('response.output_item.done', { output_index: outputIndex, item })
     a.state.usage = a.usage
-    if (stopReason === 'max_tokens') {
-      a.state.status = 'incomplete'
-      a.state.incomplete = { reason: 'max_output_tokens' }
-      a.sink.send('response.incomplete', { response: a.state.object() })
-    } else {
-      a.state.status = 'completed'
-      a.sink.send('response.completed', { response: a.state.object() })
-    }
+    a.state.status = status
+    a.state.incomplete = incomplete
     a.sink.close()
     this.events.note('completed', { session: this.sessionId, response: a.state.id, end, calls: calls.length, entries: entries.length, usage: a.usage })
     this.armEviction()

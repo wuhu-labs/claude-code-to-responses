@@ -55,6 +55,11 @@ export class ResponseStore {
     Deno.renameSync(tmp, p)
   }
 
+  /** Roll back a just-written response whose synchronous terminal enqueue was refused. */
+  remove(id: string): void {
+    Deno.removeSync(this.path(id))
+  }
+
   /** The chain of records ending at `id`, oldest first; null if any link is missing. */
   chain(id: string): ProviderRecord[] | null {
     const out: ProviderRecord[] = []

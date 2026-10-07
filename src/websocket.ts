@@ -1,6 +1,6 @@
 // OpenAI Responses WebSocket subset: one create in flight, text JSON events, no cancel message.
 import { parseRequest } from './api/request.ts'
-import type { EventSink } from './api/stream.ts'
+import type { EventSink, SinkEvent } from './api/stream.ts'
 import { asGatewayError, GatewayError, invalid, unsupported } from './errors.ts'
 import type { Gateway } from './gateway.ts'
 
@@ -26,25 +26,41 @@ export class SocketWriter {
   }
 
   send(event: Json): boolean {
-    if (this.isClosed) return false
-    const text = JSON.stringify(event)
-    const size = new TextEncoder().encode(text).byteLength
-    if (size > WS_MAX_MESSAGE_BYTES) {
+    return this.prepare([event])?.() ?? false
+  }
+
+  prepare(events: Json[]): (() => boolean) | null {
+    if (this.isClosed) return null
+    const texts = events.map((event) => JSON.stringify(event))
+    const sizes = texts.map((text) => new TextEncoder().encode(text).byteLength)
+    if (sizes.some((size) => size > WS_MAX_MESSAGE_BYTES)) {
       this.fail(new GatewayError(413, 'server_error', 'websocket_message_too_large', 'The outbound event exceeds the 16 MiB message limit.'), 1009)
-      return false
+      return null
     }
-    if (size + this.socket.bufferedAmount > WS_MAX_BUFFERED_BYTES) {
-      this.fail(new GatewayError(429, 'server_error', 'websocket_backpressure', 'The client is not draining the bounded WebSocket output buffer.'), 1013)
-      return false
+    const size = sizes.reduce((total, n) => total + n, 0)
+    if (!this.hasCapacity(size)) return null
+    return () => {
+      if (this.isClosed || !this.hasCapacity(size)) return false
+      const before = this.socket.bufferedAmount
+      if (before < this.lastBuffered) this.pendingSince = Date.now() // real draining progress
+      try {
+        for (const text of texts) this.socket.send(text)
+      } catch {
+        this.disconnect()
+        return false
+      }
+      this.watchDrain()
+      return true
     }
-    const before = this.socket.bufferedAmount
-    if (before < this.lastBuffered) this.pendingSince = Date.now() // real draining progress
-    try {
-      this.socket.send(text)
-    } catch {
-      this.disconnect()
-      return false
-    }
+  }
+
+  private hasCapacity(size: number): boolean {
+    if (size + this.socket.bufferedAmount <= WS_MAX_BUFFERED_BYTES) return true
+    this.fail(new GatewayError(429, 'server_error', 'websocket_backpressure', 'The client is not draining the bounded WebSocket output buffer.'), 1013)
+    return false
+  }
+
+  private watchDrain(): void {
     this.lastBuffered = this.socket.bufferedAmount
     if (!this.timer && this.socket.bufferedAmount > 0) {
       this.pendingSince = Date.now()
@@ -60,7 +76,6 @@ export class SocketWriter {
         this.lastBuffered = buffered
       }, 25)
     }
-    return true
   }
 
   error(err: GatewayError): void {
@@ -113,7 +128,18 @@ class SocketSink implements EventSink {
   }
 
   send(type: string, data: Json): void {
-    if (!this.isClosed) this.writer.send({ type, sequence_number: this.seq++, ...data })
+    this.prepare([{ type, data }])?.()
+  }
+
+  prepare(events: SinkEvent[]): (() => boolean) | null {
+    if (this.isClosed) return null
+    const send = this.writer.prepare(events.map(({ type, data }, i) => ({ type, sequence_number: this.seq + i, ...data })))
+    if (!send) return null
+    return () => {
+      if (this.isClosed || !send()) return false
+      this.seq += events.length
+      return true
+    }
   }
 
   close(): void {

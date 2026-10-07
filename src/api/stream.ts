@@ -82,11 +82,19 @@ export class ResponseState {
   }
 }
 
+export interface SinkEvent {
+  type: string
+  data: Json
+}
+
 /** The lane emits the same ordered events regardless of transport. Cancellation is synchronous and idempotent. */
 export interface EventSink {
   readonly isClosed: boolean
   onCancel: (() => void) | null
   send(type: string, data: Json): void
+  /** Serialize/check the entire terminal batch before the store changes. The returned synchronous enqueue
+   * reports transport acceptance, not peer consumption. No asynchronous work may separate prepare/enqueue. */
+  prepare(events: SinkEvent[]): (() => boolean) | null
   close(): void
 }
 
@@ -116,12 +124,29 @@ export class SseSink implements EventSink {
   }
 
   send(type: string, data: Json): void {
-    if (this.closed) return
-    const ev = { type, sequence_number: this.seq++, ...data }
-    try {
-      this.ctrl.enqueue(new TextEncoder().encode(`event: ${type}\ndata: ${JSON.stringify(ev)}\n\n`))
-    } catch {
-      this.closed = true
+    this.prepare([{ type, data }])?.()
+  }
+
+  prepare(events: SinkEvent[]): (() => boolean) | null {
+    if (this.closed) return null
+    const seq = this.seq
+    const bytes = new TextEncoder().encode(
+      events.map(({ type, data }, i) => {
+        const event = { type, sequence_number: seq + i, ...data }
+        return `event: ${type}\ndata: ${JSON.stringify(event)}\n\n`
+      }).join(''),
+    )
+    return () => {
+      if (this.closed) return false
+      try {
+        // One enqueue for the whole batch: a cancel before it refuses every terminal emission.
+        this.ctrl.enqueue(bytes)
+        this.seq += events.length
+        return true
+      } catch {
+        this.closed = true
+        return false
+      }
     }
   }
 
