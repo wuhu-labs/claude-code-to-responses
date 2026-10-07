@@ -219,20 +219,23 @@ export function assertPrefix(before: Exchange, after: Exchange): void {
   }
 }
 
-/** Raw request equality, metadata aside (it carries Claude Code's session and device ids). */
-export function sameRequest(x: Exchange, y: Exchange): boolean {
-  const strip = (e: Exchange) => {
+export type Normalize = (s: string) => string
+
+/** Raw request equality, metadata aside (it carries Claude Code's session and device ids). Each run's own
+ * working folder is replaced by a placeholder, since two runs cannot share one session's folder. */
+export function sameRequest(x: Exchange, y: Exchange, nx: Normalize = (s) => s, ny: Normalize = (s) => s): boolean {
+  const strip = (e: Exchange, n: Normalize) => {
     const { metadata: _m, ...rest } = e.body
-    return JSON.stringify(rest)
+    return n(JSON.stringify(rest))
   }
-  return strip(x) === strip(y)
+  return strip(x, nx) === strip(y, ny)
 }
 
-export function assertSameRequests(xs: Exchange[], ys: Exchange[]): void {
+export function assertSameRequests(xs: Exchange[], ys: Exchange[], nx: Normalize = (s) => s, ny: Normalize = (s) => s): void {
   if (xs.length !== ys.length) throw new Error(`request counts differ: ${xs.length} vs ${ys.length}`)
   for (let i = 0; i < xs.length; i++) {
-    if (!sameRequest(xs[i], ys[i])) {
-      const xm = messagesOf(xs[i]), ym = messagesOf(ys[i])
+    if (!sameRequest(xs[i], ys[i], nx, ny)) {
+      const xm = messagesOf(xs[i]).map(nx), ym = messagesOf(ys[i]).map(ny)
       let j = 0
       while (j < Math.max(xm.length, ym.length) && xm[j] === ym[j]) j++
       throw new Error(`request ${i} differs at message ${j}:\n${xm[j]?.slice(0, 800)}\n${ym[j]?.slice(0, 800)}`)

@@ -19,8 +19,6 @@ Deno.test('smoke: a text turn and a tool round', async () => {
     fake.reply({ blocks: [call('toolu_1', 'echo', { text: 'x' })] }, { blocks: [text('done')] })
     const r2 = await drv.turn('call echo', { echo: (a) => `ECHO ${a.text}` })
     assertEquals(drv.text(r2), 'done')
-    const last = fake.main().at(-1)!
-    console.log(JSON.stringify(last.body.messages, null, 1).slice(0, 3000))
     assert(r2.response.output.some((o: { type: string; encrypted_content?: string }) => o.type === 'reasoning' && o.encrypted_content?.startsWith('cc2r.record.v1.')))
   } finally {
     await tg.close()
@@ -28,5 +26,4 @@ Deno.test('smoke: a text turn and a tool round', async () => {
     cleanup(d)
   }
   tg.assertClean()
-  console.log(tg.events().map((e) => `${e.kind} ${JSON.stringify(e.data).slice(0, 200)}`).join('\n'))
 })

@@ -1,0 +1,96 @@
+// Scenario runs: the same conversation driven twice, once on one live process (the control) and once with
+// evictions and gateway restarts in between. The model must see byte-identical requests either way.
+import { assertEquals } from '@std/assert'
+import { FakeAnthropic, type Json } from './fake.ts'
+import { cleanup, type Dirs, dirs, Driver, freePort, type Result, TestGateway } from './harness.ts'
+
+export const MODEL = 'claude-opus-5-5'
+export const INSTRUCTIONS = 'You are a test agent. Use the tools when asked.'
+export const TOOLS = [
+  { type: 'function', name: 'echo', description: 'Echo the text back.', parameters: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } },
+  { type: 'function', name: 'read', description: 'Read a named thing.', parameters: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } },
+]
+export const toolsImpl = {
+  echo: (a: Json) => `ECHO ${a.text}`,
+  read: (a: Json) => `CONTENT OF ${a.name}`,
+}
+
+export type Disruption = 'idle' | 'restart' | 'restart-lost-store' | 'hold'
+
+export class Run {
+  fake: FakeAnthropic
+  tg!: TestGateway
+  drv!: Driver
+  d: Dirs
+  gateways: TestGateway[] = []
+  disruptions: { kind: Disruption; beforeRequest: number }[] = []
+
+  constructor(readonly name: string, readonly live: boolean, readonly opts: { mode?: 'previous' | 'history'; tz?: string; workRoot?: string } = {}) {
+    this.fake = new FakeAnthropic(freePort())
+    this.d = dirs(name)
+    if (opts.workRoot) this.d.workRoot = opts.workRoot
+  }
+
+  backend() {
+    return { ANTHROPIC_BASE_URL: this.fake.url, ANTHROPIC_AUTH_TOKEN: 'fake-key' }
+  }
+
+  async start(): Promise<void> {
+    this.tg = await TestGateway.start({ dirs: this.d, backendEnv: this.backend(), tz: this.opts.tz })
+    this.gateways.push(this.tg)
+    this.drv = new Driver(this.tg.client, { instructions: INSTRUCTIONS, tools: TOOLS, model: MODEL, mode: this.opts.mode ?? 'previous' })
+  }
+
+  /** Evicts or restarts between requests, unless this is the control run. */
+  async disrupt(kind: Disruption, o: { tz?: string; workRoot?: string } = {}): Promise<void> {
+    if (this.live) return
+    this.disruptions.push({ kind, beforeRequest: this.fake.main().length })
+    if (kind === 'idle' || kind === 'hold') {
+      await this.tg.evictAll(kind === 'idle' ? 'idle_timeout' : 'hold_timeout')
+      return
+    }
+    await this.tg.close()
+    this.tg.assertClean()
+    if (kind === 'restart-lost-store') this.d = { stateDir: dirs(`${this.name}-fresh`).stateDir, workRoot: o.workRoot ?? this.d.workRoot }
+    else if (o.workRoot) this.d = { ...this.d, workRoot: o.workRoot }
+    this.tg = await TestGateway.start({ dirs: this.d, backendEnv: this.backend(), tz: o.tz ?? this.opts.tz })
+    this.gateways.push(this.tg)
+    this.drv.client = this.tg.client
+  }
+
+  /** Sends through the driver; a lost store answers previous_response_not_found, and the full history goes instead. */
+  async send(input: Json[]): Promise<Result> {
+    try {
+      return await this.drv.send(input)
+    } catch (e) {
+      const err = e as { status?: number; code?: string; error?: Json }
+      if (err.status === 400 && (err.code ?? err.error?.code) === 'previous_response_not_found') return await this.drv.send(input, 'history')
+      throw e
+    }
+  }
+
+  async turn(text: string, notices: string[] = []): Promise<Result> {
+    let r = await this.send([{ role: 'user', content: text }])
+    while (r.status === 'completed' && this.drv.calls(r).length) {
+      const outs: Json[] = []
+      for (const c of this.drv.calls(r)) outs.push({ type: 'function_call_output', call_id: c.call_id, output: (toolsImpl as Json)[c.name](JSON.parse(c.arguments)) })
+      r = await this.send([...outs, ...notices.splice(0).map((n) => ({ role: 'user', content: n }))])
+    }
+    assertEquals(r.status, 'completed', JSON.stringify(r.response.error))
+    return r
+  }
+
+  /** Replaces this run's working folders with a placeholder, for comparing two runs. */
+  normalize = (s: string): string => {
+    const sessions = new Set(this.gateways.flatMap((g) => g.events('spawn').map((e) => e.data.session as string)))
+    for (const sid of sessions) s = s.replaceAll(new RegExp(`/private/tmp/cc2r-test/[^/"]+/${sid}`, 'g'), '<WORK>')
+    return s
+  }
+
+  async close(): Promise<void> {
+    await this.tg.close()
+    for (const g of this.gateways) g.assertClean()
+    await this.fake.close()
+    cleanup(this.d)
+  }
+}
