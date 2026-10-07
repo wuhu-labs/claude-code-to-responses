@@ -130,8 +130,9 @@ response is attached, so simultaneous requests never rebuild it twice. The next 
 
 ## Claude Code pins (measured on 2.1.284)
 
-Each pin is asserted by the per-release probe (`deno task probe`, `probe/probe_test.ts`), most of them paired with a
-run that drops the pin to show its effect. The source of truth is `src/claude/pins.ts`.
+Every pin in this table is asserted by the per-release probe (`deno task probe`, `probe/probe_test.ts`), most of them
+paired with a run that drops the pin to show its effect; two more variables are set without being verified (below the
+table). The source of truth is `src/claude/pins.ts`.
 
 | Flag or variable | Value | Why | Probe |
 |---|---|---|---|
@@ -159,10 +160,15 @@ run that drops the pin to show its effect. The source of truth is `src/claude/pi
 | `CLAUDE_CODE_RESUME_INTERRUPTED_TURN` | `1` on the held-call resume only | Resumes the turn from tool results + user text with nothing foreign | CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1 … (paired) |
 | `CLAUDE_CODE_MAX_RETRIES` | `0` | An upstream error ends the turn at once as `terminal_reason: api_error` with `api_error_status`; the client owns retries | CLAUDE_CODE_MAX_RETRIES=0 … (paired: unset retries) |
 
-Set but **not verified** by the probe, because the fake endpoint gives them nothing to act on:
-`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (the fake sees the same requests with or without it: the conversation's
-and `/api/hello`) and `DISABLE_AUTOUPDATER=1` (an update needs Claude Code to reach Anthropic's release server, which no
-test may do). Both are hygiene only; nothing in the gateway depends on them.
+Set but **not verified** by the probe:
+
+- `DISABLE_AUTOUPDATER=1`. In 2.1.284 the updater fetches from a fixed `https://downloads.claude.ai/claude-code-releases`
+  that no flag or variable redirects, so no test can offer it an update without letting Claude Code reach Anthropic.
+- `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`. The fake endpoint sees the same requests with or without it (measured:
+  the conversation's own and one `GET /api/hello`); what it turns off in 2.1.284 (telemetry, the model catalog and
+  plugin downloads from fixed Anthropic hosts, and auto-updates as well) never goes to `ANTHROPIC_BASE_URL`.
+
+Both are hygiene only; nothing in the gateway depends on them.
 
 Claude Code internals the gateway also relies on, asserted by the probe: the log a process mirrored resumes into a
 byte-identical request (`a log rebuilt from the mirrored entries …`), and a resumed log missing the `atis-latch` line
