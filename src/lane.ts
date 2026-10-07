@@ -171,7 +171,6 @@ export class Lane implements BridgeTarget {
    */
   spawn(opts: { resume: boolean; interruptedTurn: boolean; log?: string[]; attempt?: string[] }): void {
     const p = paths(this.config)
-    Deno.mkdirSync(this.workDir, { recursive: true, mode: 0o700 })
     Deno.mkdirSync(this.configDir, { recursive: true, mode: 0o700 })
     this.seedDevice()
     if (opts.resume) {

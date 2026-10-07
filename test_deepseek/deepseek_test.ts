@@ -106,7 +106,7 @@ Deno.test('DeepSeek: real tool rounds, and the cache stays warm after every kind
       const state = Deno.realPathSync(d.stateDir)
       for (const sub of ['responses', 'tails']) Deno.removeSync(`${state}/${sub}`, { recursive: true })
     }
-    if (lose === 'all') d = { stateDir: dirs('deepseek-fresh').stateDir, workRoot: d.workRoot }
+    if (lose === 'all') d = { stateDir: dirs('deepseek-fresh').stateDir, workDir: d.workDir }
     tg = await TestGateway.start({ dirs: d, backendEnv })
     gateways.push(tg)
     drv.client = tg.client
@@ -191,7 +191,9 @@ Deno.test('DeepSeek: real tool rounds, and the cache stays warm after every kind
     const t7 = await turn('And one more word, please.')
     measure('live (the turn after)', t7[0], last)
 
-    for (const m of [idle, hold, restarted, lost, fresh]) assert(m.prefix >= MIN_PREFIX, `${m.kind}: prefix ${(m.prefix * 100).toFixed(1)}% < ${MIN_PREFIX * 100}%`)
+    for (const m of [idle, hold, restarted, lost, fresh]) {
+      assert(m.prefix >= MIN_PREFIX, `${m.kind}: prefix ${(m.prefix * 100).toFixed(1)}% < ${MIN_PREFIX * 100}%`)
+    }
     for (const g of gateways) g.assertClean()
   } finally {
     await tg.close()

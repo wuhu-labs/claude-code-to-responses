@@ -12,7 +12,8 @@ export interface Config {
   /** Gateway state: the response store, Claude Code's config dir and scratch home. */
   stateDir: string
   /** Parent of the per-chain working folders. Must be outside any git repository. */
-  workRoot: string
+  /** The one working folder every Claude Code session runs in: the same absolute path everywhere, outside git. */
+  workDir: string
   claudeBinary: string
   /** Fixed TZ for every Claude Code process. */
   tz: string
@@ -61,7 +62,8 @@ Usage: claude-code-to-responses [options]
 
   --listen <host:port>       Responses API address (default 127.0.0.1:18330)
   --state-dir <dir>          response store, Claude Code config and scratch home (required)
-  --work-root <dir>          parent of the per-chain working folders, outside any git repository (required)
+  --work-dir <dir>           the working folder of every session, outside any git repository
+                             (default /tmp/claude-code-to-responses; keep it the same on every machine)
   --claude <path>            Claude Code ${CLAUDE_CODE_VERSION} binary (required)
   --auth-token-env <VAR>     clients must send 'Authorization: Bearer <$VAR>'; required off loopback
   --bridge-port <port>       loopback port for Claude Code's MCP and hook calls (default: any free port)
@@ -84,7 +86,7 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
       flags.add(a)
       continue
     }
-    if (!['--listen', '--auth-token-env', '--bridge-port', '--state-dir', '--work-root', '--claude', '--tz', '--idle-timeout', '--hold-timeout'].includes(a)) {
+    if (!['--listen', '--auth-token-env', '--bridge-port', '--state-dir', '--work-dir', '--claude', '--tz', '--idle-timeout', '--hold-timeout'].includes(a)) {
       throw new ConfigError(`unknown option ${a}\n\n${USAGE}`)
     }
     const v = argv[++i]
@@ -126,7 +128,7 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
     authToken,
     bridgePort: Number(opts.get('--bridge-port') ?? 0),
     stateDir: need('--state-dir'),
-    workRoot: need('--work-root'),
+    workDir: opts.get('--work-dir') ?? '/tmp/claude-code-to-responses',
     claudeBinary: need('--claude'),
     tz: opts.get('--tz') ?? 'UTC',
     idleTimeoutMs: secs('--idle-timeout', 1800),
@@ -166,21 +168,21 @@ function gitRootOf(path: string): string | null {
 
 /** Checks every setting first, then creates the folders (owner-only) and resolves them to real paths. */
 export function prepare(c: Config): Config {
-  const target = realTarget(c.workRoot)
+  const target = realTarget(c.workDir)
   const repo = gitRootOf(target)
   if (repo !== null) {
     throw new ConfigError(
-      `--work-root ${target} is inside the git repository at ${repo}; Claude Code would announce it in every prompt. Use a folder outside git.`,
+      `--work-dir ${target} is inside the git repository at ${repo}; Claude Code would announce it in every prompt. Use a folder outside git.`,
     )
   }
   // the state holds every conversation (records, logs) and the backend's credentials: owner-only, whatever the umask
   Deno.mkdirSync(c.stateDir, { recursive: true, mode: 0o700 })
-  Deno.mkdirSync(c.workRoot, { recursive: true, mode: 0o700 })
+  Deno.mkdirSync(c.workDir, { recursive: true, mode: 0o700 })
   const stateDir = Deno.realPathSync(c.stateDir)
-  const workRoot = Deno.realPathSync(c.workRoot)
+  const workDir = Deno.realPathSync(c.workDir)
   Deno.chmodSync(stateDir, 0o700)
-  Deno.chmodSync(workRoot, 0o700)
+  Deno.chmodSync(workDir, 0o700)
   const p = paths({ ...c, stateDir })
   for (const d of [p.configDir, p.homeDir, p.runDir, p.sessionsDir]) Deno.mkdirSync(d, { recursive: true, mode: 0o700 })
-  return { ...c, stateDir, workRoot }
+  return { ...c, stateDir, workDir }
 }

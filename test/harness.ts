@@ -24,12 +24,12 @@ export function freePort(): number {
 
 export interface Dirs {
   stateDir: string
-  workRoot: string
+  workDir: string
 }
 
 export function dirs(name: string): Dirs {
   const tag = `${name}-${Date.now().toString(36)}`
-  return { stateDir: `${REPO}/.state/test/${tag}`, workRoot: `/tmp/cc2r-test/${tag}` }
+  return { stateDir: `${REPO}/.state/test/${tag}`, workDir: `/tmp/cc2r-test/${tag}` }
 }
 
 export interface GatewayOpts {
@@ -51,7 +51,7 @@ export class TestGateway {
       port: freePort(),
       bridgePort: freePort(),
       stateDir: o.dirs.stateDir,
-      workRoot: o.dirs.workRoot,
+      workDir: o.dirs.workDir,
       claudeBinary: CLAUDE,
       tz: o.tz ?? 'UTC',
       idleTimeoutMs: o.idleTimeoutMs ?? 600_000,
@@ -255,6 +255,6 @@ export function assertSameRequests(xs: Exchange[], ys: Exchange[], nx: Normalize
 
 export function cleanup(d: Dirs): void {
   try {
-    Deno.removeSync(d.workRoot, { recursive: true })
+    Deno.removeSync(d.workDir, { recursive: true })
   } catch { /* gone */ }
 }

@@ -39,11 +39,11 @@ Deno.test('midnight via the TZ trick: the date change is appended at the tail, t
 
 Deno.test('negative control: a moved working folder appends an environment update at the tail', async () => {
   const run = new Run('moved', false)
-  const old = run.d.workRoot
+  const old = run.d.workDir
   await run.run(async () => {
     run.fake.reply({ blocks: [text('here')] })
     await run.turn('F1')
-    await run.disrupt('restart', { workRoot: `${old}-moved` })
+    await run.disrupt('restart', { workDir: `${old}-moved` })
     run.fake.reply({ blocks: [text('there')] })
     await run.turn('F2 from a moved folder')
     await run.disrupt('idle')
@@ -51,8 +51,7 @@ Deno.test('negative control: a moved working folder appends an environment updat
     await run.turn('F3')
     const [f1, f2, f3] = run.fake.main()
     assertPrefix(f1, f2)
-    const sid = run.tg.events('spawn')[0].data.session
-    assertStringIncludes(lastText(f2.body), `# Environment update\\n - Primary working directory: /private${old}-moved/${sid} (was /private${old}/${sid})`)
+    assertStringIncludes(lastText(f2.body), `# Environment update\\n - Primary working directory: /private${old}-moved (was /private${old})`)
     assertPrefix(f2, f3)
     assert(!lastText(f3.body).includes('Environment update'))
   })

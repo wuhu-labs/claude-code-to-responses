@@ -222,3 +222,19 @@ Deno.test('a rebuild on a completely fresh state dir from client records sends t
     assertPrefix(x, y)
   })
 })
+
+Deno.test('every session runs in the one working folder, whatever the conversation', async () => {
+  const run = new Run('one-work-dir', false)
+  await run.run(async () => {
+    run.fake.reply({ blocks: [text('a')] }, { blocks: [text('b')] })
+    await run.turn('chain one')
+    const { send } = await import('./harness.ts')
+    const { INSTRUCTIONS, MODEL, TOOLS } = await import('./scenario.ts')
+    await send(run.tg.client, { model: MODEL, instructions: INSTRUCTIONS, tools: TOOLS, input: 'chain two' })
+    const [x, y] = run.fake.main()
+    // two conversations, one environment block
+    assertEquals(JSON.stringify(x.body.messages[1]), JSON.stringify(y.body.messages[1]))
+    assertStringIncludes(JSON.stringify(x.body.messages[1]), `Primary working directory: ${run.tg.gw.config.workDir}\\n`)
+    assertEquals([...Deno.readDirSync(run.tg.gw.config.workDir)].length, 0, 'nothing is created in it')
+  })
+})

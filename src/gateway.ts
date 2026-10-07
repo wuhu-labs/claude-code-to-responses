@@ -97,8 +97,9 @@ export class Gateway {
     this.processes.add(lane)
   }
 
-  private workDir(sessionId: string): string {
-    return `${this.config.workRoot}/${sessionId}`
+  /** Every session runs in the one working folder: its environment block reads the same in every conversation. */
+  private workDir(_sessionId: string): string {
+    return this.config.workDir
   }
 
   /** Validates and starts a response; returns its event stream. Errors before streaming are thrown. */

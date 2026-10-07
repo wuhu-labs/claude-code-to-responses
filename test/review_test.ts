@@ -216,7 +216,7 @@ Deno.test('state, records and logs are owner-only under umask 022', async () => 
           `${state}/run`,
           `${state}/sessions`,
           lane.configDir,
-          Deno.realPathSync(run.d.workRoot),
+          Deno.realPathSync(run.d.workDir),
           lane.workDir,
         ]
       ) {
@@ -276,7 +276,7 @@ Deno.test('a work root inside git is refused before anything is created or chang
   Deno.mkdirSync(inGit, { recursive: true })
   Deno.chmodSync(inGit, 0o755)
   const stateDir = `/tmp/cc2r-test/refused-state-${tag}`
-  for (const workRoot of [inGit, `${inGit}/not/yet/there`]) {
+  for (const workDir of [inGit, `${inGit}/not/yet/there`]) {
     assertThrows(
       () =>
         prepare({
@@ -284,7 +284,7 @@ Deno.test('a work root inside git is refused before anything is created or chang
           port: 1,
           bridgePort: 0,
           stateDir,
-          workRoot,
+          workDir,
           claudeBinary: CLAUDE,
           tz: 'UTC',
           idleTimeoutMs: 1,
@@ -536,7 +536,7 @@ Deno.test('a second gateway on a state dir in use is refused at startup, and the
 Deno.test('off loopback the gateway refuses to start without a token; with one, every request must carry it', async () => {
   const { parseArgs, ConfigError } = await import('../src/config.ts')
   const { CLAUDE, TestGateway } = await import('./harness.ts')
-  const base = ['--state-dir', '/tmp/x', '--work-root', '/tmp/y', '--claude', CLAUDE]
+  const base = ['--state-dir', '/tmp/x', '--work-dir', '/tmp/y', '--claude', CLAUDE]
   assertThrows(() => parseArgs(['--listen', '0.0.0.0:18399', ...base], {}), ConfigError, 'reachable beyond this machine')
   assertThrows(() => parseArgs(['--listen', '0.0.0.0:18399', '--auth-token-env', 'GW_TOKEN', ...base], {}), ConfigError, 'not set')
   assertEquals(parseArgs(['--listen', '0.0.0.0:18399', '--auth-token-env', 'GW_TOKEN', ...base], { GW_TOKEN: 's3cret' }).authToken, 's3cret')

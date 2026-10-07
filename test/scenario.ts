@@ -38,12 +38,12 @@ export class Run {
   constructor(
     readonly name: string,
     readonly live: boolean,
-    readonly opts: { mode?: 'previous' | 'history'; tz?: string; workRoot?: string; idleTimeoutMs?: number; holdTimeoutMs?: number; recordTimeoutMs?: number } =
+    readonly opts: { mode?: 'previous' | 'history'; tz?: string; workDir?: string; idleTimeoutMs?: number; holdTimeoutMs?: number; recordTimeoutMs?: number } =
       {},
   ) {
     this.fake = new FakeAnthropic(freePort())
     this.d = dirs(name)
-    if (opts.workRoot) this.d.workRoot = opts.workRoot
+    if (opts.workDir) this.d.workDir = opts.workDir
   }
 
   backend() {
@@ -64,7 +64,7 @@ export class Run {
   }
 
   /** Evicts or restarts between requests, unless this is the control run. */
-  async disrupt(kind: Disruption, o: { tz?: string; workRoot?: string } = {}): Promise<void> {
+  async disrupt(kind: Disruption, o: { tz?: string; workDir?: string } = {}): Promise<void> {
     if (this.live) return
     this.disruptions.push({ kind, beforeRequest: this.fake.main().length })
     if (kind === 'idle' || kind === 'hold') {
@@ -73,8 +73,8 @@ export class Run {
     }
     await this.tg.close()
     this.tg.assertClean()
-    if (kind === 'restart-lost-store') this.d = { stateDir: dirs(`${this.name}-fresh`).stateDir, workRoot: o.workRoot ?? this.d.workRoot }
-    else if (o.workRoot) this.d = { ...this.d, workRoot: o.workRoot }
+    if (kind === 'restart-lost-store') this.d = { stateDir: dirs(`${this.name}-fresh`).stateDir, workDir: o.workDir ?? this.d.workDir }
+    else if (o.workDir) this.d = { ...this.d, workDir: o.workDir }
     this.tg = await TestGateway.start({
       dirs: this.d,
       backendEnv: this.backend(),
@@ -114,7 +114,8 @@ export class Run {
   /** Replaces this run's working folders with a placeholder, for comparing two runs. */
   normalize = (s: string): string => {
     const sessions = new Set(this.gateways.flatMap((g) => g.events('spawn').map((e) => e.data.session as string)))
-    for (const sid of sessions) s = s.replaceAll(new RegExp(`/private/tmp/cc2r-test/[^/"]+/${sid}`, 'g'), '<WORK>').replaceAll(sid, '<SESSION>')
+    for (const g of this.gateways) s = s.replaceAll(g.gw.config.workDir, '<WORK>')
+    for (const sid of sessions) s = s.replaceAll(sid, '<SESSION>')
     const devices = new Set(this.gateways.flatMap((g) => g.events('spawn').map((e) => e.data.device as string)))
     for (const d of devices) s = s.replaceAll(d, '<DEVICE>')
     return s
