@@ -188,3 +188,17 @@ Deno.test('each chain has its own Claude Code config folder, which holds its ses
     }
   })
 })
+
+Deno.test("a chain's device id is in its records and seeded into its config folder: metadata.user_id is the chain's", async () => {
+  const run = new Run('device-id', false)
+  await run.run(async () => {
+    run.fake.reply({ blocks: [text('one')] })
+    const r = await run.turn('one')
+    const rec = (await recordOf(r))!
+    assert(/^[0-9a-f]{64}$/.test(rec.device))
+    const meta = JSON.parse(run.fake.main()[0].body.metadata.user_id)
+    assertEquals([meta.device_id, meta.session_id], [rec.device, rec.session])
+    const lane = [...run.tg.gw.lanes.values()][0]
+    assertEquals(JSON.parse(Deno.readTextFileSync(`${lane.configDir}/.claude.json`)).userID, rec.device)
+  })
+})

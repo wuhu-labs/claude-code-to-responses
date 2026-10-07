@@ -19,7 +19,7 @@ import { claudeVersion, processIdentity } from './claude/process.ts'
 import { type Config, ConfigError, paths } from './config.ts'
 import { GatewayError, invalid, previousResponseNotFound, unsupported } from './errors.ts'
 import { Active, type ChainSpec, type Head, Lane, MAX_RESULT_CHARS, outputChars } from './lane.ts'
-import { type CallRef, decodeRecord, decodeThinking, digestItems, type ProviderRecord, RecordError, sha256, THINKING_PREFIX } from './records.ts'
+import { type CallRef, decodeRecord, decodeThinking, digestItems, newDeviceId, type ProviderRecord, RecordError, sha256, THINKING_PREFIX } from './records.ts'
 import { ResponseStore } from './store.ts'
 
 // deno-lint-ignore no-explicit-any
@@ -189,7 +189,7 @@ export class Gateway {
     await this.settled(rec.session)
     const records = this.store.chain(prev)
     if (!records) throw previousResponseNotFound(prev, 'its chain is incomplete in the store')
-    lane = new Lane(rec.session, this.workDir(rec.session), chain, head, this.config, this.bridge, this.store, this.laneEvents)
+    lane = new Lane(rec.session, rec.device, this.workDir(rec.session), chain, head, this.config, this.bridge, this.store, this.laneEvents)
     this.addLane(lane)
     const log = records.flatMap((r) => r.entries)
     lane.pending = this.store.tail(prev)
@@ -248,7 +248,7 @@ export class Gateway {
       const sessionId = crypto.randomUUID()
       const delivery = deliveryFor(null, tail)
       this.reserve(sessionId, reservation)
-      const lane = new Lane(sessionId, this.workDir(sessionId), chain, null, this.config, this.bridge, this.store, this.laneEvents)
+      const lane = new Lane(sessionId, newDeviceId(), this.workDir(sessionId), chain, null, this.config, this.bridge, this.store, this.laneEvents)
       this.addLane(lane)
       state.gateway = { path: 'new', session: sessionId }
       return { lane, delivery, prevId: null, covered: tail, spawn: { resume: false, interruptedTurn: false } }
@@ -259,6 +259,7 @@ export class Gateway {
     let synth: Group[] = []
     let headId: string | null = null
     let session: string | null = null
+    let device: string | null = null
     for (let gi = 0; gi < groups.length; gi++) {
       const g = groups[gi]
       pendingGroups.push(g)
@@ -268,6 +269,7 @@ export class Gateway {
       if (recs.length === 0) continue
       const r = recs[recs.length - 1]!
       const fits = recs.length === 1 && r.chain === chain.key && r.prev === headId && (session === null || r.session === session) &&
+        (device === null || r.device === device) &&
         r.digest === await digestItems(pendingGroups.flatMap((x) => [...x.inputs, ...x.outputs]))
       // a record that does not continue the log (another chain, an edited history) is ignored: its group is synthesized,
       // unless a later record covers it
@@ -275,6 +277,7 @@ export class Gateway {
       used.push(r)
       headId = r.id
       session = r.session
+      device = r.device
       pendingGroups = []
     }
     if (pendingGroups.length) synth = pendingGroups
@@ -321,6 +324,7 @@ export class Gateway {
     const delivery = deliveryFor(head, tail)
     const lane = new Lane(
       sessionId,
+      device ?? newDeviceId(),
       workDir,
       chain,
       used.length ? { responseId: headId!, end: used[used.length - 1].end, calls: used[used.length - 1].calls } : null,

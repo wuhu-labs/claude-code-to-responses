@@ -31,7 +31,11 @@ Deno.test('a client record whose session is a path is refused before any file is
       assertEquals([r.status, r.body?.error?.code], [400, 'invalid_provider_record'])
     }
     // other fields that reach paths or the log are checked too
-    for (const bad of [{ id: '../x' }, { prev: 'resp_../x' }, { entries: ['{"a":1}\n{"b":2}'] }, { entries: ['not json'] }, { end: 'calls', calls: [] }]) {
+    for (
+      const bad of [{ device: '../x' }, { device: 'A'.repeat(64) }, { id: '../x' }, { prev: 'resp_../x' }, { entries: ['{"a":1}\n{"b":2}'] }, {
+        entries: ['not json'],
+      }, { end: 'calls', calls: [] }]
+    ) {
       item.encrypted_content = await encodeRecord({ ...rec, ...bad } as Json)
       const r = await post(run.tg.url, { model: MODEL, instructions: INSTRUCTIONS, tools: TOOLS, stream: true, input: [...history, user('two')] })
       assertEquals([r.status, r.body?.error?.code], [400, 'invalid_provider_record'], JSON.stringify(bad))

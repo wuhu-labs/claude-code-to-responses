@@ -22,6 +22,8 @@ export interface ProviderRecord {
   chain: string
   /** Claude Code session id. */
   session: string
+  /** The chain's Claude Code device id (its config folder's userID): with the session id, metadata.user_id. */
+  device: string
   /** How the response ended: a finished turn, or tool calls Claude Code waits on. */
   end: 'turn' | 'calls'
   calls: CallRef[]
@@ -66,6 +68,14 @@ export class RecordError extends Error {}
 export const RESPONSE_ID = /^resp_[0-9a-f]{32}$/
 export const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const HEX64 = /^[0-9a-f]{64}$/
+export const DEVICE_ID = HEX64
+
+/** A new chain's device id: 64 hex digits, the shape Claude Code generates. */
+export function newDeviceId(): string {
+  const b = new Uint8Array(32)
+  crypto.getRandomValues(b)
+  return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('')
+}
 const CALL_ID = /^[A-Za-z0-9_-]{1,128}$/
 const TOOL_NAME = /^[a-zA-Z0-9_-]{1,64}$/
 
@@ -97,6 +107,7 @@ export function checkRecord(r: any): void {
   if (typeof r.chain !== 'string' || !HEX64.test(r.chain)) fail('bad chain')
   if (typeof r.digest !== 'string' || !HEX64.test(r.digest)) fail('bad digest')
   if (typeof r.session !== 'string' || !SESSION_ID.test(r.session)) fail('bad session')
+  if (typeof r.device !== 'string' || !DEVICE_ID.test(r.device)) fail('bad device')
   if (r.end !== 'turn' && r.end !== 'calls') fail('bad end')
   if (!Array.isArray(r.calls) || (r.end === 'turn') !== (r.calls.length === 0)) fail('bad calls')
   for (const c of r.calls) {

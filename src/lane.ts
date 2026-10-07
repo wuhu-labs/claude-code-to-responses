@@ -111,6 +111,8 @@ export class Lane implements BridgeTarget {
 
   constructor(
     readonly sessionId: string,
+    /** The chain's device id, seeded into its config folder so metadata.user_id is the same on every rebuild. */
+    readonly device: string,
     readonly workDir: string,
     readonly chain: ChainSpec,
     head: Head | null,
@@ -171,6 +173,7 @@ export class Lane implements BridgeTarget {
     const p = paths(this.config)
     Deno.mkdirSync(this.workDir, { recursive: true, mode: 0o700 })
     Deno.mkdirSync(this.configDir, { recursive: true, mode: 0o700 })
+    this.seedDevice()
     if (opts.resume) {
       const dir = projectDir(this.configDir, this.workDir)
       Deno.mkdirSync(dir, { recursive: true, mode: 0o700 })
@@ -225,6 +228,25 @@ export class Lane implements BridgeTarget {
       { mode: 0o600 },
     )
     this.events.note('spawn', { session: this.sessionId, pid: this.proc.pid, epoch, resume: opts.resume, interruptedTurn: opts.interruptedTurn })
+  }
+
+  /**
+   * Claude Code takes its device id (metadata.user_id's device_id) from its config folder's .claude.json `userID` and
+   * generates one only when there is none (probed). Seeding the chain's own id there before every launch makes
+   * metadata.user_id the same wherever and whenever the chain is rebuilt.
+   */
+  private seedDevice(): void {
+    const path = `${this.configDir}/.claude.json`
+    // deno-lint-ignore no-explicit-any
+    let state: any = {}
+    try {
+      state = JSON.parse(Deno.readTextFileSync(path))
+    } catch (e) {
+      if (!(e instanceof Deno.errors.NotFound)) throw e
+    }
+    if (state.userID === this.device) return
+    state.userID = this.device
+    Deno.writeTextFileSync(path, JSON.stringify(state, null, 2), { mode: 0o600 })
   }
 
   /** A bug in handling Claude Code's output: the response fails visibly and the process goes. */
@@ -751,6 +773,7 @@ export class Lane implements BridgeTarget {
       prev: a.prevId,
       chain: this.chain.key,
       session: this.sessionId,
+      device: this.device,
       end,
       calls,
       digest: await digestItems([...a.covered, ...a.outputs]),
