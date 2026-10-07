@@ -20,6 +20,8 @@ export interface Exchange {
 
 export interface Reply {
   blocks: Block[]
+  /** Answer with an Anthropic error instead: an HTTP status, or an `error` event in the stream (`inStream`). */
+  error?: { status: number; type: string; message: string; inStream?: boolean }
   stop?: string
   usage?: { input_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number; output_tokens?: number }
   /** ms to wait between content blocks while streaming */
@@ -93,6 +95,14 @@ export class FakeAnthropic {
       const q = this.queue.shift()
       r = q === undefined ? this.fallback(ex) : typeof q === 'function' ? q(ex) : q
     }
+    // an error in the stream is the error of the non-streamed retry too
+    if (r.error && (!r.error.inStream || !body.stream)) {
+      const status = r.error.inStream ? 529 : r.error.status
+      return Response.json({ type: 'error', error: { type: r.error.type, message: r.error.message } }, {
+        status,
+        headers: { 'request-id': `req_fake_${ex.n}` },
+      })
+    }
     const usage = {
       input_tokens: r.usage?.input_tokens ?? Math.max(1, raw.length >> 2),
       cache_creation_input_tokens: r.usage?.cache_creation_input_tokens ?? 0,
@@ -111,7 +121,9 @@ export class FakeAnthropic {
       usage,
     }
     if (!body.stream) return Response.json(message)
-    const events = sseEvents(message)
+    const events = r.error?.inStream
+      ? [sseEvents(message)[0], `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: r.error.type, message: r.error.message } })}\n\n`]
+      : sseEvents(message)
     const gap = r.gapMs ?? 0
     const stream = new ReadableStream<Uint8Array>({
       async start(c) {

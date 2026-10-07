@@ -88,6 +88,7 @@ export function launchEnv(s: LaunchSpec): Record<string, string> {
     CLAUDE_CODE_TOTAL_TOKENS_REMINDER: 'off',
     CLAUDE_CODE_SILENT_TURN_REMINDER: '0',
     MAX_MCP_OUTPUT_TOKENS,
+    CLAUDE_CODE_MAX_RETRIES: '0',
     ...(s.interruptedTurn ? { CLAUDE_CODE_RESUME_INTERRUPTED_TURN: '1' } : {}),
     ...s.backendEnv,
   }

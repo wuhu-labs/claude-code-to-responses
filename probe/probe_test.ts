@@ -199,6 +199,27 @@ probe('anthropic/maxResultSizeChars + MAX_MCP_OUTPUT_TOKENS: results up to 500,0
   }
 })
 
+probe('CLAUDE_CODE_MAX_RETRIES=0 and the error result: an upstream error ends the turn at once as api_error with its status (paired)', async (p, fake) => {
+  const cases: [number, string][] = [[400, 'invalid_request_error'], [401, 'authentication_error'], [429, 'rate_limit_error'], [500, 'api_error'], [
+    529,
+    'overloaded_error',
+  ]]
+  for (const [status, type] of cases) {
+    const n = fake.main().length
+    fake.reply({ blocks: [text('never')], error: { status, type, message: `probe ${status}` } })
+    const res = await p.launch({ name: `err-${status}`, fake, target: new ProbeTarget() }).turn('x')
+    assertEquals([res.is_error, res.terminal_reason, res.api_error_status], [true, 'api_error', status], String(status))
+    assertStringIncludes(res.result, 'API Error')
+    assertEquals(fake.main().length - n, 1, `${status}: no retry`)
+  }
+  // without the pin Claude Code retries by itself
+  fake.fallback = () => ({ blocks: [text('never')], error: { status: 529, type: 'overloaded_error', message: 'probe' } })
+  const r = p.launch({ name: 'err-retrying', fake, target: new ProbeTarget(), env: { CLAUDE_CODE_MAX_RETRIES: undefined } })
+  await r.user('x')
+  const retry = await r.until((f) => f.type === 'system' && f.subtype === 'api_retry', 20000)
+  assertEquals(retry.error_status, 529)
+})
+
 probe('a log rebuilt from the mirrored entries resumes into a byte-identical request', async (p, fake) => {
   const work = '/tmp/cc2r-probe/rebuild'
   const script = () => {

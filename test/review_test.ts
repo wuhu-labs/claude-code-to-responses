@@ -382,3 +382,28 @@ Deno.test("the gateway's own reasoning items may come back next to new input; fo
     assertEquals([r3.response.x_gateway.path, r3.response.x_gateway.records, r3.response.x_gateway.synthesized_groups], ['history', 2, 0])
   })
 })
+
+Deno.test('upstream errors map to typed failures, at once: the client owns retries', async () => {
+  const run = new Run('upstream-errors', false)
+  await run.run(async () => {
+    const cases: [string, { status: number; type: string; message: string; inStream?: boolean }, string][] = [
+      ['400', { status: 400, type: 'invalid_request_error', message: 'bad request' }, 'upstream_invalid_request'],
+      ['401', { status: 401, type: 'authentication_error', message: 'invalid x-api-key' }, 'upstream_authentication_error'],
+      ['429', { status: 429, type: 'rate_limit_error', message: 'slow down' }, 'rate_limit_exceeded'],
+      ['500', { status: 500, type: 'api_error', message: 'boom' }, 'upstream_error'],
+      ['529', { status: 529, type: 'overloaded_error', message: 'Overloaded' }, 'upstream_overloaded'],
+      ['overloaded mid-stream', { status: 200, type: 'overloaded_error', message: 'Overloaded', inStream: true }, 'upstream_stream_cut'],
+    ]
+    for (const [label, error, code] of cases) {
+      const before = run.fake.main().length
+      run.fake.reply({ blocks: [text('never')], error })
+      const t0 = Date.now()
+      const r = await run.send([user(`fails with ${label}`)])
+      assertEquals([r.status, r.response.error.code], ['failed', code], label)
+      assert(Date.now() - t0 < 5000, `${label} took ${Date.now() - t0} ms`)
+      assert(run.fake.main().length - before <= 2, `${label}: ${run.fake.main().length - before} requests`)
+    }
+    run.fake.reply({ blocks: [text('fine')] })
+    assertEquals((await run.send([user('and now it works')])).status, 'completed')
+  })
+})

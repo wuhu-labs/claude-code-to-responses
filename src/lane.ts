@@ -712,15 +712,23 @@ export function outputChars(parts: Part[]): number {
 }
 export { MAX_RESULT_CHARS }
 
+/**
+ * Maps the error result of a turn. Measured on 2.1.284: an upstream error ends the turn with
+ * `terminal_reason: "api_error"`, `api_error_status: <HTTP status>` and `result: "API Error: …"`; the context limit
+ * with `terminal_reason: "blocking_limit"` and "Prompt is too long". The probe checks both shapes per release.
+ */
 function resultError(f: Frame): GatewayError {
   const text = String(f.result ?? f.errors?.join?.('; ') ?? 'Claude Code reported an error')
-  if (f.terminal_reason === 'blocking_limit' || /prompt is too long/i.test(text)) {
+  if (f.terminal_reason === 'blocking_limit') {
     return new GatewayError(400, 'invalid_request_error', 'context_length_exceeded', `The context is too long for the model: ${text}`)
   }
   const status = typeof f.api_error_status === 'number' ? f.api_error_status : null
-  if (status === 429) return new GatewayError(429, 'server_error', 'rate_limit_exceeded', text)
-  if (status === 401 || status === 403) return new GatewayError(status, 'server_error', 'upstream_authentication_error', text)
-  if (status !== null && status >= 400 && status < 500) return new GatewayError(400, 'invalid_request_error', 'upstream_invalid_request', text)
-  if (status !== null) return new GatewayError(502, 'server_error', 'upstream_error', text)
-  return serverError('claude_code_error', text)
+  if (f.terminal_reason === 'api_error' && status !== null) {
+    if (status === 429) return new GatewayError(429, 'server_error', 'rate_limit_exceeded', text)
+    if (status === 401 || status === 403) return new GatewayError(status, 'server_error', 'upstream_authentication_error', text)
+    if (status === 529) return new GatewayError(503, 'server_error', 'upstream_overloaded', text)
+    if (status >= 400 && status < 500) return new GatewayError(400, 'invalid_request_error', 'upstream_invalid_request', text)
+    return new GatewayError(502, 'server_error', 'upstream_error', text)
+  }
+  return serverError('claude_code_error', `Claude Code ended the turn with an error (${f.terminal_reason ?? 'unknown'}): ${text}`)
 }
