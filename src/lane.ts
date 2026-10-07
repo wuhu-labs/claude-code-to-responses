@@ -65,6 +65,8 @@ export class Active {
   ownsTurn = false
   /** The turn's result arrived. */
   turnEnded = false
+  /** Its record is being cut from the log. */
+  finishing = false
   constructor(
     readonly state: ResponseState,
     readonly sink: SseSink,
@@ -79,8 +81,15 @@ export class Lane implements BridgeTarget {
   proc: ClaudeProcess | null = null
   epoch = ''
   head: Head | null
-  /** Log entries since `head`, verbatim: the gateway's own writes, then Claude Code's transcript mirror. */
+  /**
+   * Log lines since `head`'s record, verbatim, as they are on disk: the head's tail, the gateway's own writes for this
+   * attempt, then whatever Claude Code appended. The log file is the truth; the mirror only says when to read it.
+   */
   pending: string[] = []
+  /** Bytes of the log file already read into records or `pending`. */
+  private logOffset = 0
+  /** Mirrored lines since the last record: the disk must hold each before a record is cut. */
+  private mirroredLines: string[] = []
   active: Active | null = null
   dead = false
   private turnOpen = false
@@ -95,8 +104,8 @@ export class Lane implements BridgeTarget {
   private knownWaiters = new Map<string, (() => void)[]>()
   private staged: { callId: string; text: string } | null = null
   private continuing = false
-  /** For each model message id: the stream indexes whose log entries the mirror has delivered, and where the last sits in `pending`. */
-  private mirrored = new Map<string, { indexes: Set<number>; last: number }>()
+  /** For each model message id: the stream indexes whose log entries the mirror has delivered. */
+  private mirrored = new Map<string, Set<number>>()
   private timer: ReturnType<typeof setTimeout> | undefined
   private runDir = ''
 
@@ -117,6 +126,36 @@ export class Lane implements BridgeTarget {
     return logPath(paths(this.config).configDir, this.workDir, this.sessionId)
   }
 
+  /** Reads the complete lines Claude Code appended to the log since the last read into `pending`. */
+  private readLog(): void {
+    let f: Deno.FsFile
+    try {
+      f = Deno.openSync(this.logFile, { read: true })
+    } catch (e) {
+      if (e instanceof Deno.errors.NotFound) return
+      throw e
+    }
+    try {
+      const size = f.statSync().size
+      if (size <= this.logOffset) return
+      const buf = new Uint8Array(size - this.logOffset)
+      f.seekSync(this.logOffset, Deno.SeekMode.Start)
+      let got = 0
+      while (got < buf.length) {
+        const n = f.readSync(buf.subarray(got))
+        if (n === null || n === 0) break
+        got += n
+      }
+      const end = buf.subarray(0, got).lastIndexOf(10) // only whole lines
+      if (end < 0) return
+      const text = new TextDecoder().decode(buf.subarray(0, end + 1))
+      this.logOffset += end + 1
+      for (const l of text.split('\n')) if (l !== '') this.pending.push(l)
+    } finally {
+      f.close()
+    }
+  }
+
   // ---- process lifecycle -------------------------------------------------------------------------------
 
   /**
@@ -134,7 +173,11 @@ export class Lane implements BridgeTarget {
         Deno.removeSync(`${dir}/${this.sessionId}`, { recursive: true })
       } catch { /* none */ }
       const lines = [...(opts.log ?? []), ...this.pending, ...(opts.attempt ?? [])]
-      Deno.writeTextFileSync(this.logFile, lines.map((l) => l + '\n').join(''), { mode: 0o600 })
+      const text = lines.map((l) => l + '\n').join('')
+      Deno.writeTextFileSync(this.logFile, text, { mode: 0o600 })
+      this.logOffset = new TextEncoder().encode(text).length
+    } else {
+      this.logOffset = 0
     }
     this.pending.push(...(opts.attempt ?? []))
     this.epoch = newId('ep')
@@ -240,21 +283,25 @@ export class Lane implements BridgeTarget {
   private keepTail(atRest: boolean): void {
     const chain = this.store.chain(this.head!.responseId)
     if (!chain) return this.events.note('verify_error', { session: this.sessionId, error: 'chain missing from store' })
-    const want = chain.flatMap((r) => r.entries)
-    let disk: string[] | null = null
     try {
-      disk = Deno.readTextFileSync(this.logFile).split('\n').filter((l) => l !== '')
+      this.readLog() // the process is gone: everything it wrote is on disk
     } catch (e) {
       this.events.note('verify_error', { session: this.sessionId, error: String(e) })
     }
-    const prefixOk = disk !== null && want.every((l, i) => disk![i] === l)
-    if (disk && !prefixOk) {
-      const i = want.findIndex((l, i) => disk![i] !== l)
-      this.events.note('verify_error', { session: this.sessionId, line: i, disk: disk[i]?.slice(0, 300) ?? null, want: want[i].slice(0, 300) })
+    const tail = atRest ? this.pending : this.pending.slice(0, this.pendingAtAttach ?? this.pending.length)
+    // the log is the stored chain, then this tail (and, after a failed attempt, the attempt), byte for byte
+    let disk: string[] = []
+    try {
+      disk = Deno.readTextFileSync(this.logFile).split('\n').filter((l) => l !== '')
+    } catch { /* checked below */ }
+    const want = [...chain.flatMap((r) => r.entries), ...tail]
+    const i = want.findIndex((l, i) => disk[i] !== l)
+    if (i >= 0 || (atRest && disk.length !== want.length)) {
+      const at = i >= 0 ? i : want.length
+      this.events.note('verify_error', { session: this.sessionId, line: at, disk: disk[at]?.slice(0, 300) ?? null, want: want[at]?.slice(0, 300) ?? null })
     } else if (this.config.verifyLogs) {
       this.events.note('verify_ok', { session: this.sessionId, lines: want.length })
     }
-    const tail = atRest && prefixOk ? disk!.slice(want.length) : this.pending.slice(0, this.pendingAtAttach ?? this.pending.length)
     if (tail.length) {
       this.store.putTail(this.head!.responseId, tail)
       this.events.note('tail', { session: this.sessionId, response: this.head!.responseId, lines: tail.length })
@@ -277,6 +324,8 @@ export class Lane implements BridgeTarget {
   attach(a: Active): void {
     clearTimeout(this.timer)
     this.active = a
+    // anything Claude Code wrote while the lane sat at rest belongs before this attempt
+    if (this.proc && !this.dead) this.readLog()
     this.pendingAtAttach = this.pending.length
     a.sink.onCancel = () => {
       this.events.note('client_disconnect', { session: this.sessionId, response: a.state.id })
@@ -455,11 +504,10 @@ export class Lane implements BridgeTarget {
   }
 
   private mirror(e: Json): void {
-    this.pending.push(JSON.stringify(e))
+    this.mirroredLines.push(JSON.stringify(e))
     if (e?.type === 'assistant' && typeof e.message?.id === 'string' && typeof e.apiBlockIndex === 'number') {
-      const m = this.mirrored.get(e.message.id) ?? { indexes: new Set<number>(), last: 0 }
-      m.indexes.add(e.apiBlockIndex)
-      m.last = this.pending.length - 1
+      const m = this.mirrored.get(e.message.id) ?? new Set<number>()
+      m.add(e.apiBlockIndex)
       this.mirrored.set(e.message.id, m)
       this.maybeFinish()
     }
@@ -619,10 +667,10 @@ export class Lane implements BridgeTarget {
    */
   private maybeFinish(): void {
     const a = this.active
-    if (!a || a.finished || !a.msg?.stopped) return
+    if (!a || a.finished || a.finishing || !a.msg?.stopped) return
     const msg = a.msg
     const m = this.mirrored.get(msg.id)
-    for (const i of msg.blocks.keys()) if (!m?.indexes.has(i)) return
+    for (const i of msg.blocks.keys()) if (!m?.has(i)) return
     const calls = msg.stopReason === 'tool_use'
     const callBlocks = [...msg.blocks.values()].filter((b) => b.type === 'tool_use')
     if (calls && (callBlocks.length === 0 || !m)) {
@@ -631,15 +679,48 @@ export class Lane implements BridgeTarget {
     if (!calls && (this.staged || this.continuing)) return // notices go in at the end-of-turn hook; inference goes on
     if (!calls && !a.turnEnded) return
     if (calls && this.staged) return this.fail(serverError('notice_undelivered', 'The model called tools again before the notices could be delivered.'))
-    clearTimeout(a.mirrorTimer)
-    a.finished = true
-    // a turn's end takes everything logged so far; held calls take the message, and Claude Code writes nothing more while it waits
-    const cut = calls ? m!.last + 1 : this.pending.length
-    const entries = this.pending.slice(0, cut)
-    this.pending = this.pending.slice(cut)
-    this.mirrored.clear()
+    a.finishing = true
     const callRefs: CallRef[] = calls ? callBlocks.map((b) => ({ id: b.item.call_id, name: b.item.name })) : []
-    void this.complete(a, calls ? 'calls' : 'turn', callRefs, entries, msg.stopReason!)
+    void this.cutRecord(a, msg.id, Math.max(...msg.blocks.keys()), calls, callRefs, msg.stopReason!)
+  }
+
+  /**
+   * Cuts the response's record from the log on disk, once the disk holds everything the mirror announced. A turn's
+   * end takes every line so far; held calls take the lines through the message's last block (Claude Code writes
+   * nothing more while it waits; anything that comes later goes to the next record or the tail).
+   */
+  private async cutRecord(a: Active, msgId: string, lastBlock: number, calls: boolean, callRefs: CallRef[], stopReason: string): Promise<void> {
+    const deadline = Date.now() + 2000
+    while (true) {
+      if (this.active !== a || a.finished) return
+      this.readLog()
+      const have = new Set(this.pending)
+      let cut = -1
+      if (calls) {
+        cut = this.pending.findIndex((l) => {
+          if (!l.includes(msgId)) return false
+          const e = JSON.parse(l)
+          return e.type === 'assistant' && e.message?.id === msgId && e.apiBlockIndex === lastBlock
+        }) + 1
+      } else if (this.mirroredLines.every((l) => have.has(l))) {
+        cut = this.pending.length
+      }
+      if (cut > 0) {
+        clearTimeout(a.mirrorTimer)
+        a.finished = true
+        const entries = this.pending.slice(0, cut)
+        this.pending = this.pending.slice(cut)
+        const taken = new Set(entries)
+        this.mirroredLines = this.mirroredLines.filter((l) => !taken.has(l))
+        this.mirrored.clear()
+        return this.complete(a, calls ? 'calls' : 'turn', callRefs, entries, stopReason)
+      }
+      if (Date.now() > deadline) {
+        a.finishing = false
+        return this.fail(serverError('record_incomplete', 'The log on disk does not hold what Claude Code reported writing.'))
+      }
+      await new Promise((r) => setTimeout(r, 10))
+    }
   }
 
   private async complete(a: Active, end: 'turn' | 'calls', calls: CallRef[], entries: string[], stopReason: string): Promise<void> {

@@ -435,3 +435,37 @@ for (const unknownFirst of [false, true]) {
     assertStringIncludes(byId(evicted).toolu_u, 'No such tool available: mcp__fn__nonexistent')
   })
 }
+
+Deno.test('a line Claude Code writes only to disk reaches the next record, through a live turn or a cancelled one', async () => {
+  for (const cancel of [false, true]) {
+    const run = new Run(`disk-only-${cancel ? 'cancel' : 'live'}`, false)
+    await run.run(async () => {
+      run.fake.reply({ blocks: [text('one')] })
+      const r1 = await run.turn('one')
+      const lane = [...run.tg.gw.lanes.values()][0]
+      const extra = JSON.stringify({ type: 'custom-title', customTitle: 'disk only', sessionId: lane.sessionId })
+      Deno.writeTextFileSync(lane.logFile, extra + '\n', { append: true })
+      if (cancel) {
+        run.fake.reply({ blocks: [text('partial'), text('rest')], gapMs: 1000 })
+        const stream = await run.tg.gw.create(
+          parseRequest({ model: MODEL, instructions: INSTRUCTIONS, tools: TOOLS, stream: true, previous_response_id: r1.response.id, input: [user('two')] }),
+        )
+        const reader = stream.getReader()
+        let seen = ''
+        while (!seen.includes('output_text.delta')) seen += new TextDecoder().decode((await reader.read()).value)
+        lane.cancel(lane.active!.state.id, 'test')
+        await lane.gone
+        assertEquals(run.tg.gw.store.tail(r1.response.id), [extra])
+      }
+      run.fake.reply({ blocks: [text('two')] })
+      const r2 = await run.turn('two')
+      const rec2 = (await decodeRecord(r2.response.output.at(-1).encrypted_content))!
+      assertEquals(rec2.entries[0], extra)
+      const live = [...run.tg.gw.lanes.values()][0]
+      await live.kill('test')
+      const rec1 = (await decodeRecord(r1.response.output.at(-1).encrypted_content))!
+      assertEquals(Deno.readTextFileSync(live.logFile).split('\n').filter(Boolean), [...rec1.entries, ...rec2.entries])
+      assertEquals(run.tg.events('verify_error').length, 0)
+    })
+  }
+})
