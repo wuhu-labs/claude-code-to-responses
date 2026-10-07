@@ -3,7 +3,7 @@
 // delivers notices through hooks, and records every log entry so the process can be killed and rebuilt.
 import type { FnTool, InItem, Part } from './api/request.ts'
 import { newId, type ResponseState, type SseSink, type UsageTotals } from './api/stream.ts'
-import { type Bridge, type BridgeTarget, StaleEpoch } from './bridge.ts'
+import { type Bridge, type BridgeTarget, McpCallError, StaleEpoch } from './bridge.ts'
 import { ClaudeProcess, type Frame } from './claude/process.ts'
 import { type LaunchSpec, logPath, MAX_RESULT_CHARS, MCP_PREFIX, mcpConfigJson, projectDir, settingsJson } from './claude/pins.ts'
 import { type Config, paths } from './config.ts'
@@ -85,8 +85,14 @@ export class Lane implements BridgeTarget {
   dead = false
   private turnOpen = false
   private turnWaiters: (() => void)[] = []
-  private held = new Map<string, (r: Json) => void>()
+  /** MCP calls waiting for the client's output, by tool_use id (a duplicate call waits beside the first). */
+  private held = new Map<string, Set<(r: Json) => void>>()
+  /** The client's outputs, by tool_use id; kept, so a duplicate call gets the same answer. */
   private results = new Map<string, Json>()
+  /** tool_use ids the model has produced in this process's stream; MCP calls for any other id are refused. */
+  private known = new Set<string>()
+  private answered = new Set<string>()
+  private knownWaiters = new Map<string, (() => void)[]>()
   private staged: { callId: string; text: string } | null = null
   private continuing = false
   /** For each model message id: the stream indexes whose log entries the mirror has delivered, and where the last sits in `pending`. */
@@ -196,8 +202,12 @@ export class Lane implements BridgeTarget {
     const atRest = this.pendingAtAttach === null
     clearTimeout(this.timer)
     this.bridge.unregister(this.epoch)
-    for (const [, resolve] of this.held) resolve({ content: [{ type: 'text', text: 'gateway: process evicted' }], isError: true })
+    for (const [, resolvers] of this.held) {
+      for (const resolve of resolvers) resolve({ content: [{ type: 'text', text: 'gateway: process evicted' }], isError: true })
+    }
     this.held.clear()
+    for (const [, ws] of this.knownWaiters) for (const w of ws) w()
+    this.knownWaiters.clear()
     this.wakeTurn()
     const proc = this.proc
     if (proc) await proc.kill()
@@ -278,12 +288,12 @@ export class Lane implements BridgeTarget {
     const calls = this.head!.calls
     this.staged = notices !== null ? { callId: calls[calls.length - 1].id, text: notices } : null
     for (const [id, parts] of outputs) this.results.set(id, mcpResult(parts))
-    for (const [id, resolve] of [...this.held]) {
+    for (const [id, resolvers] of [...this.held]) {
       const r = this.results.get(id)
       if (r === undefined) continue
-      this.results.delete(id)
       this.held.delete(id)
-      resolve(r)
+      this.answered.add(id)
+      for (const resolve of resolvers) resolve(r)
     }
   }
 
@@ -321,20 +331,54 @@ export class Lane implements BridgeTarget {
     }))
   }
 
-  toolCall(callId: string, _name: string, _args: Json, signal: AbortSignal): Promise<Json> {
-    if (this.dead) return Promise.reject(new StaleEpoch('stale Claude Code process: it was killed'))
+  async toolCall(callId: string, _name: string, _args: Json, signal: AbortSignal): Promise<Json> {
+    const stale = () => new StaleEpoch('stale Claude Code process: it was killed')
+    if (this.dead) throw stale()
+    if (!this.known.has(callId)) {
+      // Claude Code calls a tool once its block is streamed; give the stream a moment to catch up with the call
+      await this.whenKnown(callId, 2000)
+      if (this.dead) throw stale()
+      if (!this.known.has(callId)) {
+        this.events.note('unknown_call', { session: this.sessionId, call: callId })
+        throw new McpCallError(-32602, `unknown tool call '${callId}': the model made no such call`)
+      }
+    }
+    if (this.held.has(callId) || this.answered.has(callId)) this.events.note('duplicate_call', { session: this.sessionId, call: callId })
     const ready = this.results.get(callId)
     if (ready !== undefined) {
-      this.results.delete(callId)
-      return Promise.resolve(ready)
+      this.answered.add(callId)
+      return ready
     }
     this.events.note('hold', { session: this.sessionId, call: callId })
-    return new Promise((resolve) => {
-      this.held.set(callId, resolve)
+    return await new Promise((resolve) => {
+      const set = this.held.get(callId) ?? new Set()
+      set.add(resolve)
+      this.held.set(callId, set)
       signal.addEventListener('abort', () => {
-        if (this.held.get(callId) === resolve) this.held.delete(callId)
+        set.delete(resolve)
+        if (set.size === 0 && this.held.get(callId) === set) this.held.delete(callId)
       })
     })
+  }
+
+  private whenKnown(callId: string, ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      const t = setTimeout(done, ms)
+      const ws = this.knownWaiters.get(callId) ?? []
+      ws.push(done)
+      this.knownWaiters.set(callId, ws)
+      function done() {
+        clearTimeout(t)
+        resolve()
+      }
+    })
+  }
+
+  private learn(callId: string): void {
+    this.known.add(callId)
+    const ws = this.knownWaiters.get(callId)
+    this.knownWaiters.delete(callId)
+    for (const w of ws ?? []) w()
   }
 
   hook(body: Json): Json {
@@ -448,6 +492,7 @@ export class Lane implements BridgeTarget {
           const name = String(cb.name ?? '')
           if (!name.startsWith(MCP_PREFIX)) return this.fail(serverError('unexpected_tool', `The model called '${name}', which is not a client tool.`))
           item = { type: 'function_call', id: newId('fc'), call_id: cb.id, name: name.slice(MCP_PREFIX.length), arguments: '', status: 'in_progress' }
+          this.learn(cb.id)
         } else {
           return this.fail(serverError('unexpected_block', `Unsupported content block '${cb.type}' from the model.`))
         }

@@ -213,3 +213,40 @@ Deno.test('state, records and logs are owner-only under umask 022', async () => 
     Deno.umask(old)
   }
 })
+
+Deno.test('MCP calls with an unknown tool id are refused; duplicate ids share the one output', async () => {
+  const run = new Run('mcp-ids', false)
+  await run.run(async () => {
+    run.fake.reply({ blocks: [call('toolu_m1', 'echo', { text: 'a' }), call('toolu_m2', 'echo', { text: 'b' })] })
+    await run.send([user('two calls')])
+    await run.tg.waitEvent('hold', (d) => d.call === 'toolu_m1')
+    const epoch = run.tg.events('spawn')[0].data.epoch
+    const bridge = run.tg.gw.bridge
+    const mcp = (id: string) =>
+      fetch(`${bridge.url}/mcp/${epoch}`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${bridge.bearer}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'echo', arguments: {}, _meta: { 'claudecode/toolUseId': id } } }),
+      }).then((r) => r.json())
+    // an id the model never produced
+    const unknown = await mcp('toolu_bogus')
+    assertEquals(unknown.error.code, -32602)
+    assert(run.tg.events('unknown_call').length === 1)
+    // a duplicate of the held call waits beside it and gets the same output
+    const dup = mcp('toolu_m1')
+    await run.tg.waitEvent('duplicate_call', (d) => d.call === 'toolu_m1')
+    run.fake.reply({ blocks: [text('done')] })
+    const r = await run.send([{ type: 'function_call_output', call_id: 'toolu_m1', output: 'OUT-1' }, {
+      type: 'function_call_output',
+      call_id: 'toolu_m2',
+      output: 'OUT-2',
+    }])
+    assertEquals(r.status, 'completed')
+    assertEquals((await dup).result.content[0].text, 'OUT-1')
+    // after the release a duplicate is answered at once, with the same output
+    assertEquals((await mcp('toolu_m2')).result.content[0].text, 'OUT-2')
+    // the model saw each output once
+    const results = run.fake.main()[1].body.messages.at(-1).content.filter((b: Json) => b.type === 'tool_result')
+    assertEquals(results.map((b: Json) => b.tool_use_id), ['toolu_m1', 'toolu_m2'])
+  })
+})
