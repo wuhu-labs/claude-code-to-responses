@@ -8,8 +8,8 @@ export class ResponseStore {
   constructor(stateDir: string) {
     this.dir = `${stateDir}/responses`
     this.tailDir = `${stateDir}/tails`
-    Deno.mkdirSync(this.dir, { recursive: true })
-    Deno.mkdirSync(this.tailDir, { recursive: true })
+    Deno.mkdirSync(this.dir, { recursive: true, mode: 0o700 })
+    Deno.mkdirSync(this.tailDir, { recursive: true, mode: 0o700 })
   }
 
   /** Log lines Claude Code wrote after a response's record and before its process went away. */
@@ -25,7 +25,7 @@ export class ResponseStore {
 
   putTail(id: string, lines: string[]): void {
     const p = `${this.tailDir}/${this.path(id).replace(/^.*\//, '')}`
-    Deno.writeTextFileSync(`${p}.tmp`, JSON.stringify(lines))
+    Deno.writeTextFileSync(`${p}.tmp`, JSON.stringify(lines), { mode: 0o600 })
     Deno.renameSync(`${p}.tmp`, p)
   }
 
@@ -51,7 +51,7 @@ export class ResponseStore {
   put(r: ProviderRecord): void {
     const p = this.path(r.id)
     const tmp = `${p}.tmp`
-    Deno.writeTextFileSync(tmp, JSON.stringify(r))
+    Deno.writeTextFileSync(tmp, JSON.stringify(r), { mode: 0o600 })
     Deno.renameSync(tmp, p)
   }
 

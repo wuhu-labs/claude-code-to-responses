@@ -110,10 +110,13 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
 
 /** Resolves folders to real paths and checks the work root is outside git (a git folder changes Claude Code's prompt). */
 export function prepare(c: Config): Config {
-  Deno.mkdirSync(c.stateDir, { recursive: true })
-  Deno.mkdirSync(c.workRoot, { recursive: true })
+  // the state holds every conversation (records, logs) and the backend's credentials: owner-only, whatever the umask
+  Deno.mkdirSync(c.stateDir, { recursive: true, mode: 0o700 })
+  Deno.mkdirSync(c.workRoot, { recursive: true, mode: 0o700 })
   const stateDir = Deno.realPathSync(c.stateDir)
   const workRoot = Deno.realPathSync(c.workRoot)
+  Deno.chmodSync(stateDir, 0o700)
+  Deno.chmodSync(workRoot, 0o700)
   for (let d = workRoot;; d = d.replace(/\/[^/]+$/, '') || '/') {
     try {
       Deno.statSync(`${d}/.git`)
@@ -126,6 +129,6 @@ export function prepare(c: Config): Config {
     if (d === '/') break
   }
   const p = paths({ ...c, stateDir })
-  for (const d of [p.configDir, p.homeDir, p.runDir]) Deno.mkdirSync(d, { recursive: true })
+  for (const d of [p.configDir, p.homeDir, p.runDir]) Deno.mkdirSync(d, { recursive: true, mode: 0o700 })
   return { ...c, stateDir, workRoot }
 }

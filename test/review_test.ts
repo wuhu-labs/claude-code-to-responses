@@ -190,3 +190,26 @@ Deno.test('history with tool arguments that are not a JSON object is refused, ne
     assertEquals(run.fake.main().length, 0)
   })
 })
+
+Deno.test('state, records and logs are owner-only under umask 022', async () => {
+  const old = Deno.umask(0o022)
+  const run = new Run('perms', false)
+  try {
+    await run.run(async () => {
+      run.fake.reply({ blocks: [text('one')] })
+      const r = await run.turn('one')
+      const lane = [...run.tg.gw.lanes.values()][0]
+      await lane.kill('test')
+      const mode = (p: string) => Deno.statSync(p).mode! & 0o777
+      const state = Deno.realPathSync(run.d.stateDir)
+      for (
+        const d of [state, `${state}/responses`, `${state}/tails`, `${state}/claude/config`, `${state}/run`, Deno.realPathSync(run.d.workRoot), lane.workDir]
+      ) {
+        assertEquals(mode(d), 0o700, d)
+      }
+      assertEquals(mode(`${state}/responses/${r.response.id}.json`), 0o600)
+    })
+  } finally {
+    Deno.umask(old)
+  }
+})
