@@ -16,6 +16,7 @@ export const ERROR_CODES = [
   'missing_tool_output',
   'unexpected_tool_output',
   'tool_output_too_large',
+  'image_too_large',
   'conversation_busy',
   'not_found',
   'response_not_in_progress',

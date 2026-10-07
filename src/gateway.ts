@@ -11,13 +11,13 @@ import {
   type LogContext,
   toolResultEntry,
   unknownToolEntry,
+  userContentEntry,
   userMessageEntry,
-  userTextEntry,
 } from './claude/entries.ts'
 import { CLAUDE_CODE_VERSION, MCP_PREFIX, RESUME_LINE } from './claude/pins.ts'
 import { claudeVersion, processIdentity } from './claude/process.ts'
 import { type Config, ConfigError, paths } from './config.ts'
-import { GatewayError, invalid, previousResponseNotFound, unsupported } from './errors.ts'
+import { GatewayError, invalid, previousResponseNotFound } from './errors.ts'
 import { Active, type ChainSpec, type Head, Lane, MAX_RESULT_CHARS, outputChars } from './lane.ts'
 import { type CallRef, decodeRecord, decodeThinking, digestItems, type ProviderRecord, RecordError, sha256, THINKING_PREFIX } from './records.ts'
 import { ResponseStore } from './store.ts'
@@ -31,10 +31,16 @@ export interface GatewayEvent {
   data: Json
 }
 
+/** Hook text is null only when the notice needs the image-capable interrupted-turn resume. */
+interface Notice {
+  parts: Part[]
+  hookText: string | null
+}
+
 /** What a request asks of Claude Code after the point the log is at. */
 type Delivery =
   | { kind: 'turn'; parts: Part[] }
-  | { kind: 'outputs'; outputs: Map<string, Part[]>; notices: string | null }
+  | { kind: 'outputs'; outputs: Map<string, Part[]>; notices: Notice | null }
 
 export class Gateway {
   readonly store: ResponseStore
@@ -136,7 +142,7 @@ export class Gateway {
     this.note('request', { session: lane.sessionId, response: state.id, path: state.gateway.path })
     if (plan.spawn) lane.spawn(plan.spawn)
     if (plan.delivery?.kind === 'turn') void lane.startTurn(plan.delivery.parts)
-    else if (plan.delivery?.kind === 'outputs') lane.release(plan.delivery.outputs, plan.delivery.notices)
+    else if (plan.delivery?.kind === 'outputs') lane.release(plan.delivery.outputs, plan.delivery.notices?.hookText ?? null)
     return sink.stream
   }
 
@@ -182,11 +188,14 @@ export class Gateway {
     const delivery = deliveryFor(head, input)
     this.reserve(rec.session, reservation)
     let lane = this.lanes.get(rec.session)
-    if (lane && !lane.dead && lane.head?.responseId === prev) {
+    if (
+      lane && !lane.dead && lane.head?.responseId === prev &&
+      !(delivery.kind === 'outputs' && delivery.notices?.hookText === null)
+    ) {
       state.gateway = { path: 'live', session: rec.session }
       return { lane, delivery, prevId: prev, covered: input, spawn: null }
     }
-    if (lane) await lane.kill('superseded')
+    if (lane) await lane.kill(delivery.kind === 'outputs' && delivery.notices?.hookText === null ? 'image_notice' : 'superseded')
     await this.settled(rec.session)
     const records = this.store.chain(prev)
     if (!records) throw previousResponseNotFound(prev, 'its chain is incomplete in the store')
@@ -234,10 +243,10 @@ export class Gateway {
     return { resume: true, interruptedTurn: true, log, attempt }
   }
 
-  /** The tool results plus one user text: the notices that came with the outputs, else a fixed line. */
+  /** The tool results plus one user message: the notice text and images, else a fixed line. */
   private interruptedEntries(ctx: LogContext, log: string[], head: Head, d: Extract<Delivery, { kind: 'outputs' }>, tools: FnTool[] | null): string[] {
     const out = resultEntries(ctx, log, head.calls, d.outputs, tools)
-    out.push(JSON.stringify(userTextEntry(ctx, d.notices ?? RESUME_LINE)))
+    out.push(JSON.stringify(userContentEntry(ctx, d.notices?.parts ?? [{ type: 'text', text: RESUME_LINE }])))
     return out
   }
 
@@ -315,7 +324,7 @@ export class Gateway {
         } else {
           // completed calls: their outputs are history, whatever tools this request offers
           extra.push(...resultEntries(ctx, [...log, ...tailLines, ...extra], calls, d.outputs, null))
-          if (d.notices !== null) extra.push(JSON.stringify(userTextEntry(ctx, d.notices)))
+          if (d.notices !== null) extra.push(JSON.stringify(userContentEntry(ctx, d.notices.parts)))
         }
         const a = assistantEntries(ctx, g.outputs, chain.model)
         for (const e of a.entries) extra.push(JSON.stringify(e))
@@ -510,7 +519,7 @@ function deliveryFor(head: Head | null, input: InItem[], isNew = true): Delivery
     return { kind: 'turn', parts }
   }
   const outputs = new Map<string, Part[]>()
-  const notices: string[] = []
+  const notices: Part[][] = []
   const want = new Set(head.calls.map((c) => c.id))
   input.forEach((it, i) => {
     if (it.kind === 'function_call_output') {
@@ -525,17 +534,23 @@ function deliveryFor(head: Head | null, input: InItem[], isNew = true): Delivery
       }
       outputs.set(it.callId, it.parts)
     } else if (it.kind === 'message' && it.role === 'user') {
-      if (it.parts.some((p) => p.type !== 'text')) {
-        throw unsupported(`input[${i}].content`, 'Notices sent with tool outputs carry text only (they go in through a hook).')
-      }
-      // a blank notice (empty content, or only whitespace) carries nothing: it is treated as absent
-      const text = it.parts.map((p) => (p as { text: string }).text).join('\n')
-      if (text.trim() !== '') notices.push(text)
+      // A blank text-only notice is absent; an image-only notice still carries content.
+      if (it.parts.some((p) => p.type === 'image' || p.text.trim() !== '')) notices.push(it.parts)
     } else {
       throw invalid(`input[${i}]`, 'New input must be tool outputs and user messages here.')
     }
   })
   const missing = head.calls.filter((c) => !outputs.has(c.id)).map((c) => c.id)
   if (missing.length) throw invalid('input', `Missing outputs for tool calls: ${missing.join(', ')}.`, 'missing_tool_output')
-  return { kind: 'outputs', outputs, notices: notices.length ? notices.join('\n\n') : null }
+  let notice: Notice | null = null
+  if (notices.length) {
+    const parts = notices.flat()
+    if (parts.some((p) => p.type === 'image')) notice = { parts, hookText: null }
+    else {
+      // Preserve the existing text-only hook/resume bytes, including separators between messages.
+      const text = notices.map((ps) => ps.map((p) => (p as { text: string }).text).join('\n')).join('\n\n')
+      notice = { parts: [{ type: 'text', text }], hookText: text }
+    }
+  }
+  return { kind: 'outputs', outputs, notices: notice }
 }

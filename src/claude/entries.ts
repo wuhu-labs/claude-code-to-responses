@@ -92,10 +92,15 @@ export function hasToolResult(lines: string[], callId: string): boolean {
 
 /** A plain (non-meta) user text entry: what the interrupted-turn resume sends after the tool results. */
 export function userTextEntry(ctx: LogContext, text: string): Json {
+  return userContentEntry(ctx, [{ type: 'text', text }])
+}
+
+/** A notice entry on the interrupted-turn resume; image blocks stay images, never hook text. */
+export function userContentEntry(ctx: LogContext, parts: Part[]): Json {
   return base(ctx, {
     ...(ctx.promptId ? { promptId: ctx.promptId } : {}),
     type: 'user',
-    message: { role: 'user', content: [{ type: 'text', text }] },
+    message: { role: 'user', content: contentBlocks(parts) },
   })
 }
 

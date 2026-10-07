@@ -5,6 +5,9 @@ import { DEFAULT_EFFORT, EFFORTS, MAX_TOOL_NAME } from '../claude/pins.ts'
 // deno-lint-ignore no-explicit-any
 type Json = any
 
+/** Claude Code 2.1.284 validates each image's base64 length against this default API limit. */
+export const MAX_IMAGE_BASE64_CHARS = 5 * 1024 * 1024
+
 export type Part = { type: 'text'; text: string } | { type: 'image'; mediaType: string; data: string }
 
 export type InItem =
@@ -245,6 +248,14 @@ function parseContent(content: unknown, p: string, role: 'user' | 'assistant'): 
       const url = c.image_url
       const m = typeof url === 'string' ? /^data:(image\/(?:png|jpeg|gif|webp));base64,([A-Za-z0-9+/=]+)$/.exec(url) : null
       if (!m) throw unsupported(`${q}.image_url`, 'Only base64 data URLs of png, jpeg, gif or webp images are supported.')
+      if (m[2].length > MAX_IMAGE_BASE64_CHARS) {
+        throw invalid(`${q}.image_url`, `Image base64 exceeds ${MAX_IMAGE_BASE64_CHARS} characters; resize it before sending.`, 'image_too_large')
+      }
+      try {
+        atob(m[2])
+      } catch {
+        throw invalid(`${q}.image_url`, 'Image data must be valid base64.')
+      }
       return { type: 'image', mediaType: m[1], data: m[2] }
     }
     throw unsupported(`${q}.type`, `Content part type '${c.type}' is not supported here.`)

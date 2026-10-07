@@ -2,11 +2,12 @@
 // still does what README.md says. Most checks are paired: the pin on, then the pin off, so each one shows its effect.
 // Run against a new Claude Code release before adding it to the supported versions: `deno task probe`.
 import { assert, assertEquals, assertNotEquals, assertStringIncludes } from '@std/assert'
-import { assistantUuidFor, contextOf, toolResultEntry, userTextEntry } from '../src/claude/entries.ts'
+import { assistantUuidFor, contextOf, toolResultEntry, userContentEntry, userTextEntry } from '../src/claude/entries.ts'
 import { CLAUDE_CODE_VERSION, launchArgs } from '../src/claude/pins.ts'
 import { claudeVersion } from '../src/claude/process.ts'
 import { call, FakeAnthropic, type Json, text, think } from '../test/fake.ts'
-import { CLAUDE, freePort } from '../test/harness.ts'
+import { IMAGE_BLOCK, PNG } from '../test/images.ts'
+import { assertPrefix, CLAUDE, freePort } from '../test/harness.ts'
 import { Probe, ProbeTarget, without } from './launcher.ts'
 
 const AGENT_SDK_LINE = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
@@ -428,4 +429,49 @@ probe('MCP server timeout 2147483647: a call held 65 s still returns (the HTTP d
   const res = await r.until((f) => f.type === 'result', 20000)
   assertEquals(res.result, 'done')
   assertStringIncludes(fake.main().at(-1)!.raw, 'AFTER 65 S')
+})
+
+probe('2.1.284: images in an appended user log entry resume as real base64 image blocks immediately after tool results', async (p, fake) => {
+  const t = new ProbeTarget(['hold'])
+  fake.reply({ blocks: [call('toolu_img', 'hold', {})] })
+  const a = p.launch({ name: 'image-a', fake, target: t })
+  await a.user('hold for an image')
+  while (!t.held.has('toolu_img')) await new Promise((res) => setTimeout(res, 50))
+  await new Promise((res) => setTimeout(res, 300))
+  await a.kill()
+  const log = a.log()
+  const ctx = contextOf(log, a.spec.sessionId, a.spec.workDir)
+  const tail = [
+    toolResultEntry(ctx, 'toolu_img', [{ type: 'text', text: 'RESULT' }], assistantUuidFor(log, 'toolu_img')),
+    userContentEntry(ctx, [{ type: 'text', text: 'IMAGE NOTICE' }, { type: 'image', mediaType: 'image/png', data: PNG }]),
+  ].map((e) => JSON.stringify(e))
+  fake.reply({ blocks: [text('image received')] })
+  const b = p.launch({
+    name: 'image-b',
+    fake,
+    target: t,
+    workDir: a.spec.workDir,
+    sessionId: a.spec.sessionId,
+    resume: true,
+    interruptedTurn: true,
+    log: [...log, ...tail],
+  })
+  assertEquals((await b.until((f) => f.type === 'result', 20000)).subtype, 'success')
+  const [before, after] = fake.main()
+  assertPrefix(before, after)
+  const last = after.body.messages.at(-1)
+  assertEquals({ ...last, content: last.content.slice(0, 3) }, {
+    role: 'user',
+    content: [
+      { type: 'tool_result', tool_use_id: 'toolu_img', content: [{ type: 'text', text: 'RESULT' }] },
+      { type: 'text', text: 'IMAGE NOTICE' },
+      IMAGE_BLOCK,
+    ],
+  })
+  assert(!after.raw.includes('Continue from where you left off'))
+  assert(!after.raw.includes('unsupported content'))
+  assertEquals(last.content.length, 4)
+  assertStringIncludes(last.content[3].text, '/images/1.png]')
+  await b.kill()
+  assertEquals(b.log().slice(0, log.length + tail.length), [...log, ...tail], 'resume does not rewrite appended log entries')
 })

@@ -1,0 +1,117 @@
+// Image notices must evict even a live hold, then survive every record-based rebuild without losing image bytes.
+import { assert, assertEquals, assertExists } from '@std/assert'
+import { MAX_IMAGE_BASE64_CHARS } from '../src/api/request.ts'
+import { decodeRecord } from '../src/records.ts'
+import { call, type Json, text } from './fake.ts'
+import { assertOneUserId, assertPrefix, output, user } from './harness.ts'
+import { IMAGE, IMAGE_BLOCK } from './images.ts'
+import { Run } from './scenario.ts'
+
+for (const path of ['live', 'evicted', 'history'] as const) {
+  Deno.test(`an image notice resumes a ${path} hold with real images; idle eviction and lost-store rebuild repeat its bytes`, async () => {
+    const run = new Run(`image-notice-${path}`, false)
+    await run.run(async () => {
+      run.fake.reply({ blocks: [call('toolu_img1', 'echo', { text: 'slow' }), call('toolu_img2', 'read', { name: 'big' })] })
+      await run.send([user('two tools')])
+      await run.tg.waitEvent('hold', (d) => d.call === 'toolu_img1')
+      const before = run.fake.main()[0]
+      const oldPid = run.tg.events('spawn')[0].data.pid
+      if (path === 'evicted') await run.disrupt('hold')
+      if (path === 'history') await run.disrupt('restart-lost-store')
+      run.fake.reply({ blocks: [text('saw the images')] })
+      const notice = { role: 'user', content: [{ type: 'input_text', text: 'NOTICE before image' }, IMAGE, { type: 'input_text', text: 'after image' }] }
+      // Multiple message items (including image-only and blank ones) become one user log entry after all results.
+      const r = await run.send([output('toolu_img2', 'BIG'), notice, output('toolu_img1', 'ECHO'), user('   '), { role: 'user', content: [IMAGE] }])
+      assertEquals(r.status, 'completed', JSON.stringify(r.response.error))
+      assertEquals(r.response.x_gateway.resume, 'interrupted_turn')
+      if (path === 'live') {
+        assertEquals(r.response.x_gateway.path, 'store')
+        assertEquals(run.tg.events('kill').filter((e) => e.data.reason === 'image_notice').map((e) => e.data.pid), [oldPid])
+        assertEquals(run.tg.events('spawn').length, 2)
+      }
+      assertEquals(run.tg.events('notice').length, 0, 'no text hook delivery for an image notice')
+      const after = run.fake.main()[1]
+      assertPrefix(before, { ...after, body: { ...after.body, messages: after.body.messages.slice(0, before.body.messages.length) } })
+      const tail = after.body.messages.slice(before.body.messages.length)
+      assertEquals(tail.length, 2)
+      assertEquals(tail[0].role, 'assistant')
+      assertEquals(tail[0].content.map((b: Json) => b.id), ['toolu_img1', 'toolu_img2'])
+      assertEquals({ ...tail[1], content: tail[1].content.slice(0, 6) }, {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'toolu_img1', content: [{ type: 'text', text: 'ECHO' }] },
+          { type: 'tool_result', tool_use_id: 'toolu_img2', content: [{ type: 'text', text: 'BIG' }] },
+          { type: 'text', text: 'NOTICE before image' },
+          IMAGE_BLOCK,
+          { type: 'text', text: 'after image' },
+          IMAGE_BLOCK,
+        ],
+      })
+      assertEquals(tail[1].content.length, 8, 'Claude Code adds source labels after the real images')
+      for (const [i, block] of tail[1].content.slice(6).entries()) {
+        assertEquals(block.type, 'text')
+        assert(block.text.startsWith('[Image: source: '))
+        assert(block.text.endsWith(`/images/${i + 1}.png]`))
+      }
+      const rec = await decodeRecord(r.response.output.at(-1).encrypted_content)
+      assertExists(rec)
+      const noticeEntries = rec.entries.filter((e) => e.includes('NOTICE before image'))
+      assertEquals(noticeEntries.length, 1)
+      assertEquals(JSON.parse(noticeEntries[0]).message.content, tail[1].content.slice(2, 6))
+      await run.disrupt('idle')
+      run.fake.reply({ blocks: [text('after idle')] })
+      await run.turn('next')
+      await run.disrupt('restart-lost-store')
+      run.fake.reply({ blocks: [text('after history rebuild')] })
+      const rebuilt = await run.turn('last')
+      assertEquals(rebuilt.response.x_gateway.path, 'history')
+      assertEquals(rebuilt.response.x_gateway.synthesized_groups, 0)
+      const requests = run.fake.main()
+      assertPrefix(after, requests[2])
+      assertPrefix(requests[2], requests[3])
+      assertOneUserId(requests)
+      // The exact appended log line remains in the store after the lost-state recovery.
+      const chain = run.tg.gw.store.chain(rebuilt.response.id)!
+      assert(chain.flatMap((r) => r.entries).includes(noticeEntries[0]))
+    })
+  })
+}
+
+Deno.test('bad-format, malformed-base64 and oversized image notices are typed 400s before eviction or releasing outputs', async () => {
+  const run = new Run('image-errors', false)
+  await run.run(async () => {
+    run.fake.reply({ blocks: [call('toolu_badimg', 'echo', { text: 'x' })] })
+    await run.send([user('hold')])
+    await run.tg.waitEvent('hold')
+    const errors = [
+      ['data:image/bmp;base64,Qk0=', 'unsupported'],
+      ['data:image/svg+xml;base64,PHN2Zy8+', 'unsupported'],
+      ['https://example.com/image.png', 'unsupported'],
+      ['data:image/png;base64,====', 'invalid_request'],
+      [`data:image/png;base64,${'A'.repeat(MAX_IMAGE_BASE64_CHARS + 4)}`, 'image_too_large'],
+    ]
+    for (const [image_url, code] of errors) {
+      const response = await fetch(`${run.tg.url}/v1/responses`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          instructions: run.drv.opts.instructions,
+          tools: run.drv.opts.tools,
+          model: run.drv.opts.model,
+          previous_response_id: run.drv.prevId,
+          stream: true,
+          input: [output('toolu_badimg', 'RESULT'), { role: 'user', content: [{ type: 'input_image', image_url }] }],
+        }),
+      })
+      assertEquals(response.status, 400)
+      const body = await response.json()
+      assertEquals(body.error.type, 'invalid_request_error')
+      assertEquals(body.error.code, code)
+      assertEquals(body.error.param, 'input[1].content[0].image_url')
+      assertEquals(run.tg.events('kill').length, 0)
+      assertEquals(run.fake.main().length, 1)
+    }
+    run.fake.reply({ blocks: [text('good retry')] })
+    assertEquals((await run.send([output('toolu_badimg', 'RESULT'), { role: 'user', content: [IMAGE] }])).status, 'completed')
+  })
+})
