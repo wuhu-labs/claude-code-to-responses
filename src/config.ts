@@ -5,6 +5,8 @@ export interface Config {
   /** Address of the Responses API listener. */
   hostname: string
   port: number
+  /** Bearer token clients must send; required unless the listener is on loopback. Read from an environment variable. */
+  authToken?: string
   /** Loopback port of the MCP and hook endpoint Claude Code calls (0: any free port). */
   bridgePort: number
   /** Gateway state: the response store, Claude Code's config dir and scratch home. */
@@ -40,6 +42,10 @@ export function paths(c: Config): Paths {
 
 export class ConfigError extends Error {}
 
+export function isLoopback(host: string): boolean {
+  return host === 'localhost' || host === '::1' || host === '[::1]' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)
+}
+
 const USAGE = `claude-code-to-responses: an OpenAI Responses API (stateful, streaming) in front of Claude Code ${CLAUDE_CODE_VERSION}
 
 Usage: claude-code-to-responses [options]
@@ -48,6 +54,7 @@ Usage: claude-code-to-responses [options]
   --state-dir <dir>          response store, Claude Code config and scratch home (required)
   --work-root <dir>          parent of the per-chain working folders, outside any git repository (required)
   --claude <path>            Claude Code ${CLAUDE_CODE_VERSION} binary (required)
+  --auth-token-env <VAR>     clients must send 'Authorization: Bearer <$VAR>'; required off loopback
   --bridge-port <port>       loopback port for Claude Code's MCP and hook calls (default: any free port)
   --tz <zone>                TZ for every Claude Code process (default UTC)
   --idle-timeout <seconds>   kill a process idle at a finished turn after this long (default 1800)
@@ -68,7 +75,7 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
       flags.add(a)
       continue
     }
-    if (!['--listen', '--bridge-port', '--state-dir', '--work-root', '--claude', '--tz', '--idle-timeout', '--hold-timeout'].includes(a)) {
+    if (!['--listen', '--auth-token-env', '--bridge-port', '--state-dir', '--work-root', '--claude', '--tz', '--idle-timeout', '--hold-timeout'].includes(a)) {
       throw new ConfigError(`unknown option ${a}\n\n${USAGE}`)
     }
     const v = argv[++i]
@@ -90,6 +97,15 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
     if (!Number.isFinite(n) || n <= 0) throw new ConfigError(`${k} must be a positive number of seconds`)
     return n * 1000
   }
+  let authToken: string | undefined
+  const tokenVar = opts.get('--auth-token-env')
+  if (tokenVar !== undefined) {
+    authToken = env[tokenVar]
+    if (!authToken) throw new ConfigError(`--auth-token-env ${tokenVar}: the variable is not set or empty`)
+  }
+  if (!isLoopback(m[1]) && !authToken) {
+    throw new ConfigError(`--listen ${listen} is reachable beyond this machine: configure a token with --auth-token-env, or listen on loopback`)
+  }
   const backendEnv: Record<string, string> = {}
   for (const k of BACKEND_ENV) {
     const v = env[k]
@@ -98,6 +114,7 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
   return {
     hostname: m[1],
     port: Number(m[2]),
+    authToken,
     bridgePort: Number(opts.get('--bridge-port') ?? 0),
     stateDir: need('--state-dir'),
     workRoot: need('--work-root'),

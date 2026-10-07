@@ -39,6 +39,7 @@ export interface GatewayOpts {
   idleTimeoutMs?: number
   holdTimeoutMs?: number
   recordTimeoutMs?: number
+  authToken?: string
 }
 
 export class TestGateway {
@@ -58,10 +59,11 @@ export class TestGateway {
       backendEnv: o.backendEnv,
       verifyLogs: true,
       recordTimeoutMs: o.recordTimeoutMs,
+      authToken: o.authToken,
     })
     const gw = await Gateway.start(config)
     const server = Deno.serve({ hostname: config.hostname, port: config.port, onListen: () => {} }, handler(gw))
-    const client = new OpenAI({ baseURL: `http://127.0.0.1:${config.port}/v1`, apiKey: 'unused', maxRetries: 0 })
+    const client = new OpenAI({ baseURL: `http://127.0.0.1:${config.port}/v1`, apiKey: o.authToken ?? 'unused', maxRetries: 0 })
     return new TestGateway(gw, server, client)
   }
 

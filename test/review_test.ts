@@ -504,3 +504,30 @@ Deno.test('a gateway that died without cleaning up has its Claude Code processes
     await second.close()
   })
 })
+
+Deno.test('off loopback the gateway refuses to start without a token; with one, every request must carry it', async () => {
+  const { parseArgs, ConfigError } = await import('../src/config.ts')
+  const { CLAUDE, TestGateway } = await import('./harness.ts')
+  const base = ['--state-dir', '/tmp/x', '--work-root', '/tmp/y', '--claude', CLAUDE]
+  assertThrows(() => parseArgs(['--listen', '0.0.0.0:18399', ...base], {}), ConfigError, 'reachable beyond this machine')
+  assertThrows(() => parseArgs(['--listen', '0.0.0.0:18399', '--auth-token-env', 'GW_TOKEN', ...base], {}), ConfigError, 'not set')
+  assertEquals(parseArgs(['--listen', '0.0.0.0:18399', '--auth-token-env', 'GW_TOKEN', ...base], { GW_TOKEN: 's3cret' }).authToken, 's3cret')
+  assertEquals(parseArgs(['--listen', '127.0.0.1:18399', ...base], {}).authToken, undefined)
+  const run = new Run('auth', false)
+  run.tg = await TestGateway.start({ dirs: run.d, backendEnv: run.backend(), authToken: 's3cret' })
+  run.gateways.push(run.tg)
+  await run.run(async () => {
+    for (const auth of [undefined, 'Bearer wrong']) {
+      const res = await fetch(`${run.tg.url}/v1/responses`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...(auth ? { authorization: auth } : {}) },
+        body: '{}',
+      })
+      assertEquals([res.status, (await res.json()).error.code], [401, 'invalid_api_key'])
+    }
+    const { Driver } = await import('./harness.ts')
+    run.drv = new Driver(run.tg.client, { instructions: INSTRUCTIONS, tools: TOOLS, model: MODEL, mode: 'previous' })
+    run.fake.reply({ blocks: [text('authorized')] })
+    assertEquals(run.drv.text(await run.turn('hello')), 'authorized')
+  }, false)
+})
