@@ -246,11 +246,12 @@ function parseContent(content: unknown, p: string, role: 'user' | 'assistant'): 
     }
     if (c.type === 'input_image' && role === 'user') {
       const url = c.image_url
-      const m = typeof url === 'string' ? /^data:(image\/(?:png|jpeg|gif|webp));base64,([A-Za-z0-9+/=]+)$/.exec(url) : null
+      const m = typeof url === 'string' ? /^data:(image\/(?:png|jpeg|gif|webp));base64,([\s\S]*)$/.exec(url) : null
       if (!m) throw unsupported(`${q}.image_url`, 'Only base64 data URLs of png, jpeg, gif or webp images are supported.')
       if (m[2].length > MAX_IMAGE_BASE64_CHARS) {
         throw invalid(`${q}.image_url`, `Image base64 exceeds ${MAX_IMAGE_BASE64_CHARS} characters; resize it before sending.`, 'image_too_large')
       }
+      if (!/^[A-Za-z0-9+/]+={0,2}$/.test(m[2])) throw invalid(`${q}.image_url`, 'Image data must be valid nonempty base64.')
       try {
         atob(m[2])
       } catch {

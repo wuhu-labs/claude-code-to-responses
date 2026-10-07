@@ -88,6 +88,12 @@ Deno.test('bad-format, malformed-base64 and oversized image notices are typed 40
       ['data:image/svg+xml;base64,PHN2Zy8+', 'unsupported'],
       ['https://example.com/image.png', 'unsupported'],
       ['data:image/png;base64,====', 'invalid_request'],
+      ['data:image/png;base64,', 'invalid_request'],
+      ['data:image/jpeg;base64,not-base64!', 'invalid_request'],
+      ['data:image/gif;base64,AA A', 'invalid_request'],
+      ['data:image/webp;base64,AA\nAA', 'invalid_request'],
+      ['data:image/png;base64,A', 'invalid_request'],
+      ['data:image/png;base64,AAA===', 'invalid_request'],
       [`data:image/png;base64,${'A'.repeat(MAX_IMAGE_BASE64_CHARS + 4)}`, 'image_too_large'],
     ]
     for (const [image_url, code] of errors) {
