@@ -252,3 +252,37 @@ Deno.test('MCP calls with an unknown tool id are refused; duplicate ids share th
     assertEquals(results.map((b: Json) => b.tool_use_id), ['toolu_m1', 'toolu_m2'])
   })
 })
+
+Deno.test('a work root inside git is refused before anything is created or changed', async () => {
+  const { prepare, ConfigError } = await import('../src/config.ts')
+  const { CLAUDE, REPO } = await import('./harness.ts')
+  const tag = Date.now().toString(36)
+  const inGit = `${REPO}/.state/test/in-git-${tag}`
+  Deno.mkdirSync(inGit, { recursive: true })
+  Deno.chmodSync(inGit, 0o755)
+  const stateDir = `/tmp/cc2r-test/refused-state-${tag}`
+  for (const workRoot of [inGit, `${inGit}/not/yet/there`]) {
+    assertThrows(
+      () =>
+        prepare({
+          hostname: '127.0.0.1',
+          port: 1,
+          bridgePort: 0,
+          stateDir,
+          workRoot,
+          claudeBinary: CLAUDE,
+          tz: 'UTC',
+          idleTimeoutMs: 1,
+          holdTimeoutMs: 1,
+          backendEnv: {},
+          verifyLogs: false,
+        }),
+      ConfigError,
+      'inside the git repository',
+    )
+  }
+  assertEquals(Deno.statSync(inGit).mode! & 0o777, 0o755)
+  assertThrows(() => Deno.statSync(stateDir))
+  assertThrows(() => Deno.statSync(`${inGit}/not`))
+  Deno.removeSync(inGit, { recursive: true })
+})

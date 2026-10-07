@@ -109,7 +109,42 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
 }
 
 /** Resolves folders to real paths and checks the work root is outside git (a git folder changes Claude Code's prompt). */
+/** The real path a folder has or will have: its deepest existing ancestor resolved, the rest appended. */
+function realTarget(path: string): string {
+  const abs = path.startsWith('/') ? path : `${Deno.cwd()}/${path}`
+  const parts = abs.split('/').filter((x) => x && x !== '.')
+  const rest: string[] = []
+  while (true) {
+    const cur = '/' + parts.join('/')
+    try {
+      return [Deno.realPathSync(cur), ...rest].join('/').replace(/\/+/g, '/')
+    } catch (e) {
+      if (!(e instanceof Deno.errors.NotFound) || parts.length === 0) throw e
+      rest.unshift(parts.pop()!)
+    }
+  }
+}
+
+/** The repository a folder is in, if any: a folder that does not exist yet can only be in its ancestors' one. */
+function gitRootOf(path: string): string | null {
+  for (let d = path;; d = d.replace(/\/[^/]+$/, '') || '/') {
+    try {
+      Deno.statSync(`${d}/.git`)
+      return d
+    } catch { /* not here */ }
+    if (d === '/') return null
+  }
+}
+
+/** Checks every setting first, then creates the folders (owner-only) and resolves them to real paths. */
 export function prepare(c: Config): Config {
+  const target = realTarget(c.workRoot)
+  const repo = gitRootOf(target)
+  if (repo !== null) {
+    throw new ConfigError(
+      `--work-root ${target} is inside the git repository at ${repo}; Claude Code would announce it in every prompt. Use a folder outside git.`,
+    )
+  }
   // the state holds every conversation (records, logs) and the backend's credentials: owner-only, whatever the umask
   Deno.mkdirSync(c.stateDir, { recursive: true, mode: 0o700 })
   Deno.mkdirSync(c.workRoot, { recursive: true, mode: 0o700 })
@@ -117,17 +152,6 @@ export function prepare(c: Config): Config {
   const workRoot = Deno.realPathSync(c.workRoot)
   Deno.chmodSync(stateDir, 0o700)
   Deno.chmodSync(workRoot, 0o700)
-  for (let d = workRoot;; d = d.replace(/\/[^/]+$/, '') || '/') {
-    try {
-      Deno.statSync(`${d}/.git`)
-      throw new ConfigError(
-        `--work-root ${workRoot} is inside the git repository at ${d}; Claude Code would announce it in every prompt. Use a folder outside git.`,
-      )
-    } catch (e) {
-      if (e instanceof ConfigError) throw e
-    }
-    if (d === '/') break
-  }
   const p = paths({ ...c, stateDir })
   for (const d of [p.configDir, p.homeDir, p.runDir]) Deno.mkdirSync(d, { recursive: true, mode: 0o700 })
   return { ...c, stateDir, workRoot }
