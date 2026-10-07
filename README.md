@@ -28,7 +28,7 @@ deno run -A src/main.ts \
 | `--tz` | `UTC` | `TZ` of every Claude Code process. |
 | `--idle-timeout` | 1800 s | Kill a process that sits at a finished turn this long. |
 | `--hold-timeout` | 600 s | Kill a process whose held tool calls wait this long. |
-| (startup) | | Kills the Claude Code processes a crashed gateway left behind: each run folder records its process's pid, start time and executable, and only a process matching all three is killed. |
+| (startup) | | Takes the state dir's lock (`gateway.lock`, naming the holder by pid, start time and executable): a second gateway on the same state dir is refused with a startup error. Then kills the Claude Code processes a crashed gateway left behind: each run folder records its process's pid, executable and the time window of its spawn, written in the same synchronous step as the spawn, and only a process matching all three is killed. The one gap is a gateway killed between those two statements. |
 | `--verify-logs` | off | After each process exits, check its log starts with the stored records, byte for byte (the tests turn it on). |
 
 The backend comes from the gateway's own environment: `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`,

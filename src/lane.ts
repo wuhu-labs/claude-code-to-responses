@@ -4,7 +4,7 @@
 import type { FnTool, InItem, Part } from './api/request.ts'
 import { newId, type ResponseState, type SseSink, type UsageTotals } from './api/stream.ts'
 import { type Bridge, type BridgeTarget, McpCallError, StaleEpoch } from './bridge.ts'
-import { ClaudeProcess, type Frame, processIdentity } from './claude/process.ts'
+import { ClaudeProcess, type Frame } from './claude/process.ts'
 import { type LaunchSpec, logPath, MAX_RESULT_CHARS, MCP_PREFIX, mcpConfigJson, projectDir, settingsJson } from './claude/pins.ts'
 import { type Config, paths } from './config.ts'
 import { type ErrorCode, GatewayError, serverError } from './errors.ts'
@@ -210,13 +210,16 @@ export class Lane implements BridgeTarget {
     this.turnOpen = opts.interruptedTurn
     // the interrupted-turn resume starts the active response's turn by itself
     if (opts.interruptedTurn && this.active) this.active.ownsTurn = true
+    const spawnedFrom = Date.now()
     this.proc = new ClaudeProcess(spec, (f) => this.onFrame(f), (s) => this.onExit(epoch, s), (e) => this.onFrameError(e))
+    // the pid registry, written in the same synchronous step as the spawn: a gateway that dies without killing its
+    // processes finds them at its next start (pid, executable, and a start-time window; a pid alone is never trusted)
+    Deno.writeTextFileSync(
+      `${this.runDir}/proc.json`,
+      JSON.stringify({ pid: this.proc.pid, binary: this.config.claudeBinary, spawnedFrom, spawnedTo: Date.now() }),
+      { mode: 0o600 },
+    )
     this.events.note('spawn', { session: this.sessionId, pid: this.proc.pid, epoch, resume: opts.resume, interruptedTurn: opts.interruptedTurn })
-    // the pid registry: a gateway that dies without killing its processes finds them at its next start
-    const pid = this.proc.pid, runDir = this.runDir
-    void processIdentity(pid).then((id) => {
-      if (id) Deno.writeTextFileSync(`${runDir}/proc.json`, JSON.stringify({ pid, ...id, binary: this.config.claudeBinary }), { mode: 0o600 })
-    }).catch(() => {/* the process (and its run folder) may already be gone */})
   }
 
   /** A bug in handling Claude Code's output: the response fails visibly and the process goes. */

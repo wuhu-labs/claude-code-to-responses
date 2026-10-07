@@ -16,7 +16,7 @@ import {
 } from './claude/entries.ts'
 import { CLAUDE_CODE_VERSION, MCP_PREFIX, RESUME_LINE } from './claude/pins.ts'
 import { claudeVersion, processIdentity } from './claude/process.ts'
-import { type Config, paths } from './config.ts'
+import { type Config, ConfigError, paths } from './config.ts'
 import { GatewayError, invalid, previousResponseNotFound, unsupported } from './errors.ts'
 import { Active, type ChainSpec, type Head, Lane, MAX_RESULT_CHARS, outputChars } from './lane.ts'
 import { type CallRef, decodeRecord, decodeThinking, digestItems, type ProviderRecord, RecordError, sha256, THINKING_PREFIX } from './records.ts'
@@ -61,7 +61,8 @@ export class Gateway {
         `Claude Code ${version} at ${config.claudeBinary} is not the measured version ${CLAUDE_CODE_VERSION}; run the probe against it before supporting it.`,
       )
     }
-    await sweepOrphans(p.runDir, (kind, data) => console.error(`${kind} ${JSON.stringify(data)}`))
+    await takeLock(config.stateDir)
+    await sweepOrphans(p.runDir, config.claudeBinary, (kind, data) => console.error(`${kind} ${JSON.stringify(data)}`))
     return new Gateway(config)
   }
 
@@ -77,6 +78,7 @@ export class Gateway {
     this.closed = true
     await Promise.all([...this.processes].map((l) => l.kill('gateway_shutdown')))
     await this.bridge.close()
+    releaseLock(this.config.stateDir)
   }
 
   private laneEvents = {
@@ -374,13 +376,16 @@ function resultEntries(ctx: LogContext, log: string[], calls: CallRef[], outputs
  * Kills the Claude Code processes a gateway that died without cleaning up left behind: every run folder still holding
  * a proc.json whose pid has the same start time and executable as recorded. A pid alone is never trusted.
  */
-export async function sweepOrphans(runDir: string, note: (kind: string, data: Json) => void): Promise<void> {
+export async function sweepOrphans(runDir: string, binary: string, note: (kind: string, data: Json) => void): Promise<void> {
   for (const d of Deno.readDirSync(runDir)) {
     const dir = `${runDir}/${d.name}`
     try {
       const rec = JSON.parse(Deno.readTextFileSync(`${dir}/proc.json`))
       const now = await processIdentity(rec.pid)
-      if (now && now.started === rec.started && now.comm === rec.comm) {
+      // the same executable, started within the window the gateway recorded around its spawn (ps reports whole seconds)
+      const started = now ? Date.parse(now.started) : NaN
+      const inWindow = started >= Math.floor(rec.spawnedFrom / 1000) * 1000 - 1000 && started <= rec.spawnedTo + 1000
+      if (now && now.comm === binary && rec.binary === binary && inWindow) {
         try {
           Deno.kill(rec.pid, 'SIGKILL')
           note('orphan_killed', { pid: rec.pid, epoch: d.name })
@@ -389,6 +394,40 @@ export async function sweepOrphans(runDir: string, note: (kind: string, data: Js
     } catch { /* no registry entry: nothing ran there */ }
     Deno.removeSync(dir, { recursive: true })
   }
+}
+
+/**
+ * One gateway per state dir: a second one would sweep the first one's live processes. The lock file names the holder
+ * by pid, start time and executable; a holder that is gone (or a reused pid) does not count.
+ */
+async function takeLock(stateDir: string): Promise<void> {
+  const path = `${stateDir}/gateway.lock`
+  try {
+    const held = JSON.parse(Deno.readTextFileSync(path))
+    const now = await processIdentity(held.pid)
+    if (now && now.started === held.started && now.comm === held.comm) {
+      throw new ConfigError(`another gateway (pid ${held.pid}) is using the state dir ${stateDir}; stop it first`)
+    }
+    Deno.removeSync(path) // a stale lock: its holder is gone
+  } catch (e) {
+    if (e instanceof ConfigError) throw e
+    if (!(e instanceof Deno.errors.NotFound) && !(e instanceof SyntaxError)) throw e
+  }
+  const me = await processIdentity(Deno.pid)
+  if (!me) throw new ConfigError("cannot read this process's own start time to lock the state dir")
+  try {
+    Deno.writeTextFileSync(path, JSON.stringify({ pid: Deno.pid, ...me }), { createNew: true, mode: 0o600 })
+  } catch (e) {
+    if (e instanceof Deno.errors.AlreadyExists) throw new ConfigError(`another gateway took the state dir ${stateDir} at the same moment`)
+    throw e
+  }
+}
+
+function releaseLock(stateDir: string): void {
+  try {
+    const held = JSON.parse(Deno.readTextFileSync(`${stateDir}/gateway.lock`))
+    if (held.pid === Deno.pid) Deno.removeSync(`${stateDir}/gateway.lock`)
+  } catch { /* none */ }
 }
 
 interface Reservation {
