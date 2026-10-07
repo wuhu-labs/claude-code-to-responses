@@ -97,8 +97,9 @@ same response. With no held calls, new `message` items go in through stdin as on
 
 **Undefined tools.** A model call of a tool the request doesn't define is answered by Claude Code itself, with its
 `<tool_use_error>Error: No such tool available: …` result. The client still receives the `function_call` and must
-send an output; the model never sees that output. A rebuild after an eviction writes Claude Code's exact entry, so
-the model sees the same thing on every path.
+send an output; the model never sees that output. A rebuild after an eviction during such a hold keeps Claude Code's
+own entry, so the model sees the same thing on every path. Completed calls in a history keep the client's outputs,
+whatever tools the request offers.
 
 **Provider records.** A response's record is every line Claude Code wrote to its session log since the previous
 response, read verbatim from the log file, so `log(response) = log(previous) + record`. `--session-mirror` tells the
