@@ -622,3 +622,20 @@ Deno.test('input with nothing new in it is refused, not sent as an empty turn', 
     assertEquals(run.fake.main().length, 1)
   })
 })
+
+Deno.test('a lane killed while its response commits fails the response and stores nothing: client and store agree', async () => {
+  const run = new Run('commit-race', false)
+  await run.run(async () => {
+    run.fake.reply({ blocks: [text('one')] }, { blocks: [text('two')] }, { blocks: [text('two again')] })
+    const r1 = await run.turn('one')
+    const lane = [...run.tg.gw.lanes.values()][0]
+    lane.beforeCommit = () => lane.kill('test')
+    const r = await run.send([user('two')])
+    assertEquals(r.status, 'failed')
+    assertEquals(run.tg.gw.store.get(r.response.id), null)
+    // the conversation goes on from the last response both sides know
+    const r2 = await run.send([user('two')])
+    assertEquals([r2.status, r2.response.previous_response_id], ['completed', r1.response.id])
+    assertEquals(run.tg.events('verify_error').length, 0)
+  })
+})

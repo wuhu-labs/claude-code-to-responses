@@ -717,12 +717,7 @@ export class Lane implements BridgeTarget {
       if (cut > 0) {
         clearTimeout(a.mirrorTimer)
         a.finished = true
-        const entries = this.pending.slice(0, cut)
-        this.pending = this.pending.slice(cut)
-        const taken = new Set(entries)
-        this.mirroredLines = this.mirroredLines.filter((l) => !taken.has(l))
-        this.mirrored.clear()
-        return this.complete(a, calls ? 'calls' : 'turn', callRefs, entries, stopReason)
+        return this.complete(a, calls ? 'calls' : 'turn', callRefs, cut, stopReason)
       }
       if (Date.now() > deadline) {
         a.finishing = false
@@ -732,7 +727,16 @@ export class Lane implements BridgeTarget {
     }
   }
 
-  private async complete(a: Active, end: 'turn' | 'calls', calls: CallRef[], entries: string[], stopReason: string): Promise<void> {
+  /** Awaited before a response commits (tests use it to kill a lane in that window). */
+  beforeCommit: (() => Promise<void>) | null = null
+
+  /**
+   * Prepares the record (asynchronously), then commits in one synchronous step: the record goes to the store, the head
+   * moves and the client is told it completed. A lane killed before that step fails the response and stores nothing,
+   * so the client and the store never disagree.
+   */
+  private async complete(a: Active, end: 'turn' | 'calls', calls: CallRef[], cut: number, stopReason: string): Promise<void> {
+    const entries = this.pending.slice(0, cut)
     const record: ProviderRecord = {
       v: 1,
       id: a.state.id,
@@ -744,11 +748,18 @@ export class Lane implements BridgeTarget {
       digest: await digestItems([...a.covered, ...a.outputs]),
       entries,
     }
+    const item = { type: 'reasoning', id: newId('rs'), summary: [], encrypted_content: await encodeRecord(record) }
+    await this.beforeCommit?.()
+    if (this.dead || a.state.status !== 'in_progress') return // failed meanwhile: the store never hears of it
+    // ---- commit: synchronous from here on
+    this.pending = this.pending.slice(cut)
+    const taken = new Set(entries)
+    this.mirroredLines = this.mirroredLines.filter((l) => !taken.has(l))
+    this.mirrored.clear()
     this.store.put(record)
     this.head = { responseId: a.state.id, end, calls }
     this.pendingAtAttach = null
     if (this.active === a) this.active = null
-    const item = { type: 'reasoning', id: newId('rs'), summary: [], encrypted_content: await encodeRecord(record) }
     const outputIndex = a.state.output.length
     a.state.output.push(item)
     a.sink.send('response.output_item.added', { output_index: outputIndex, item })
