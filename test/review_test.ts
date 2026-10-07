@@ -204,7 +204,17 @@ Deno.test('state, records and logs are owner-only under umask 022', async () => 
       const mode = (p: string) => Deno.statSync(p).mode! & 0o777
       const state = Deno.realPathSync(run.d.stateDir)
       for (
-        const d of [state, `${state}/responses`, `${state}/tails`, `${state}/claude/config`, `${state}/run`, Deno.realPathSync(run.d.workRoot), lane.workDir]
+        const d of [
+          state,
+          `${state}/responses`,
+          `${state}/tails`,
+          `${state}/claude/config`,
+          `${state}/run`,
+          `${state}/sessions`,
+          lane.configDir,
+          Deno.realPathSync(run.d.workRoot),
+          lane.workDir,
+        ]
       ) {
         assertEquals(mode(d), 0o700, d)
       }

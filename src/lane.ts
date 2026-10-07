@@ -6,7 +6,7 @@ import { newId, type ResponseState, type SseSink, type UsageTotals } from './api
 import { type Bridge, type BridgeTarget, McpCallError, StaleEpoch } from './bridge.ts'
 import { ClaudeProcess, type Frame } from './claude/process.ts'
 import { type LaunchSpec, logPath, MAX_RESULT_CHARS, MCP_PREFIX, mcpConfigJson, projectDir, settingsJson } from './claude/pins.ts'
-import { type Config, paths } from './config.ts'
+import { chainConfigDir, type Config, paths } from './config.ts'
 import { type ErrorCode, GatewayError, serverError } from './errors.ts'
 import { type CallRef, digestItems, encodeRecord, encodeThinking, type ProviderRecord } from './records.ts'
 import type { ResponseStore } from './store.ts'
@@ -123,7 +123,11 @@ export class Lane implements BridgeTarget {
   }
 
   get logFile(): string {
-    return logPath(paths(this.config).configDir, this.workDir, this.sessionId)
+    return logPath(this.configDir, this.workDir, this.sessionId)
+  }
+
+  get configDir(): string {
+    return chainConfigDir(this.config, this.sessionId)
   }
 
   /** Reads the complete lines Claude Code appended to the log since the last read into `pending`. */
@@ -166,8 +170,9 @@ export class Lane implements BridgeTarget {
   spawn(opts: { resume: boolean; interruptedTurn: boolean; log?: string[]; attempt?: string[] }): void {
     const p = paths(this.config)
     Deno.mkdirSync(this.workDir, { recursive: true, mode: 0o700 })
+    Deno.mkdirSync(this.configDir, { recursive: true, mode: 0o700 })
     if (opts.resume) {
-      const dir = projectDir(p.configDir, this.workDir)
+      const dir = projectDir(this.configDir, this.workDir)
       Deno.mkdirSync(dir, { recursive: true, mode: 0o700 })
       try {
         Deno.removeSync(`${dir}/${this.sessionId}`, { recursive: true })
@@ -197,7 +202,7 @@ export class Lane implements BridgeTarget {
       effort: this.chain.effort,
       systemPromptPath,
       workDir: this.workDir,
-      configDir: p.configDir,
+      configDir: this.configDir,
       homeDir: p.homeDir,
       tz: this.config.tz,
       settingsPath,

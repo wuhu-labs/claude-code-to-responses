@@ -169,3 +169,22 @@ Deno.test('idle timeout kills the process and the next request rebuilds it', asy
     assertStringIncludes(JSON.stringify(y.body.messages.at(-1)), 'two')
   })
 })
+
+Deno.test('each chain has its own Claude Code config folder, which holds its session log', async () => {
+  const run = new Run('chain-config', false)
+  await run.run(async () => {
+    run.fake.reply({ blocks: [text('a')] }, { blocks: [text('b')] })
+    await run.turn('chain one')
+    const { send } = await import('./harness.ts')
+    const { INSTRUCTIONS, MODEL, TOOLS } = await import('./scenario.ts')
+    await send(run.tg.client, { model: MODEL, instructions: INSTRUCTIONS, tools: TOOLS, input: 'chain two' })
+    const lanes = [...run.tg.gw.lanes.values()]
+    assertEquals(lanes.length, 2)
+    const state = Deno.realPathSync(run.d.stateDir)
+    for (const lane of [...lanes]) {
+      assertEquals(lane.configDir, `${state}/sessions/${lane.sessionId}/config`)
+      assert(lane.logFile.startsWith(`${lane.configDir}/projects/`))
+      assert(Deno.statSync(lane.logFile).isFile)
+    }
+  })
+})
