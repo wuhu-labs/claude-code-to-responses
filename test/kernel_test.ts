@@ -124,6 +124,25 @@ Deno.test('kernel WebSocket delta inherits durable instructions, enforces cap/ch
   })
 })
 
+Deno.test('legacy record without saved instructions inherits its live lane prompt on a kernel delta', async () => {
+  const run = new Run('kernel-legacy-live', false, { transport: 'websocket' })
+  await run.run(async () => {
+    const body = base(), ws = run.tg.websocket()
+    run.fake.reply({ blocks: [text('one')] })
+    const first = await ws.send(body)
+    const record = run.tg.gw.store.get(first.response.id)!
+    delete record.instructions
+    run.tg.gw.store.put(record)
+    run.fake.reply({ blocks: [text('two')] })
+    const second = await ws.send({ ...body, previous_response_id: first.response.id, input: [user('next')] })
+    assertEquals([second.status, second.response.instructions, second.response.x_gateway.path], ['completed', 'You are helpful.', 'live'])
+    assertEquals(second.response.x_gateway.session, first.response.x_gateway.session)
+    assertEquals(run.tg.events('spawn').length, 1)
+    assertPrefix(run.fake.main()[0], run.fake.main()[1])
+    assertEquals(run.tg.gw.store.get(second.response.id)!.instructions, 'You are helpful.')
+  })
+})
+
 Deno.test('legacy provider records work with explicit instructions; omitted instructions fail typed after restart', async () => {
   const run = new Run('kernel-legacy', false, { transport: 'websocket' })
   await run.run(async () => {
