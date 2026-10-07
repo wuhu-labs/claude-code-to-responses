@@ -206,6 +206,7 @@ InferenceKit’s executor/catalog. The `responses` dialect is not the `codex` di
 | `stream: true` | HTTP/SSE only; kernel removes it on WebSocket (sending it there is unsupported). |
 | `store: false` | Accepted; records still retained; response reports actual `store: true`. |
 | Leading `{role:"system",content:"…"}` | Full create’s chain instructions, removed from history. Leading developer/text-part variants obey the literal-concatenation rule above. |
+| Nil or empty session prompt | The builder omits the system message. The kernel must carry a nonempty session prompt for a full create; otherwise the gateway returns `400 invalid_request`, `param: instructions`. No default prompt is invented. |
 | `previous_response_id` | Warm delta names the store/chain; unknown id is a typed miss. |
 | `input` on a warm delta | Only new items after the acknowledged baseline; no system message or top-level instructions. Tool-output ids are translated back to the provider’s ids by the kernel. |
 | `max_output_tokens` | Always set by the kernel executor, forwarded as the fixed process cap above. |

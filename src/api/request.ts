@@ -228,7 +228,7 @@ function parseInstructionsAndInput(body: Json, previous: string | null): { instr
   else if (Array.isArray(input)) items = input.slice(first).map((it, i) => parseItem(it, `input[${i + first}]`))
   else throw invalid('input', "'input' must be a string or an array of items.")
   if (previous === null && !instructions) {
-    throw invalid('instructions', 'A full create requires nonempty top-level instructions or leading system/developer text.')
+    throw invalid('instructions', 'The kernel must carry a nonempty session prompt in top-level instructions or leading system/developer text.')
   }
   return { instructions, input: items }
 }

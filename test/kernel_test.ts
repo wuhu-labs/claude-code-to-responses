@@ -41,6 +41,15 @@ Deno.test('kernel full create and warm delta normalize without putting instructi
   assertEquals(parseRequest({ ...b, tool_choice: { type: 'function', name: 'echo' } }, 'websocket').tools.length, 2)
 })
 
+Deno.test('prompt-less kernel full creates require a nonempty session prompt with an explicit typed error', () => {
+  const body = base()
+  for (const input of [[user('Hello')], [{ role: 'system', content: '' }, user('Hello')]]) {
+    const e = assertThrows(() => parseRequest({ ...body, input }, 'websocket'), GatewayError)
+    assertEquals([e.status, e.code, e.param], [400, 'invalid_request', 'instructions'])
+    assertEquals(e.message, 'The kernel must carry a nonempty session prompt in top-level instructions or leading system/developer text.')
+  }
+})
+
 Deno.test('instruction joining is literal concatenation of leading parts/messages, never trimmed or separated', () => {
   const b = base()
   b.input = [
