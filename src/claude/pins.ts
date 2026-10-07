@@ -30,7 +30,8 @@ export interface LaunchSpec {
   resume: boolean
   model: string
   effort: string
-  instructions: string
+  /** File holding the system prompt (the request's instructions): on argv every local user could read it. */
+  systemPromptPath: string
   workDir: string
   configDir: string
   homeDir: string
@@ -68,8 +69,8 @@ export function launchArgs(s: LaunchSpec): string[] {
     '--strict-mcp-config',
     '--mcp-config',
     s.mcpConfigPath,
-    '--system-prompt',
-    s.instructions,
+    '--system-prompt-file',
+    s.systemPromptPath,
     s.resume ? '--resume' : '--session-id',
     s.sessionId,
   ]

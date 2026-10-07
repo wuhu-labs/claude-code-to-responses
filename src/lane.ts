@@ -185,6 +185,8 @@ export class Lane implements BridgeTarget {
     Deno.mkdirSync(this.runDir, { recursive: true, mode: 0o700 })
     const settingsPath = `${this.runDir}/settings.json`
     const mcpConfigPath = `${this.runDir}/mcp.json`
+    const systemPromptPath = `${this.runDir}/system-prompt.txt`
+    Deno.writeTextFileSync(systemPromptPath, this.chain.instructions, { mode: 0o600 })
     Deno.writeTextFileSync(settingsPath, JSON.stringify(settingsJson(this.bridge.hookUrl(this.epoch), this.bridge.bearer)), { mode: 0o600 })
     Deno.writeTextFileSync(mcpConfigPath, JSON.stringify(mcpConfigJson(this.bridge.mcpUrl(this.epoch), this.bridge.bearer)), { mode: 0o600 })
     const spec: LaunchSpec = {
@@ -193,7 +195,7 @@ export class Lane implements BridgeTarget {
       resume: opts.resume,
       model: this.chain.model,
       effort: this.chain.effort,
-      instructions: this.chain.instructions,
+      systemPromptPath,
       workDir: this.workDir,
       configDir: p.configDir,
       homeDir: p.homeDir,

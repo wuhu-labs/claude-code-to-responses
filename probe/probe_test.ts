@@ -3,7 +3,7 @@
 // Run against a new Claude Code release before adding it to the supported versions: `deno task probe`.
 import { assert, assertEquals, assertNotEquals, assertStringIncludes } from '@std/assert'
 import { assistantUuidFor, contextOf, toolResultEntry, userTextEntry } from '../src/claude/entries.ts'
-import { CLAUDE_CODE_VERSION } from '../src/claude/pins.ts'
+import { CLAUDE_CODE_VERSION, launchArgs } from '../src/claude/pins.ts'
 import { claudeVersion } from '../src/claude/process.ts'
 import { call, FakeAnthropic, type Json, text, think } from '../test/fake.ts'
 import { CLAUDE, freePort } from '../test/harness.ts'
@@ -71,6 +71,25 @@ probe(
     assertEquals(second.body.messages.at(-1).content[0].text, 'PostToolUse:mcp__fn__echo hook additional context: NOTICE-POST')
   },
 )
+
+probe('--system-prompt-file: the prompt reaches the model byte for byte, as --system-prompt would send it, and stays off argv', async (p, fake) => {
+  const prompt = '  Leading spaces\nunicode ünï — "quotes"\n\n'
+  fake.reply({ blocks: [text('a')] }, { blocks: [text('b')] })
+  const viaFile = p.launch({ name: 'sp-file', fake, target: new ProbeTarget(), systemPrompt: prompt })
+  await viaFile.turn('x')
+  assert(!launchArgs(viaFile.spec).includes(prompt))
+  const file = `${p.root}/sp-arg.system-prompt.txt`
+  await p.launch({
+    name: 'sp-arg',
+    fake,
+    target: new ProbeTarget(),
+    systemPrompt: prompt,
+    args: (a) => a.map((x, i) => (x === '--system-prompt-file' ? '--system-prompt' : a[i - 1] === '--system-prompt-file' ? Deno.readTextFileSync(file) : x)),
+  }).turn('x')
+  const [f, g] = fake.main()
+  assertEquals(f.body.system[2].text, prompt)
+  assertEquals(JSON.stringify(f.body.system), JSON.stringify(g.body.system))
+})
 
 probe('Stop hook additionalContext continues inference in the same turn', async (p, fake) => {
   const t = new ProbeTarget(['echo'])

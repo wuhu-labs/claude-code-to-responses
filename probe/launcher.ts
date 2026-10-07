@@ -72,6 +72,7 @@ export interface ProbeOpts {
   workDir?: string
   /** A log to write before resuming. */
   log?: string[]
+  systemPrompt?: string
 }
 
 export class ProbeRun {
@@ -93,13 +94,14 @@ export class ProbeRun {
     const settingsPath = `${root}/${o.name}.settings.json`, mcpConfigPath = `${root}/${o.name}.mcp.json`
     Deno.writeTextFileSync(settingsPath, JSON.stringify(settingsJson(bridge.hookUrl(epoch), bridge.bearer)))
     Deno.writeTextFileSync(mcpConfigPath, JSON.stringify(mcpConfigJson(bridge.mcpUrl(epoch), bridge.bearer)))
+    Deno.writeTextFileSync(`${root}/${o.name}.system-prompt.txt`, o.systemPrompt ?? 'You are a probe.')
     this.spec = {
       binary: CLAUDE,
       sessionId: o.sessionId ?? crypto.randomUUID(),
       resume: o.resume ?? false,
       model: 'claude-opus-5-5',
       effort: 'high',
-      instructions: 'You are a probe.',
+      systemPromptPath: `${root}/${o.name}.system-prompt.txt`,
       workDir: Deno.realPathSync(workDir),
       configDir,
       homeDir,
