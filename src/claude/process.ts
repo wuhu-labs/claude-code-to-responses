@@ -108,8 +108,12 @@ export async function processIdentity(pid: number): Promise<{ started: string; c
   // Linux ps comm is a truncated process name, not the executable path used to fence orphan cleanup.
   const executable = async () => {
     try {
-      const path = Deno.build.os === 'linux' ? await Deno.readLink(`/proc/${pid}/exe`) : await run('comm')
-      return executableIdentity(path)
+      if (Deno.build.os !== 'linux') return executableIdentity(await run('comm'))
+      const exe = `/proc/${pid}/exe`
+      const path = await Deno.readLink(exe) // the kernel already resolved the executable's symlinks at launch
+      // An atomic version replacement unlinks the old inode, which /proc can still inspect. The suffix is not
+      // part of its launch path. nlink distinguishes it from an executable literally named "… (deleted)".
+      return path.endsWith(' (deleted)') && (await Deno.stat(exe)).nlink === 0 ? path.slice(0, -10) : path
     } catch {
       return ''
     }

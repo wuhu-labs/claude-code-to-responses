@@ -396,24 +396,59 @@ function resultEntries(ctx: LogContext, log: string[], calls: CallRef[], outputs
 /**
  * Kills the Claude Code processes a gateway that died without cleaning up left behind: every run folder still holding
  * a proc.json whose pid has the same start time and executable as recorded. A pid alone is never trusted.
+ * An unmatched registry emits orphan_unmatched with a reason and is retained for diagnosis and later sweeps.
  */
 export async function sweepOrphans(runDir: string, binary: string, note: (kind: string, data: Json) => void): Promise<void> {
   binary = executableIdentity(binary)
   for (const d of Deno.readDirSync(runDir)) {
     const dir = `${runDir}/${d.name}`
+    let rec: Json
+    const unmatched = (reason: string) => note('orphan_unmatched', { epoch: d.name, ...(Number.isInteger(rec?.pid) ? { pid: rec.pid } : {}), reason })
     try {
-      const rec = JSON.parse(Deno.readTextFileSync(`${dir}/proc.json`))
-      const now = await processIdentity(rec.pid)
-      // the same executable, started within the window the gateway recorded around its spawn (ps reports whole seconds)
-      const started = now ? Date.parse(now.started) : NaN
-      const inWindow = started >= Math.floor(rec.spawnedFrom / 1000) * 1000 - 1000 && started <= rec.spawnedTo + 1000
-      if (now && now.comm === binary && executableIdentity(rec.binary) === binary && inWindow) {
-        try {
-          Deno.kill(rec.pid, 'SIGKILL')
-          note('orphan_killed', { pid: rec.pid, epoch: d.name })
-        } catch { /* gone meanwhile */ }
-      }
-    } catch { /* no registry entry: nothing ran there */ }
+      rec = JSON.parse(Deno.readTextFileSync(`${dir}/proc.json`))
+    } catch {
+      unmatched('registry_unavailable')
+      continue
+    }
+    if (!rec || typeof rec !== 'object' || !Number.isInteger(rec.pid) || rec.pid <= 0 || typeof rec.binary !== 'string') {
+      unmatched('registry_invalid')
+      continue
+    }
+    let now
+    try {
+      now = await processIdentity(rec.pid)
+    } catch {
+      unmatched('process_unavailable')
+      continue
+    }
+    if (!now) {
+      unmatched('process_unavailable')
+      continue
+    }
+    let recordedBinary: string
+    try {
+      recordedBinary = executableIdentity(rec.binary)
+    } catch {
+      unmatched('executable_unavailable')
+      continue
+    }
+    if (now.comm !== binary || recordedBinary !== binary) {
+      unmatched('executable_mismatch')
+      continue
+    }
+    // Same executable and start-time window: a reused pid alone is never trusted.
+    const started = Date.parse(now.started)
+    if (!(started >= Math.floor(rec.spawnedFrom / 1000) * 1000 - 1000 && started <= rec.spawnedTo + 1000)) {
+      unmatched('start_time_mismatch')
+      continue
+    }
+    try {
+      Deno.kill(rec.pid, 'SIGKILL')
+    } catch {
+      unmatched('kill_failed')
+      continue
+    }
+    note('orphan_killed', { pid: rec.pid, epoch: d.name })
     Deno.removeSync(dir, { recursive: true })
   }
 }

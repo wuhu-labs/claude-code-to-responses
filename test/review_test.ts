@@ -522,9 +522,13 @@ for (const alias of [false, true]) {
       for (let i = 0; i < 100 && alive(pid); i++) await new Promise((r) => setTimeout(r, 20)) // until it is reaped
       assert(!alive(pid), 'the orphan was killed')
       assert(alive(bystander.pid), 'the bystander survived')
+      const { sweepOrphans } = await import('../src/gateway.ts')
+      const unmatched: Json[] = []
+      await sweepOrphans(runDir, binary, (kind, data) => unmatched.push({ kind, ...data }))
+      assertEquals(unmatched, [{ kind: 'orphan_unmatched', epoch: 'ep_bystander', pid: bystander.pid, reason: 'executable_mismatch' }])
+      assertEquals([...Deno.readDirSync(runDir)].map((d) => d.name), ['ep_bystander'], 'an unmatched registry is retained for diagnosis/retry')
       bystander.kill('SIGKILL')
       await bystander.status
-      assertEquals([...Deno.readDirSync(runDir)].map((d) => d.name), [])
       await second.close()
     })
   })
@@ -728,4 +732,39 @@ Deno.test('the backend: CLAUDE_CODE_OAUTH_TOKEN, or the test-only ANTHROPIC_BASE
       [{ ANTHROPIC_BASE_URL: 'http://x' }, 'needs ANTHROPIC_API_KEY'],
     ] as const
   ) assertThrows(() => parseArgs(base, env), ConfigError, why)
+})
+
+Deno.test({
+  name: 'Linux orphan cleanup recognizes the deleted inode of an atomically replaced Claude executable',
+  ignore: Deno.build.os !== 'linux',
+  fn: async () => {
+    const { alive, CLAUDE, TestGateway } = await import('./harness.ts')
+    const { processIdentity } = await import('../src/claude/process.ts')
+    const run = new Run('orphan-replaced', false)
+    Deno.mkdirSync(run.d.stateDir, { recursive: true })
+    const binary = `${run.d.stateDir}/claude-bin`
+    Deno.copyFileSync(CLAUDE, binary)
+    Deno.chmodSync(binary, 0o700)
+    run.opts.claudeBinary = binary
+    await run.run(async () => {
+      await run.turn('one')
+      const spawn = run.tg.events('spawn')[0].data
+      const canonical = run.tg.gw.config.claudeBinary
+      const replacement = `${canonical}.replacement`
+      Deno.copyFileSync(CLAUDE, replacement)
+      Deno.chmodSync(replacement, 0o700)
+      Deno.renameSync(replacement, canonical)
+      assertEquals(await Deno.readLink(`/proc/${spawn.pid}/exe`), canonical + ' (deleted)')
+      assertEquals((await processIdentity(spawn.pid))!.comm, canonical)
+      Deno.writeTextFileSync(`${run.d.stateDir}/gateway.lock`, JSON.stringify({ pid: 999999, started: 'gone', comm: 'gone' }))
+      const second = await TestGateway.start({ dirs: run.d, backendEnv: run.backend(), claudeBinary: binary })
+      try {
+        for (let i = 0; i < 100 && alive(spawn.pid); i++) await new Promise((r) => setTimeout(r, 20))
+        assert(!alive(spawn.pid), 'the replaced-binary orphan was killed')
+        assertEquals([...Deno.readDirSync(`${run.d.stateDir}/run`)].map((d) => d.name), [])
+      } finally {
+        await second.close()
+      }
+    })
+  },
 })
