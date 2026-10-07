@@ -2,7 +2,7 @@
 // It turns Claude Code's stream into Responses events, holds MCP calls until the client's outputs come,
 // delivers notices through hooks, and records every log entry so the process can be killed and rebuilt.
 import type { FnTool, InItem, Part } from './api/request.ts'
-import { newId, type ResponseState, type SseSink, type UsageTotals } from './api/stream.ts'
+import { type EventSink, newId, type ResponseState, type UsageTotals } from './api/stream.ts'
 import { type Bridge, type BridgeTarget, McpCallError, StaleEpoch } from './bridge.ts'
 import { userContentBlocks } from './claude/entries.ts'
 import { ClaudeProcess, executableIdentity, type Frame } from './claude/process.ts'
@@ -70,7 +70,7 @@ export class Active {
   finishing = false
   constructor(
     readonly state: ResponseState,
-    readonly sink: SseSink,
+    readonly sink: EventSink,
     /** The response this one continues in the log; null when it starts it. */
     readonly prevId: string | null,
     /** Every input item the record covers: synthesized history, then this request's input. */
@@ -408,7 +408,8 @@ export class Lane implements BridgeTarget {
 
   cancel(responseId: string, reason: string): boolean {
     const a = this.active
-    if (!a || a.finished || a.state.id !== responseId) return false
+    // `finished` also covers the asynchronous record/commit window: cancellation still wins until commit.
+    if (!a || a.state.status !== 'in_progress' || a.state.id !== responseId) return false
     a.finished = true
     a.state.status = 'cancelled'
     a.state.error = { code: 'cancelled' satisfies ErrorCode, message: `The response was cancelled (${reason}).` }

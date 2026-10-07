@@ -82,8 +82,16 @@ export class ResponseState {
   }
 }
 
+/** The lane emits the same ordered events regardless of transport. Cancellation is synchronous and idempotent. */
+export interface EventSink {
+  readonly isClosed: boolean
+  onCancel: (() => void) | null
+  send(type: string, data: Json): void
+  close(): void
+}
+
 /** Writes SSE events to a ReadableStream the HTTP layer returns. */
-export class SseSink {
+export class SseSink implements EventSink {
   readonly stream: ReadableStream<Uint8Array>
   private ctrl!: ReadableStreamDefaultController<Uint8Array>
   private seq = 0

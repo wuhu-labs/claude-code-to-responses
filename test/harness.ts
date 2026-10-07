@@ -4,6 +4,7 @@ import { type Config, prepare } from '../src/config.ts'
 import { Gateway } from '../src/gateway.ts'
 import { handler } from '../src/server.ts'
 import type { Exchange, Json } from './fake.ts'
+import { WsClient } from './websocket_client.ts'
 
 export const CLAUDE = Deno.env.get('CLAUDE_BINARY') ?? `${Deno.env.get('HOME')}/.wuhu/vendors/claude/2.1.284/claude`
 export const REPO = new URL('..', import.meta.url).pathname.replace(/\/$/, '')
@@ -71,6 +72,14 @@ export class TestGateway {
     return new TestGateway(gw, server, client)
   }
 
+  private sockets: WsClient[] = []
+
+  websocket(): WsClient {
+    const ws = new WsClient(new WebSocket(this.url.replace('http:', 'ws:') + '/v1/responses'))
+    this.sockets.push(ws)
+    return ws
+  }
+
   get url(): string {
     return `http://127.0.0.1:${this.server.addr.port}`
   }
@@ -102,6 +111,7 @@ export class TestGateway {
 
   async close(): Promise<void> {
     const pids = this.gw.events.filter((e) => e.kind === 'spawn').map((e) => e.data.pid as number)
+    await Promise.all(this.sockets.map((s) => s.close()))
     await this.gw.close()
     await this.server.shutdown()
     for (const pid of pids) {
@@ -150,6 +160,8 @@ export class Driver {
     public opts: { instructions: string; tools: Json[]; model: string; effort?: string; mode: 'previous' | 'history' },
   ) {}
 
+  sender: ((body: Json) => Promise<Result>) | null = null
+
   /** Sends new input items; on success appends input and output to the history. */
   async send(input: Json[], mode = this.opts.mode): Promise<Result> {
     const body: Json = {
@@ -160,7 +172,7 @@ export class Driver {
       ...(mode === 'previous' && this.prevId ? { previous_response_id: this.prevId } : {}),
       ...(this.opts.effort ? { reasoning: { effort: this.opts.effort } } : {}),
     }
-    const r = await send(this.client, body)
+    const r = await (this.sender ? this.sender(body) : send(this.client, body))
     this.results.push(r)
     if (r.status === 'completed' || r.status === 'incomplete') {
       this.history.push(...input, ...r.response.output)

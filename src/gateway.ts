@@ -1,7 +1,7 @@
 // Routes each Responses request to a lane: the live process when it sits at the previous response, otherwise a
 // process rebuilt from the response store or from the client's history and the provider records it carries.
 import type { FnTool, InItem, NormRequest, Part } from './api/request.ts'
-import { ResponseState, SseSink } from './api/stream.ts'
+import { type EventSink, ResponseState, SseSink } from './api/stream.ts'
 import { Bridge } from './bridge.ts'
 import {
   assistantEntries,
@@ -81,8 +81,23 @@ export class Gateway {
   /** Every lane whose process may still be running, live or dying. */
   private processes = new Set<Lane>()
 
+  private connections = new Set<() => void>()
+
+  assertOpen(): void {
+    if (this.closed) throw new GatewayError(503, 'server_error', 'shutting_down', 'The gateway is shutting down.')
+  }
+
+  /** Shutdown owns persistent transports too, including sockets sitting between turns. */
+  trackConnection(close: () => void): () => void {
+    this.assertOpen()
+    this.connections.add(close)
+    return () => this.connections.delete(close)
+  }
+
   async close(): Promise<void> {
     this.closed = true
+    for (const close of this.connections) close()
+    this.connections.clear()
     await Promise.all([...this.processes].map((l) => l.kill('gateway_shutdown')))
     await this.bridge.close()
     releaseLock(this.config.stateDir)
@@ -111,7 +126,14 @@ export class Gateway {
 
   /** Validates and starts a response; returns its event stream. Errors before streaming are thrown. */
   async create(req: NormRequest): Promise<ReadableStream<Uint8Array>> {
-    if (this.closed) throw new GatewayError(503, 'server_error', 'shutting_down', 'The gateway is shutting down.')
+    const sink = new SseSink()
+    await this.createInto(req, sink)
+    return sink.stream
+  }
+
+  /** Both transports use the same validation, reservations, processes and durable response store. */
+  async createInto(req: NormRequest, sink: EventSink): Promise<void> {
+    this.assertOpen()
     const chain: ChainSpec = {
       key: await sha256(JSON.stringify([req.model, req.effort, req.instructions, req.tools])),
       model: req.model,
@@ -127,24 +149,34 @@ export class Gateway {
       const plan = req.previousResponseId !== null
         ? await this.fromPrevious(req, chain, state, reservation)
         : await this.fromHistory(req, chain, state, reservation)
-      return this.start(state, plan)
+      this.start(state, plan, sink)
     } finally {
       if (reservation.session) this.reserved.delete(reservation.session)
     }
   }
 
-  private start(state: ResponseState, plan: Plan): ReadableStream<Uint8Array> {
-    const sink = new SseSink()
+  private start(state: ResponseState, plan: Plan, sink: EventSink): void {
     const active = new Active(state, sink, plan.prevId, plan.covered)
-    sink.send('response.created', { response: state.object() })
-    sink.send('response.in_progress', { response: state.object() })
     const lane = plan.lane
     lane.attach(active)
+    // A socket may close while the asynchronous history/store plan is being built. Never launch or release
+    // anything in that case; attach first so the same lane cancellation rolls back the attempt.
+    if (sink.isClosed) {
+      sink.onCancel?.()
+      return
+    }
+    sink.send('response.created', { response: state.object() })
+    sink.send('response.in_progress', { response: state.object() })
+    // Initial event serialization can itself overflow the socket budget. Do not launch the model on a
+    // request whose transport has already failed; later emission failures cancel at a microtask boundary.
+    if (sink.isClosed) {
+      sink.onCancel?.()
+      return
+    }
     this.note('request', { session: lane.sessionId, response: state.id, path: state.gateway.path })
     if (plan.spawn) lane.spawn(plan.spawn)
     if (plan.delivery?.kind === 'turn') void lane.startTurn(plan.delivery.parts)
     else if (plan.delivery?.kind === 'outputs') lane.release(plan.delivery.outputs, plan.delivery.notices?.hookText ?? null)
-    return sink.stream
   }
 
   cancel(id: string): Json {

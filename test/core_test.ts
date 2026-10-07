@@ -1,3 +1,4 @@
+import { scenarioTest } from './scenario.ts'
 // Gateway core on the fake endpoint: held calls, message_stop, notices, records, usage, eviction and restart bytes.
 import { assert, assertEquals, assertExists, assertStringIncludes } from '@std/assert'
 import { decodeRecord } from '../src/records.ts'
@@ -11,7 +12,7 @@ function recordOf(r: { response: Json }) {
   return decodeRecord(items[0].encrypted_content)
 }
 
-Deno.test('parallel calls are held until the outputs come, in any order; the response ends at message_stop', async () => {
+scenarioTest('parallel calls are held until the outputs come, in any order; the response ends at message_stop', async () => {
   const run = new Run('parallel', false)
   await run.run(async () => {
     // the fake streams 400 ms between blocks: Claude Code calls the first tool long before the message ends
@@ -54,7 +55,7 @@ Deno.test('parallel calls are held until the outputs come, in any order; the res
   })
 })
 
-Deno.test('usage maps cache reads into cached_tokens and keeps the raw numbers', async () => {
+scenarioTest('usage maps cache reads into cached_tokens and keeps the raw numbers', async () => {
   const run = new Run('usage', false)
   await run.run(async () => {
     run.fake.reply({ blocks: [text('hi')], usage: { input_tokens: 7, cache_read_input_tokens: 1000, cache_creation_input_tokens: 50, output_tokens: 3 } })
@@ -83,7 +84,7 @@ Deno.test('usage maps cache reads into cached_tokens and keeps the raw numbers',
   })
 })
 
-Deno.test('a provider record is every log entry since the previous response, verbatim', async () => {
+scenarioTest('a provider record is every log entry since the previous response, verbatim', async () => {
   const run = new Run('records', false)
   await run.run(async () => {
     run.fake.reply({ blocks: [text('one')] })
@@ -128,7 +129,7 @@ async function conversation(run: Run): Promise<void> {
   await run.turn('T6 last')
 }
 
-Deno.test('kill/resume and gateway restarts: every request is byte-identical to the live process', async () => {
+scenarioTest('kill/resume and gateway restarts: every request is byte-identical to the live process', async () => {
   const control = new Run('bytes-control', true)
   const evicted = new Run('bytes-evicted', false)
   await control.start()
@@ -156,7 +157,7 @@ Deno.test('kill/resume and gateway restarts: every request is byte-identical to 
   }
 })
 
-Deno.test('idle timeout kills the process and the next request rebuilds it', async () => {
+scenarioTest('idle timeout kills the process and the next request rebuilds it', async () => {
   const run = new Run('idle-timer', false, { idleTimeoutMs: 300 })
   await run.run(async () => {
     run.fake.reply({ blocks: [text('first')] })
@@ -173,7 +174,7 @@ Deno.test('idle timeout kills the process and the next request rebuilds it', asy
   })
 })
 
-Deno.test("chains running in parallel share one Claude config folder without corrupting it or each other's logs", async () => {
+scenarioTest("chains running in parallel share one Claude config folder without corrupting it or each other's logs", async () => {
   const { Driver } = await import('./harness.ts')
   const { INSTRUCTIONS, MODEL, TOOLS, toolsImpl } = await import('./scenario.ts')
   const run = new Run('shared-config', false)
@@ -210,7 +211,7 @@ Deno.test("chains running in parallel share one Claude config folder without cor
   })
 })
 
-Deno.test("the gateway's device id is seeded into the shared config folder, sent as metadata.user_id's device_id and noted in records", async () => {
+scenarioTest("the gateway's device id is seeded into the shared config folder, sent as metadata.user_id's device_id and noted in records", async () => {
   const run = new Run('device-id', false)
   await run.run(async () => {
     run.fake.reply({ blocks: [text('one')] })
@@ -224,7 +225,7 @@ Deno.test("the gateway's device id is seeded into the shared config folder, sent
   })
 })
 
-Deno.test('a rebuild on a completely fresh state dir configured with the same device id sends the same metadata.user_id', async () => {
+scenarioTest('a rebuild on a completely fresh state dir configured with the same device id sends the same metadata.user_id', async () => {
   const run = new Run('fresh-state-metadata', false)
   await run.run(async () => {
     run.fake.reply({ blocks: [text('one')] })
@@ -241,7 +242,7 @@ Deno.test('a rebuild on a completely fresh state dir configured with the same de
   })
 })
 
-Deno.test('every session runs in the one working folder, whatever the conversation', async () => {
+scenarioTest('every session runs in the one working folder, whatever the conversation', async () => {
   const run = new Run('one-work-dir', false)
   await run.run(async () => {
     run.fake.reply({ blocks: [text('a')] }, { blocks: [text('b')] })
@@ -257,7 +258,7 @@ Deno.test('every session runs in the one working folder, whatever the conversati
   })
 })
 
-Deno.test('a fresh state dir with another device id rebuilds the same model bytes; only metadata.user_id differs, and the mismatch is noted', async () => {
+scenarioTest('a fresh state dir with another device id rebuilds the same model bytes; only metadata.user_id differs, and the mismatch is noted', async () => {
   const run = new Run('other-device', false)
   await run.run(async () => {
     run.fake.reply({ blocks: [text('one')] })

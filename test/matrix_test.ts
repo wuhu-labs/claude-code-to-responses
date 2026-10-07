@@ -1,3 +1,4 @@
+import { scenarioTest } from './scenario.ts'
 // The fake-endpoint matrix: midnight, moved folder, records-less history, turn-start notices, the end-of-turn hook,
 // cancellation and interrupts, stale-call fencing, typed errors.
 import { assert, assertEquals, assertNotEquals, assertRejects, assertStringIncludes, assertThrows } from '@std/assert'
@@ -8,7 +9,7 @@ import { INSTRUCTIONS, MODEL, Run, TOOLS } from './scenario.ts'
 const dateIn = (tz: string) => new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date())
 const lastText = (body: Json): string => JSON.stringify(body.messages.at(-1))
 
-Deno.test('midnight via the TZ trick: the date change is appended at the tail, the old date stays', async () => {
+scenarioTest('midnight via the TZ trick: the date change is appended at the tail, the old date stays', async () => {
   const [tzA, tzB] = ['Etc/GMT+12', 'Etc/GMT-14']
   assertNotEquals(dateIn(tzA), dateIn(tzB))
   const run = new Run('midnight', false, { tz: tzA })
@@ -37,7 +38,7 @@ Deno.test('midnight via the TZ trick: the date change is appended at the tail, t
   })
 })
 
-Deno.test('negative control: a moved working folder appends an environment update at the tail', async () => {
+scenarioTest('negative control: a moved working folder appends an environment update at the tail', async () => {
   const run = new Run('moved', false)
   const old = run.d.workDir
   await run.run(async () => {
@@ -61,7 +62,7 @@ Deno.test('negative control: a moved working folder appends an environment updat
   } catch { /* gone */ }
 })
 
-Deno.test('negative control: a history without provider records is synthesized (cold), and its next record makes it warm again', async () => {
+scenarioTest('negative control: a history without provider records is synthesized (cold), and its next record makes it warm again', async () => {
   const run = new Run('recordless', false)
   await run.run(async () => {
     run.fake.reply({ blocks: [think('p'), text('R1')] })
@@ -97,7 +98,7 @@ Deno.test('negative control: a history without provider records is synthesized (
   })
 })
 
-Deno.test('notices at a turn start go in through stdin as one user turn', async () => {
+scenarioTest('notices at a turn start go in through stdin as one user turn', async () => {
   const run = new Run('turnstart', false)
   await run.run(async () => {
     run.fake.reply({ blocks: [text('one')] }, { blocks: [text('two')] })
@@ -110,7 +111,7 @@ Deno.test('notices at a turn start go in through stdin as one user turn', async 
   })
 })
 
-Deno.test('a notice delivered at the end-of-turn hook continues inference within the same response', async () => {
+scenarioTest('a notice delivered at the end-of-turn hook continues inference within the same response', async () => {
   const run = new Run('stophook', false)
   await run.run(async () => {
     // the second call names a tool the client never defined: Claude Code answers it itself, so no hook of the
@@ -153,7 +154,7 @@ async function streamUntil(tg: TestGateway, body: Json, pred: (ev: Json) => bool
   return final
 }
 
-Deno.test('cancel mid-stream: the response fails as cancelled, the process goes, the next request rebuilds the same prefix', async () => {
+scenarioTest('cancel mid-stream: the response fails as cancelled, the process goes, the next request rebuilds the same prefix', async () => {
   const run = new Run('cancel', false)
   await run.run(async () => {
     run.fake.reply({ blocks: [text('C1')] })
@@ -187,7 +188,7 @@ Deno.test('cancel mid-stream: the response fails as cancelled, the process goes,
   })
 })
 
-Deno.test('interrupt while the released calls continue: the outputs come again and resume the interrupted turn', async () => {
+scenarioTest('interrupt while the released calls continue: the outputs come again and resume the interrupted turn', async () => {
   const run = new Run('interrupt', false)
   await run.run(async () => {
     run.fake.reply({ blocks: [call('toolu_i', 'echo', { text: 'i' })] })
@@ -212,7 +213,7 @@ Deno.test('interrupt while the released calls continue: the outputs come again a
   })
 })
 
-Deno.test('a client that goes away mid-stream cancels the response', async () => {
+scenarioTest('a client that goes away mid-stream cancels the response', async () => {
   const run = new Run('disconnect', false)
   await run.run(async () => {
     run.fake.reply({ blocks: [text('a'), text('b')], gapMs: 1500 })
@@ -233,7 +234,7 @@ Deno.test('a client that goes away mid-stream cancels the response', async () =>
   })
 })
 
-Deno.test('stale calls from a killed process are fenced by its epoch', async () => {
+scenarioTest('stale calls from a killed process are fenced by its epoch', async () => {
   const run = new Run('fence', false)
   await run.run(async () => {
     run.fake.reply({ blocks: [call('toolu_f', 'echo', { text: 'f' })] })
@@ -271,7 +272,7 @@ Deno.test('stale calls from a killed process are fenced by its epoch', async () 
   })
 })
 
-Deno.test('typed errors: the subset, unknown ids, wrong outputs, a busy chain, the context limit, oversized outputs', async () => {
+scenarioTest('typed errors: the subset, unknown ids, wrong outputs, a busy chain, the context limit, oversized outputs', async () => {
   const run = new Run('errors', false)
   const base = { model: MODEL, instructions: INSTRUCTIONS, tools: TOOLS }
   const expect = async (body: Json, status: number, code: string) => {

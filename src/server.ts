@@ -1,7 +1,8 @@
-// HTTP routes: POST /v1/responses (SSE), POST /v1/responses/{id}/cancel, GET /healthz.
+// Responses routes: POST /v1/responses (SSE), GET /v1/responses (WebSocket), POST /v1/responses/{id}/cancel; GET /healthz.
 import { parseRequest } from './api/request.ts'
 import { asGatewayError, GatewayError, invalid } from './errors.ts'
 import type { Gateway } from './gateway.ts'
+import { upgradeResponses } from './websocket.ts'
 
 function sameToken(given: string, want: string): boolean {
   const a = new TextEncoder().encode(given), b = new TextEncoder().encode(want)
@@ -20,6 +21,7 @@ export function handler(gw: Gateway): (req: Request) => Promise<Response> {
         if (!sameToken(given, token)) throw new GatewayError(401, 'invalid_request_error', 'invalid_api_key', 'Missing or wrong bearer token.')
       }
       if (req.method === 'GET' && url.pathname === '/healthz') return Response.json({ ok: true, lanes: gw.lanes.size })
+      if (req.method === 'GET' && url.pathname === '/v1/responses') return upgradeResponses(req, gw)
       if (req.method === 'POST' && url.pathname === '/v1/responses') {
         let body: unknown
         try {

@@ -48,6 +48,7 @@ export class Run {
       idleTimeoutMs?: number
       holdTimeoutMs?: number
       recordTimeoutMs?: number
+      transport?: 'sse' | 'websocket'
     } = {},
   ) {
     this.fake = new FakeAnthropic(freePort())
@@ -72,6 +73,7 @@ export class Run {
     })
     this.gateways.push(this.tg)
     this.drv = new Driver(this.tg.client, { instructions: INSTRUCTIONS, tools: TOOLS, model: MODEL, mode: this.opts.mode ?? 'previous' })
+    this.setTransport()
   }
 
   /** Evicts or restarts between requests, unless this is the control run. */
@@ -98,6 +100,14 @@ export class Run {
     })
     this.gateways.push(this.tg)
     this.drv.client = this.tg.client
+    this.setTransport()
+  }
+
+  private setTransport(): void {
+    if ((this.opts.transport ?? scenarioTransport) === 'websocket') {
+      const ws = this.tg.websocket()
+      this.drv.sender = (body) => ws.send(body)
+    }
   }
 
   /** Sends through the driver; a lost store answers previous_response_not_found, and the full history goes instead. */
@@ -152,4 +162,19 @@ export class Run {
     await this.fake.close()
     cleanup(this.d)
   }
+}
+
+// Re-run the existing fake-endpoint assertions, not a new approximation of the scenarios. Deno runs these
+// tests serially in each module; restore the selector even on failure. Direct HTTP checks stay HTTP.
+let scenarioTransport: 'sse' | 'websocket' = 'sse'
+export function scenarioTest(name: string, fn: () => Promise<void>): void {
+  Deno.test(name, fn)
+  Deno.test(`WebSocket: ${name}`, async () => {
+    scenarioTransport = 'websocket'
+    try {
+      await fn()
+    } finally {
+      scenarioTransport = 'sse'
+    }
+  })
 }

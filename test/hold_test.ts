@@ -1,3 +1,4 @@
+import { scenarioTest } from './scenario.ts'
 // Eviction during a held call: the interrupted-turn resume with the gateway-written user text.
 import { assert, assertEquals, assertExists } from '@std/assert'
 import { RESUME_LINE } from '../src/claude/pins.ts'
@@ -36,7 +37,7 @@ async function holdConversation(run: Run, withNotice: boolean) {
 }
 
 for (const withNotice of [true, false]) {
-  Deno.test(`eviction during a hold resumes the interrupted turn with ${withNotice ? 'the notices' : 'the fixed line'} as the user text`, async () => {
+  scenarioTest(`eviction during a hold resumes the interrupted turn with ${withNotice ? 'the notices' : 'the fixed line'} as the user text`, async () => {
     const run = new Run(`hold-${withNotice ? 'notice' : 'plain'}`, false)
     await run.run(async () => {
       await holdConversation(run, withNotice)
@@ -71,7 +72,7 @@ for (const withNotice of [true, false]) {
   })
 }
 
-Deno.test('the hold timeout kills a process whose held call outlives it; the client tool is untouched', async () => {
+scenarioTest('the hold timeout kills a process whose held call outlives it; the client tool is untouched', async () => {
   const run = new Run('hold-timer', false, { holdTimeoutMs: 400 })
   await run.run(async () => {
     run.fake.reply({ blocks: [call('toolu_t', 'echo', { text: 'long' })] })

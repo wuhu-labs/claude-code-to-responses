@@ -70,6 +70,9 @@ reads `~/.claude`.
   | `tool_output_too_large` | An output over 500,000 characters (Claude Code would move it to a file). |
   | `image_too_large` | `400`: an image whose base64 payload exceeds 5,242,880 characters (5 MiB encoded, up to 3,932,160 decoded bytes), the gateway’s own per-image input cap, enforced before Claude Code’s image processing. Resize it before sending. |
   | `conversation_busy` | `409`: another response of the conversation is streaming or starting. |
+  | `websocket_response_in_progress` | `409`: a second create arrived before the socket's active response ended. |
+  | `websocket_message_too_large` | `413`: an inbound message or outbound event exceeds 16 MiB; the socket closes with `1009`. |
+  | `websocket_backpressure` | `429`: buffered outbound bytes exceed 16 MiB, or output makes no draining progress for 5 s; the socket closes with `1013`. |
   | `not_found`, `response_not_in_progress` | Cancel of an unknown response, or of one that is no longer streaming. |
   | `shutting_down` | `503`: the gateway is stopping. |
   | `cancelled` | The response was cancelled (by the cancel route or a client that went away). |
@@ -96,6 +99,59 @@ reads `~/.claude`.
   the response.
 - Each response object carries `x_gateway`: how it reached Claude Code (`new`, `live`, `store`, `history`), how many
   records a history rebuild used, how many groups it had to synthesize, and the resume path.
+
+## WebSocket mode
+
+`GET /v1/responses` upgrades to a persistent WebSocket (`ws://127.0.0.1:18330/v1/responses` locally;
+use a TLS reverse proxy for `wss://`). The listen restrictions and bearer authentication are the same as HTTP.
+A bad credential refuses the upgrade with HTTP `401 invalid_api_key`, not a socket or an SSE detour.
+No beta header is required.
+
+Send one **JSON text message** per request, with `type: "response.create"` and the ordinary fields accepted above,
+but **omit `stream`** (even `stream: false` is unsupported). Streaming is implicit:
+
+```json
+{"type":"response.create","model":"claude-opus-5-5","instructions":"Answer briefly.","input":"Hello"}
+```
+
+Each server text message is one of the same JSON streaming events as SSE, including `type` and a
+`sequence_number` starting at zero for each response. Finish a turn at `response.completed`, `response.failed`
+or `response.incomplete`, **not at socket EOF**. The socket stays open for later turns. Resend instructions, tools
+and other request properties on every create; they are not socket configuration.
+
+```json
+{"type":"response.create","model":"claude-opus-5-5","instructions":"Answer briefly.","previous_response_id":"resp_…","input":[{"role":"user","content":"And another question"}]}
+```
+
+There is **one response in flight per connection**, including the asynchronous start/record-commit windows. A
+second create is rejected, not queued, without disturbing the first. Request/protocol errors are messages shaped
+as `{"type":"error","status":400,"error":{"message":"…","type":"invalid_request_error","param":null,"code":"…"}}`.
+Ordinary validation errors leave the connection usable; after generation has started, model errors still arrive
+as `response.failed`, exactly as on SSE. Unknown client events, binary JSON, `stream_id`, `generate` (including
+warm-up), steering and interrupt/cancel messages are typed `unsupported` errors. There is no automatic recovery
+or transport fallback: after `previous_response_not_found`, the client may explicitly resend full history on the
+same WebSocket.
+
+HTTP and WebSocket use **one durable response store and one set of Claude Code chains**. A response created over
+either transport can be continued over the other, or over a new connection, with the same eviction/rebuild and
+provider-record behavior. Unlike OpenAI's connection-local `store: false` mode, every response here is stored;
+`store: false` remains unsupported. Named lanes, concurrent responses on one socket, warm-up/steering, OpenAI's
+60-minute connection expiry and its full Responses feature set are not implemented.
+
+Closing or losing a socket **mid-response** cancels that response and kills its process, just like the HTTP cancel
+endpoint. Continue from the last completed response, never the cancelled id. A socket closed **after a completed
+tool-call response**, while the tool is held, does not cancel that completed response or the client's tool: its
+outputs can still arrive on HTTP or another socket. The normal hold timeout still applies. The HTTP cancel route
+can also cancel a response created over WebSocket without closing its socket. Gateway shutdown closes idle sockets
+as well as active ones (`1001`).
+
+Application messages/events are limited to **16 MiB of UTF-8 bytes** (binary messages use their byte length).
+Deno reassembles inbound frames before this application limit is checked; this is not a wire-level frame or
+preallocation limit. The writer never waits on a client from the Claude Code lane: it caps buffered outbound bytes
+at **16 MiB** and closes if they make no draining progress for **5 seconds**, even after a response's terminal event.
+Overflow cancels active work. Fatal size/backpressure errors get one small best-effort typed error followed by
+close; a client that never reads cannot be guaranteed to see that error. No output is silently dropped to keep an
+inference running.
 
 ## How it works
 
@@ -262,7 +318,8 @@ The probes use the same setting. The binary must still be 2.1.284. Gateway tests
 working folders under `/tmp/cc2r-test`. Each probe owns a unique `/tmp/cc2r-probe-*` root for its configuration, logs
 and working folders; cleanup removes only that root. Tests use ports 18300-18399 and fail if any Claude Code process outlives them.
 
-The byte assertions (`test/core_test.ts`, `test/hold_test.ts`, `test/matrix_test.ts`): one conversation runs twice,
+The byte assertions (`test/core_test.ts`, `test/hold_test.ts`, `test/matrix_test.ts`) run over both HTTP/SSE and
+persistent WebSockets: one conversation runs twice,
 once on a single live process and once with idle evictions, a gateway restart that keeps the store and one that
 loses it (full-history rebuild from records); every request the model receives is byte-identical (working folder
 normalized). Around each disruption, the next request repeats the one before it up to the new tail. The matrix adds
@@ -271,6 +328,13 @@ hold (with and without notices, then evicted and rebuilt again), a midnight via 
 mid-continuation, a client disconnect, stale-call fencing, typed errors, and two negative controls: a moved working
 folder (an environment update at the tail, prefix intact) and a history without records (synthesized, a cache miss,
 warm again on the next rebuild).
+
+`test/websocket_test.ts` additionally checks mixed HTTP/WebSocket tool continuation, socket closes mid-stream,
+mid-continuation, during asynchronous planning/commit and after a completed held-tool response, single flight,
+HTTP cancellation, refused upgrades, oversized messages, shutdown and bounded backpressure. Its non-reading client
+is a raw TCP WebSocket peer, since a JS WebSocket still drains network input without a message listener. The
+incomplete-terminal transport test injects at the shared event-sink boundary (Claude Code may auto-continue a
+model-level `max_tokens` stop).
 
 `test/image_notice_test.ts` checks real image delivery against live/evicted/rebuilt holds, prefix stability within
 each run, and verbatim provider-record replay through idle eviction and lost-store rebuilds. It does not assert

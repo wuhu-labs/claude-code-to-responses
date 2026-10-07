@@ -62,12 +62,14 @@ const ACCEPTED = new Set([
 
 const isObj = (v: unknown): v is Record<string, Json> => typeof v === 'object' && v !== null && !Array.isArray(v)
 
-export function parseRequest(body: unknown): NormRequest {
+export function parseRequest(body: unknown, transport: 'sse' | 'websocket' = 'sse'): NormRequest {
   if (!isObj(body)) throw invalid(null, 'The request body must be a JSON object.')
   for (const k of Object.keys(body)) {
     if (!ACCEPTED.has(k)) throw unsupported(k, `Field '${k}' is not supported by this gateway.`)
   }
-  if (body.stream !== true) throw unsupported('stream', "Only streaming responses are supported: set 'stream' to true.")
+  if (transport === 'websocket') {
+    if ('stream' in body) throw unsupported('stream', "WebSocket responses stream implicitly: omit 'stream'.")
+  } else if (body.stream !== true) throw unsupported('stream', "Only streaming responses are supported: set 'stream' to true.")
   if (body.background !== undefined && body.background !== false && body.background !== null) {
     throw unsupported('background', 'Background mode is not supported.')
   }
