@@ -180,18 +180,18 @@ Deno.test('DeepSeek: real tool rounds, and the cache stays warm after every kind
     last = t5.at(-1)!
     await pause()
 
-    // 5. a fresh state dir: same bytes to the model, but a new Claude Code device id in metadata.user_id, which
-    //    DeepSeek keys its cache on. Reported, not asserted: a known miss.
+    // 5. a completely fresh state dir: the chain's device id comes back from its records and is seeded into the new
+    //    config folder, so metadata.user_id (which DeepSeek keys its cache on) is the same as before
     await restart('all')
     const t6 = await turn('Thank you. Reply with one word.')
-    measure('after a restart with a fresh state dir (known miss)', t6[0], last)
+    const fresh = measure('after a restart with a fresh state dir', t6[0], last)
     assertEquals([t6[0].response.x_gateway.path, t6[0].response.x_gateway.synthesized_groups], ['history', 0])
     last = t6.at(-1)!
     await pause()
     const t7 = await turn('And one more word, please.')
     measure('live (the turn after)', t7[0], last)
 
-    for (const m of [idle, hold, restarted, lost]) assert(m.prefix >= MIN_PREFIX, `${m.kind}: prefix ${(m.prefix * 100).toFixed(1)}% < ${MIN_PREFIX * 100}%`)
+    for (const m of [idle, hold, restarted, lost, fresh]) assert(m.prefix >= MIN_PREFIX, `${m.kind}: prefix ${(m.prefix * 100).toFixed(1)}% < ${MIN_PREFIX * 100}%`)
     for (const g of gateways) g.assertClean()
   } finally {
     await tg.close()

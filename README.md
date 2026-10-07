@@ -21,7 +21,7 @@ deno run -A src/main.ts \
 |---|---|---|
 | `--listen host:port` | `127.0.0.1:18330` | Responses API address. Off loopback the gateway refuses to start without `--auth-token-env`. |
 | `--auth-token-env VAR` | none | Clients must send `Authorization: Bearer $VAR` (`401 invalid_api_key` otherwise). The token is read from the environment, never from argv. |
-| `--state-dir` | required | Response store (`responses/`), Claude Code's config dir and scratch home (`claude/`), per-process files (`run/`). |
+| `--state-dir` | required | Response store (`responses/`, `tails/`), each chain's Claude Code config folder (`sessions/<session>/config`), Claude Code's scratch home (`claude/`), per-process files (`run/`). |
 | `--work-root` | required | Parent of the per-chain working folders. Must be outside any git repository (checked at startup). |
 | `--claude` | required | The Claude Code 2.1.284 binary. |
 | `--bridge-port` | any free port | Loopback port Claude Code calls for MCP tools and hooks. |
@@ -32,9 +32,10 @@ deno run -A src/main.ts \
 | `--verify-logs` | off | After each process exits, check its log starts with the stored records, byte for byte (the tests turn it on). |
 
 The backend comes from the gateway's own environment: `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`,
-`ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` are handed to Claude Code, and nothing else is. With none set,
-Claude Code uses whatever login its isolated config dir (`<state-dir>/claude/config`) holds; the gateway never reads
-`~/.claude`. For a subscription, set `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`).
+`ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` are handed to Claude Code, and nothing else is. Each chain has its
+own Claude Code config folder, so a login stored in a config folder is not shared between chains: give the backend's
+credentials in the environment. For a subscription, set `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`). The
+gateway never reads `~/.claude`.
 
 ## The API: a subset of OpenAI Responses
 
@@ -95,8 +96,16 @@ Claude Code uses whatever login its isolated config dir (`<state-dir>/claude/con
 ## How it works
 
 **Chains.** A chain is one Claude Code session: fixed `instructions` (passed as `--system-prompt-file`, kept off argv,
-which Claude Code snapshots on the first request), tools, model and effort. Its working folder is `<work-root>/<session id>`, the same
-absolute path every time.
+which Claude Code snapshots on the first request), tools, model and effort. Its working folder is
+`<work-root>/<session id>`, the same absolute path every time. Its Claude Code config folder is
+`<state-dir>/sessions/<session id>/config`, which holds its session log (`projects/<working folder>/<session>.jsonl`).
+
+**One metadata.user_id per chain.** Claude Code sends `metadata.user_id` with every request: its device id and the
+session id. It takes the device id from its config folder's `.claude.json` (`userID`) and generates one only when
+there is none (probed). Each chain gets a random 64-hex device id when it starts; the id travels in every provider
+record next to the session id, and the gateway seeds it into the chain's config folder before every launch. So a chain
+sends the same `metadata.user_id` live, after a store rebuild, and after a history rebuild on a completely fresh state
+dir, and a cache keyed on it (DeepSeek's, see below) follows the conversation rather than the gateway.
 
 **Tool rounds.** The request's tools are served to Claude Code as MCP tools (`mcp__fn__<name>`) by a loopback HTTP
 server inside the gateway. Claude Code calls them while the model message is still streaming, one at a time; every
@@ -123,7 +132,8 @@ reaches a record too. A response that ends the model's turn completes at the tur
 Claude Code has logged its end-of-turn hook, so the record holds the whole turn; one that ends in tool calls completes
 at `message_stop`. Records live in the response store (one file per response under `<state-dir>/responses`, owner-only)
 and travel with the response in `encrypted_content` (gzip + base64, not encrypted). A record from the client is
-checked field by field (the session must be a UUID, links must be response ids, entries single-line JSON objects)
+checked field by field (the session must be a UUID, the device id 64 hex digits, links must be response ids, entries
+single-line JSON objects)
 before anything touches a file; a malformed one is a `400`.
 
 **Eviction and rebuild.** A process is killed after `--idle-timeout` at a finished turn, after `--hold-timeout`
@@ -165,7 +175,8 @@ the table). The source of truth is `src/claude/pins.ts`.
 | `--session-id` / `--resume` | chain's session | New session, or a rebuilt log | headless …, a log rebuilt … |
 | MCP server `timeout` | `2147483647` | The longest Claude Code accepts; holds end by eviction, never by this | MCP server timeout … (65 s hold) |
 | MCP tool `_meta["anthropic/maxResultSizeChars"]` | `500000` | Results up to 500,000 characters stay inline, never moved to a file (the gateway refuses longer outputs) | anthropic/maxResultSizeChars … (paired) |
-| `HOME`, `CLAUDE_CONFIG_DIR` | `<state-dir>/claude/{home,config}` | Isolation; logs live in the config dir | headless … |
+| `HOME`, `CLAUDE_CONFIG_DIR` | `<state-dir>/claude/home`, `<state-dir>/sessions/<session>/config` | Isolation; a config folder per chain, which holds the chain's log | headless … |
+| `.claude.json` `userID` in the config folder | the chain's device id, seeded | Claude Code uses it as `metadata.user_id`'s `device_id` instead of generating one | a device id seeded as userID … (paired with a fresh folder) |
 | `TZ` | `--tz` | Decides the date Claude Code announces | TZ decides the date … |
 | `ENABLE_TOOL_SEARCH` | `false` | MCP tools load eagerly, in every request | ENABLE_TOOL_SEARCH=false … (paired with `true`) |
 | `DISABLE_AUTO_COMPACT` | `1` | The client is the only compactor; at the limit the turn ends as `blocking_limit` | DISABLE_AUTO_COMPACT=1 … (paired) |
@@ -228,22 +239,21 @@ from its cache on the first request after the eviction (DeepSeek caches in 64-to
 
 | First request after | Input | Cached | Hit | Prefix |
 |---|---|---|---|---|
-| a live turn start (for comparison) | 2,208 | 2,048 | 92.8% | 95.6% |
-| an idle eviction (store rebuild) | 3,843 | 3,584 | 93.3% | 94.3% |
-| an eviction during a hold (interrupted-turn resume) | 5,397 | 3,840 | 71.2% | 98.9% |
-| a gateway restart (store rebuild) | 5,421 | 5,248 | 96.8% | 97.2% |
-| a restart that lost the response store (history rebuild from records) | 5,515 | 5,376 | 97.5% | 97.9% |
-| a restart with a fresh state dir (history rebuild, new device id) | 5,577 | 0 | 0% | 0% |
+| a live turn start (for comparison) | 2,160 | 1,920 | 88.9% | 90.7% |
+| an idle eviction (store rebuild) | 3,824 | 3,584 | 93.7% | 94.7% |
+| an eviction during a hold (interrupted-turn resume) | 5,370 | 3,840 | 71.5% | 99.6% |
+| a gateway restart (store rebuild) | 5,395 | 5,248 | 97.3% | 97.7% |
+| a restart that lost the response store (history rebuild from records) | 5,489 | 5,248 | 95.6% | 96.0% |
+| a restart with a completely fresh state dir (history rebuild from records) | 5,572 | 5,376 | 96.5% | 97.9% |
 
 The hold row's hit is lower only because its new tail is a 1,500-token tool result no cache has seen; everything before
 it was read from the cache.
 
-DeepSeek keys its prompt cache on Anthropic's `metadata.user_id`, which Claude Code fills with its device id (kept in
-its config dir) and the session id: the same request under another device id or session id reads nothing from the
-cache (measured directly against the endpoint). The gateway keeps the session id across every rebuild, and the device
-id lives as long as `<state-dir>/claude/config` does. So a gateway that loses its whole state dir misses DeepSeek's
-cache once (last row), although the bytes the model sees are identical; the turn after is warm again. Whether
-Anthropic's own cache depends on `metadata` is unknown: no request in this repository goes to Anthropic.
+DeepSeek keys its prompt cache on Anthropic's `metadata.user_id` (Claude Code's device id and the session id): the
+same request under another device id or session id reads nothing from the cache (measured directly against the
+endpoint). Before the chain's device id was carried in its records, the last row was a miss (0% cached): a fresh state
+dir meant a new device id. Now the id comes back from the client's records and is seeded into the new config folder.
+Whether Anthropic's own cache depends on `metadata` is unknown: no request in this repository goes to Anthropic.
 
 ## Known limits
 
