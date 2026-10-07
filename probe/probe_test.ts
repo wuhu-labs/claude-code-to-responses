@@ -111,7 +111,7 @@ probe('--tools "": no native tools, no Skill tool (paired with --tools default)'
 
 probe('--setting-sources "": planted user and project settings (Stop hooks) are ignored (paired: dropping the flag runs them)', async (p, fake) => {
   const userMarker = `${p.root}/user-hook-ran`, projectMarker = `${p.root}/project-hook-ran`
-  const work = `/tmp/cc2r-probe/planted-settings`
+  const work = `${p.root}/work/planted-settings`
   Deno.mkdirSync(`${work}/.claude`, { recursive: true })
   Deno.mkdirSync(`${p.root}/config`, { recursive: true })
   const hook = (marker: string) => JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: `/usr/bin/touch ${marker}` }] }] } })
@@ -139,7 +139,7 @@ function plantMcp(p: Probe, work: string) {
 const plantedTools = (b: Json) => toolNames(b).filter((n: string) => n.includes('planted'))
 
 probe('--strict-mcp-config: with settings open, planted user and project MCP servers are ignored (paired: dropping the flag loads them)', async (p, fake) => {
-  const work = '/tmp/cc2r-probe/planted-mcp-strict'
+  const work = `${p.root}/work/planted-mcp-strict`
   plantMcp(p, work)
   fake.reply({ blocks: [text('a')] }, { blocks: [text('b')] })
   const strict = p.launch({ name: 'mcp-strict', fake, target: new ProbeTarget(), workDir: work, args: without('--setting-sources') })
@@ -158,7 +158,7 @@ probe('--strict-mcp-config: with settings open, planted user and project MCP ser
 })
 
 probe('--setting-sources "" keeps planted MCP servers out on its own too (paired, with --strict-mcp-config dropped)', async (p, fake) => {
-  const work = '/tmp/cc2r-probe/planted-mcp-sources'
+  const work = `${p.root}/work/planted-mcp-sources`
   plantMcp(p, work)
   fake.reply({ blocks: [text('a')] }, { blocks: [text('b')] })
   await p.launch({ name: 'mcp-sources-pinned', fake, target: new ProbeTarget(), workDir: work, args: without('--strict-mcp-config', false) }).turn('x')
@@ -324,7 +324,7 @@ Deno.test("a device id seeded as userID in the config folder's .claude.json beco
 })
 
 probe('a log rebuilt from the mirrored entries resumes into a byte-identical request', async (p, fake) => {
-  const work = '/tmp/cc2r-probe/rebuild'
+  const work = `${p.root}/work/rebuild`
   const script = () => {
     fake.reply({ blocks: [think('a'), text('one')] })
     fake.reply({ blocks: [call('toolu_rb', 'echo', { text: 'x' })] }, { blocks: [text('two')] })
@@ -680,7 +680,7 @@ probe('slash notices: PostToolUse context never dispatches; appended text dispat
 })
 
 probe('--setting-sources "" ignores planted slash commands and skills; dropping it enables both; a leading space neutralizes them', async (p, fake) => {
-  const work = '/tmp/cc2r-probe/slash-planted'
+  const work = `${p.root}/work/slash-planted`
   for (const dir of [`${p.root}/config`, `${work}/.claude`]) {
     Deno.mkdirSync(`${dir}/commands`, { recursive: true })
     Deno.writeTextFileSync(`${dir}/commands/planted.md`, '---\ndescription: planted command\n---\nPLANTED-COMMAND-BODY $ARGUMENTS')
@@ -712,4 +712,30 @@ probe('--setting-sources "" ignores planted slash commands and skills; dropping 
       }
     }
   }
+})
+
+Deno.test('concurrent probes own separate temp roots; closing one leaves the other process and planted workdir intact', async () => {
+  const first = new Probe(), second = new Probe(), fake = new FakeAnthropic(freePort())
+  let firstClosed = false
+  try {
+    assertNotEquals(first.root, second.root)
+    const customWork = `${second.root}/planted-work`
+    Deno.mkdirSync(customWork)
+    Deno.writeTextFileSync(`${customWork}/canary`, 'alive')
+    const a = first.launch({ name: 'concurrent', fake, target: new ProbeTarget() })
+    const b = second.launch({ name: 'concurrent', fake, target: new ProbeTarget(), workDir: customWork })
+    assertEquals((await a.turn('first')).result, 'FAKE-DEFAULT')
+    assertEquals((await b.turn('second')).result, 'FAKE-DEFAULT')
+    await first.close()
+    firstClosed = true
+    assert(!exists(first.root))
+    assert(exists(second.root))
+    assertEquals(Deno.readTextFileSync(`${customWork}/canary`), 'alive')
+    assertEquals((await b.turn('still running')).result, 'FAKE-DEFAULT')
+  } finally {
+    if (!firstClosed) await first.close()
+    await second.close()
+    await fake.close()
+  }
+  assert(!exists(second.root))
 })

@@ -3,7 +3,7 @@
 import { Bridge, type BridgeTarget } from '../src/bridge.ts'
 import { launchArgs, launchEnv, type LaunchSpec, logPath, MAX_RESULT_CHARS, mcpConfigJson, settingsJson } from '../src/claude/pins.ts'
 import type { FakeAnthropic, Json } from '../test/fake.ts'
-import { CLAUDE, freePort, REPO } from '../test/harness.ts'
+import { CLAUDE, freePort } from '../test/harness.ts'
 
 export interface ProbeTools {
   tools: Json[]
@@ -87,7 +87,7 @@ export class ProbeRun {
   constructor(readonly o: ProbeOpts, readonly bridge: Bridge, readonly root: string) {
     const epoch = `ep_${o.name.replace(/[^a-z0-9]/gi, '')}${Date.now()}`
     bridge.register(epoch, o.target)
-    const workDir = o.workDir ?? `/tmp/cc2r-probe/${o.name}`
+    const workDir = o.workDir ?? `${root}/work/${o.name}`
     Deno.mkdirSync(workDir, { recursive: true })
     const configDir = `${root}/config`, homeDir = `${root}/home`
     for (const d of [configDir, homeDir]) Deno.mkdirSync(d, { recursive: true })
@@ -227,7 +227,8 @@ async function* lines(stream: ReadableStream<Uint8Array>) {
 
 export class Probe {
   bridge = new Bridge(freePort())
-  root = `${REPO}/.state/probe/${Date.now().toString(36)}`
+  /** Everything this probe owns, including planted workdirs, is isolated from concurrent suites/clones. */
+  root = Deno.makeTempDirSync({ dir: '/tmp', prefix: 'cc2r-probe-' })
   runs: ProbeRun[] = []
   launch(o: ProbeOpts): ProbeRun {
     const r = new ProbeRun(o, this.bridge, this.root)
@@ -240,7 +241,7 @@ export class Probe {
     for (const r of this.runs) for (const id of [...r.o.target.held.keys()]) r.o.target.release(id, 'probe closed')
     await this.bridge.close()
     try {
-      Deno.removeSync('/tmp/cc2r-probe', { recursive: true })
+      Deno.removeSync(this.root, { recursive: true })
     } catch { /* gone */ }
   }
 }
