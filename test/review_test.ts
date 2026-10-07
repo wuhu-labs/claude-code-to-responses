@@ -2,7 +2,7 @@
 import { assert, assertEquals, assertRejects, assertThrows } from '@std/assert'
 import { decodeRecord, encodeRecord } from '../src/records.ts'
 import { parseRequest } from '../src/api/request.ts'
-import { call, type Json, text } from './fake.ts'
+import { call, type Json, text, think } from './fake.ts'
 import { assertPrefix, freePort, output, user } from './harness.ts'
 import { INSTRUCTIONS, MODEL, Run, TOOLS } from './scenario.ts'
 
@@ -354,5 +354,31 @@ Deno.test('a turn that cannot be written to Claude Code fails its response inste
     assertEquals([r.status, r.response.error.code], ['failed', 'claude_code_stdin'])
     const r2 = await run.send([user('two')])
     assertEquals([r2.status, r2.response.x_gateway.path], ['completed', 'store'])
+  })
+})
+
+Deno.test("the gateway's own reasoning items may come back next to new input; foreign ones are refused", async () => {
+  const run = new Run('reasoning-back', false)
+  await run.run(async () => {
+    run.fake.reply({ blocks: [think('plan'), call('toolu_rb', 'echo', { text: 'x' })] })
+    const r1 = await run.send([user('one')])
+    const mine = r1.response.output.filter((o: Json) => o.type === 'reasoning')
+    assertEquals(mine.length, 2) // the thinking, then the provider record
+    const base = { model: MODEL, instructions: INSTRUCTIONS, tools: TOOLS, stream: true, previous_response_id: r1.response.id }
+    const out = output('toolu_rb', 'X')
+    for (const bad of [{ type: 'reasoning', summary: [] }, { type: 'reasoning', summary: [], encrypted_content: 'gAAAA-from-elsewhere' }]) {
+      const r = await post(run.tg.url, { ...base, input: [bad, out] })
+      assertEquals([r.status, r.body?.error?.code], [400, 'unexpected_reasoning_item'])
+    }
+    run.fake.reply({ blocks: [text('two')] })
+    const r2 = await run.send([...mine, out])
+    assertEquals([r2.status, run.drv.text(r2)], ['completed', 'two'])
+    // a full history that repeats a record item still uses its records
+    await run.disrupt('restart-lost-store')
+    const dup = r2.response.output.find((o: Json) => o.encrypted_content?.startsWith('cc2r.record.'))
+    run.drv.history.push(dup)
+    run.fake.reply({ blocks: [text('three')] })
+    const r3 = await run.send([user('three')])
+    assertEquals([r3.response.x_gateway.path, r3.response.x_gateway.records, r3.response.x_gateway.synthesized_groups], ['history', 2, 0])
   })
 })

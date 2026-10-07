@@ -9,7 +9,7 @@ import { claudeVersion } from './claude/process.ts'
 import { type Config, paths } from './config.ts'
 import { GatewayError, invalid, previousResponseNotFound, unsupported } from './errors.ts'
 import { Active, type ChainSpec, type Head, Lane, MAX_RESULT_CHARS, outputChars } from './lane.ts'
-import { decodeRecord, digestItems, type ProviderRecord, RecordError, sha256 } from './records.ts'
+import { decodeRecord, decodeThinking, digestItems, type ProviderRecord, RecordError, sha256, THINKING_PREFIX } from './records.ts'
 import { ResponseStore } from './store.ts'
 
 // deno-lint-ignore no-explicit-any
@@ -164,12 +164,13 @@ export class Gateway {
       throw previousResponseNotFound(prev, 'instructions, tools, model or reasoning effort changed, which starts a new Claude Code session')
     }
     const head: Head = { responseId: rec.id, end: rec.end, calls: rec.calls }
-    const delivery = deliveryFor(head, req.input)
+    const input = await this.withoutOwnReasoning(req.input, prev)
+    const delivery = deliveryFor(head, input)
     this.reserve(rec.session, reservation)
     let lane = this.lanes.get(rec.session)
     if (lane && !lane.dead && lane.head?.responseId === prev) {
       state.gateway = { path: 'live', session: rec.session }
-      return { lane, delivery, prevId: prev, covered: req.input, spawn: null }
+      return { lane, delivery, prevId: prev, covered: input, spawn: null }
     }
     if (lane) await lane.kill('superseded')
     await this.settled(rec.session)
@@ -181,7 +182,34 @@ export class Gateway {
     lane.pending = this.store.tail(prev)
     const spawn = this.resumePlan(lane, log, head, delivery)
     state.gateway = { path: 'store', session: rec.session, records: records.length, resume: spawn.interruptedTurn ? 'interrupted_turn' : 'stdin' }
-    return { lane, delivery: spawn.interruptedTurn ? null : delivery, prevId: prev, covered: req.input, spawn }
+    return { lane, delivery: spawn.interruptedTurn ? null : delivery, prevId: prev, covered: input, spawn }
+  }
+
+  /**
+   * Reasoning items sent back next to new input in previous_response_id mode are ignored: what they carry is already
+   * the state `previous_response_id` names. Only the gateway's own may come back: a provider record of this chain, or
+   * a thinking item in the gateway's encoding. Anything else is a 400, since it could only be meant as new input.
+   */
+  private async withoutOwnReasoning(input: InItem[], prev: string): Promise<InItem[]> {
+    const chainIds = new Set((this.store.chain(prev) ?? []).map((r) => r.id))
+    const out: InItem[] = []
+    for (let i = 0; i < input.length; i++) {
+      const it = input[i]
+      if (it.kind !== 'reasoning') {
+        out.push(it)
+        continue
+      }
+      const enc = it.encrypted ?? ''
+      if (enc.startsWith(THINKING_PREFIX) && decodeThinking(enc)) continue
+      const r = await clientRecord(enc, i)
+      if (r && chainIds.has(r.id)) continue
+      throw invalid(
+        `input[${i}]`,
+        'Only reasoning items this gateway issued in this conversation can be sent back with previous_response_id.',
+        'unexpected_reasoning_item',
+      )
+    }
+    return out
   }
 
   /** The resume launch, with the interrupted-turn entries appended when the log stops at held calls. */
@@ -222,9 +250,9 @@ export class Gateway {
     for (let gi = 0; gi < groups.length; gi++) {
       const g = groups[gi]
       pendingGroups.push(g)
-      const recs = (await Promise.all(
-        g.outputs.filter((i) => i.kind === 'reasoning' && i.encrypted).map((i) => clientRecord((i as { encrypted: string }).encrypted, gi)),
-      )).filter((r) => r !== null)
+      // a client may repeat an item it already sent; one record counted twice is still one record
+      const encrypted = [...new Set(g.outputs.filter((i) => i.kind === 'reasoning' && i.encrypted).map((i) => (i as { encrypted: string }).encrypted))]
+      const recs = (await Promise.all(encrypted.map((e) => clientRecord(e, gi)))).filter((r) => r !== null)
       if (recs.length === 0) continue
       const r = recs[recs.length - 1]!
       const fits = recs.length === 1 && r.chain === chain.key && r.prev === headId && (session === null || r.session === session) &&
