@@ -8,7 +8,7 @@ import { userContentBlocks } from './claude/entries.ts'
 import { ClaudeProcess, executableIdentity, type Frame } from './claude/process.ts'
 import { type LaunchSpec, logPath, MAX_RESULT_CHARS, MCP_PREFIX, mcpConfigJson, projectDir, settingsJson } from './claude/pins.ts'
 import { type Config, paths } from './config.ts'
-import { type ErrorCode, GatewayError, serverError } from './errors.ts'
+import { asGatewayError, type ErrorCode, GatewayError, serverError } from './errors.ts'
 import { type CallRef, digestItems, encodeRecord, encodeThinking, type ProviderRecord } from './records.ts'
 import type { ResponseStore } from './store.ts'
 
@@ -805,7 +805,14 @@ export class Lane implements BridgeTarget {
     }
     // No await from preflight through enqueue/commit. Write disk first, so a storage error cannot publish
     // success; if the transport refuses its enqueue, roll disk back before touching the head/log cursor.
-    this.store.put(record)
+    try {
+      this.store.put(record)
+    } catch (error) {
+      // Model output is finished but the response is not committed. A failed atomic record write must
+      // terminate the stream and release the lane, not reject the un-awaited completion task.
+      this.fail(asGatewayError(error))
+      return
+    }
     if (!enqueue()) {
       this.store.remove(record.id)
       a.sink.onCancel?.()
@@ -831,7 +838,8 @@ export class Lane implements BridgeTarget {
   /** Ends the active response with an error. The lane's state is unknown afterwards, so the process goes. */
   fail(err: GatewayError): void {
     const a = this.active
-    if (!a || a.finished) return
+    // `finished` includes record preparation. Failures can still win until the response commits.
+    if (!a || a.state.status !== 'in_progress') return
     a.finished = true
     clearTimeout(a.mirrorTimer)
     this.active = null

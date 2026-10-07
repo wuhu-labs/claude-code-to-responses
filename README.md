@@ -348,6 +348,10 @@ is a raw TCP WebSocket peer, since a JS WebSocket still drains network input wit
 incomplete-terminal transport test injects at the shared event-sink boundary (Claude Code may auto-continue a
 model-level `max_tokens` stop).
 
+`test/store_failure_test.ts` injects a synchronous record-write exception after model output finishes. HTTP and
+WebSocket receive a typed `response.failed`, retain no successful record or attempt tail, and can retry the prior
+completed response with byte-identical model input (on the same socket for WebSocket).
+
 `test/start_failure_test.ts` checks post-attach spawn exceptions before and after the process starts, preserves
 typed error codes, and exercises a real torn Claude config. Both WebSocket (same socket) and HTTP receive
 `response.failed`, then can retry the same parent with byte-identical model input after the failure is removed.
