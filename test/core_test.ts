@@ -173,22 +173,40 @@ Deno.test('idle timeout kills the process and the next request rebuilds it', asy
   })
 })
 
-Deno.test('each chain has its own Claude Code config folder, which holds its session log', async () => {
-  const run = new Run('chain-config', false)
+Deno.test("chains running in parallel share one Claude config folder without corrupting it or each other's logs", async () => {
+  const { Driver } = await import('./harness.ts')
+  const { INSTRUCTIONS, MODEL, TOOLS, toolsImpl } = await import('./scenario.ts')
+  const run = new Run('shared-config', false)
   await run.run(async () => {
-    run.fake.reply({ blocks: [text('a')] }, { blocks: [text('b')] })
-    await run.turn('chain one')
-    const { send } = await import('./harness.ts')
-    const { INSTRUCTIONS, MODEL, TOOLS } = await import('./scenario.ts')
-    await send(run.tg.client, { model: MODEL, instructions: INSTRUCTIONS, tools: TOOLS, input: 'chain two' })
-    const lanes = [...run.tg.gw.lanes.values()]
-    assertEquals(lanes.length, 2)
-    const state = Deno.realPathSync(run.d.stateDir)
-    for (const lane of [...lanes]) {
-      assertEquals(lane.configDir, `${state}/sessions/${lane.sessionId}/config`)
-      assert(lane.logFile.startsWith(`${lane.configDir}/projects/`))
-      assert(Deno.statSync(lane.logFile).isFile)
+    // replies follow each request, whatever order the chains' requests come in
+    run.fake.fallback = (ex) => {
+      const last = JSON.stringify(ex.body.messages.at(-1))
+      return last.includes('tool_result')
+        ? { blocks: [text(`done ${ex.n}`)], gapMs: 50 }
+        : { blocks: [call(`toolu_p${ex.n}`, 'echo', { text: `x${ex.n}` })], gapMs: 50 }
     }
+    const chains = Array.from({ length: 5 }, () => new Driver(run.tg.client, { instructions: INSTRUCTIONS, tools: TOOLS, model: MODEL, mode: 'previous' }))
+    for (let round = 0; round < 3; round++) {
+      await Promise.all(chains.map((d, i) => d.turn(`chain ${i} round ${round}`, toolsImpl)))
+    }
+    const lanes = [...run.tg.gw.lanes.values()]
+    assertEquals(lanes.length, 5)
+    const config = run.tg.gw.config.stateDir + '/claude/config'
+    for (const lane of lanes) {
+      assertEquals(lane.configDir, config)
+      assert(lane.logFile.startsWith(`${config}/projects/`))
+    }
+    await Promise.all(lanes.map((l) => l.kill('test')))
+    // every log is exactly its chain's records, and the shared state file is intact
+    for (const [i, d] of chains.entries()) {
+      const lane = lanes.find((l) => l.head?.responseId === d.prevId)!
+      const recs = run.tg.gw.store.chain(d.prevId!)!
+      const disk = Deno.readTextFileSync(lane.logFile).split('\n').filter(Boolean)
+      assertEquals(disk, [...recs.flatMap((r) => r.entries), ...run.tg.gw.store.tail(d.prevId!)], `chain ${i}`)
+    }
+    JSON.parse(Deno.readTextFileSync(`${config}/.claude.json`))
+    assertEquals(run.tg.events('verify_error').length, 0)
+    assertEquals(run.tg.events('verify_ok').length, 5)
   })
 })
 

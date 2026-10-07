@@ -6,7 +6,7 @@ import { newId, type ResponseState, type SseSink, type UsageTotals } from './api
 import { type Bridge, type BridgeTarget, McpCallError, StaleEpoch } from './bridge.ts'
 import { ClaudeProcess, type Frame } from './claude/process.ts'
 import { type LaunchSpec, logPath, MAX_RESULT_CHARS, MCP_PREFIX, mcpConfigJson, projectDir, settingsJson } from './claude/pins.ts'
-import { chainConfigDir, type Config, paths } from './config.ts'
+import { type Config, paths } from './config.ts'
 import { type ErrorCode, GatewayError, serverError } from './errors.ts'
 import { type CallRef, digestItems, encodeRecord, encodeThinking, type ProviderRecord } from './records.ts'
 import type { ResponseStore } from './store.ts'
@@ -129,7 +129,7 @@ export class Lane implements BridgeTarget {
   }
 
   get configDir(): string {
-    return chainConfigDir(this.config, this.sessionId)
+    return paths(this.config).configDir
   }
 
   /** Reads the complete lines Claude Code appended to the log since the last read into `pending`. */
@@ -171,7 +171,6 @@ export class Lane implements BridgeTarget {
    */
   spawn(opts: { resume: boolean; interruptedTurn: boolean; log?: string[]; attempt?: string[] }): void {
     const p = paths(this.config)
-    Deno.mkdirSync(this.configDir, { recursive: true, mode: 0o700 })
     this.seedDevice()
     if (opts.resume) {
       const dir = projectDir(this.configDir, this.workDir)

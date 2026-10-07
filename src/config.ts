@@ -28,23 +28,15 @@ export interface Config {
 }
 
 export interface Paths {
-  /** Claude Code's config folder for the startup version check only; each chain has its own (chainConfigDir). */
+  /** Claude Code's config folder, shared by every session: each session's log is projects/<work dir>/<session>.jsonl. */
   configDir: string
-  /** Per-chain state: <sessionsDir>/<session id>/config is that chain's Claude Code config folder. */
-  sessionsDir: string
   homeDir: string
   runDir: string
-}
-
-/** A chain's own Claude Code config folder: its device id, its session log, nothing shared with other chains. */
-export function chainConfigDir(c: Config, sessionId: string): string {
-  return `${paths(c).sessionsDir}/${sessionId}/config`
 }
 
 export function paths(c: Config): Paths {
   return {
     configDir: `${c.stateDir}/claude/config`,
-    sessionsDir: `${c.stateDir}/sessions`,
     homeDir: `${c.stateDir}/claude/home`,
     runDir: `${c.stateDir}/run`,
   }
@@ -183,6 +175,6 @@ export function prepare(c: Config): Config {
   Deno.chmodSync(stateDir, 0o700)
   Deno.chmodSync(workDir, 0o700)
   const p = paths({ ...c, stateDir })
-  for (const d of [p.configDir, p.homeDir, p.runDir, p.sessionsDir]) Deno.mkdirSync(d, { recursive: true, mode: 0o700 })
+  for (const d of [p.configDir, p.homeDir, p.runDir]) Deno.mkdirSync(d, { recursive: true, mode: 0o700 })
   return { ...c, stateDir, workDir }
 }

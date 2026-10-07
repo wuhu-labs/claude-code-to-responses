@@ -214,7 +214,6 @@ Deno.test('state, records and logs are owner-only under umask 022', async () => 
           `${state}/tails`,
           `${state}/claude/config`,
           `${state}/run`,
-          `${state}/sessions`,
           lane.configDir,
           Deno.realPathSync(run.d.workDir),
           lane.workDir,
