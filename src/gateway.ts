@@ -15,7 +15,7 @@ import {
   userTextEntry,
 } from './claude/entries.ts'
 import { CLAUDE_CODE_VERSION, MCP_PREFIX, RESUME_LINE } from './claude/pins.ts'
-import { claudeVersion } from './claude/process.ts'
+import { claudeVersion, processIdentity } from './claude/process.ts'
 import { type Config, paths } from './config.ts'
 import { GatewayError, invalid, previousResponseNotFound, unsupported } from './errors.ts'
 import { Active, type ChainSpec, type Head, Lane, MAX_RESULT_CHARS, outputChars } from './lane.ts'
@@ -61,6 +61,7 @@ export class Gateway {
         `Claude Code ${version} at ${config.claudeBinary} is not the measured version ${CLAUDE_CODE_VERSION}; run the probe against it before supporting it.`,
       )
     }
+    await sweepOrphans(p.runDir, (kind, data) => console.error(`${kind} ${JSON.stringify(data)}`))
     return new Gateway(config)
   }
 
@@ -364,6 +365,27 @@ function resultEntries(ctx: LogContext, log: string[], calls: CallRef[], outputs
     out.push(JSON.stringify(entry))
   }
   return out
+}
+
+/**
+ * Kills the Claude Code processes a gateway that died without cleaning up left behind: every run folder still holding
+ * a proc.json whose pid has the same start time and executable as recorded. A pid alone is never trusted.
+ */
+export async function sweepOrphans(runDir: string, note: (kind: string, data: Json) => void): Promise<void> {
+  for (const d of Deno.readDirSync(runDir)) {
+    const dir = `${runDir}/${d.name}`
+    try {
+      const rec = JSON.parse(Deno.readTextFileSync(`${dir}/proc.json`))
+      const now = await processIdentity(rec.pid)
+      if (now && now.started === rec.started && now.comm === rec.comm) {
+        try {
+          Deno.kill(rec.pid, 'SIGKILL')
+          note('orphan_killed', { pid: rec.pid, epoch: d.name })
+        } catch { /* gone meanwhile */ }
+      }
+    } catch { /* no registry entry: nothing ran there */ }
+    Deno.removeSync(dir, { recursive: true })
+  }
 }
 
 interface Reservation {

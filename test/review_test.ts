@@ -469,3 +469,38 @@ Deno.test('a line Claude Code writes only to disk reaches the next record, throu
     })
   }
 })
+
+Deno.test('a gateway that died without cleaning up has its Claude Code processes killed at the next start; a reused pid is spared', async () => {
+  const { alive, TestGateway } = await import('./harness.ts')
+  const run = new Run('orphans', false)
+  await run.run(async () => {
+    run.fake.reply({ blocks: [text('one')] })
+    await run.turn('one')
+    const pid = run.tg.events('spawn')[0].data.pid
+    const epoch = run.tg.events('spawn')[0].data.epoch
+    const runDir = `${Deno.realPathSync(run.d.stateDir)}/run`
+    while (
+      !(() => {
+        try {
+          return Deno.statSync(`${runDir}/${epoch}/proc.json`).isFile
+        } catch {
+          return false
+        }
+      })()
+    ) await new Promise((r) => setTimeout(r, 20))
+    // a process that merely reuses a recorded pid (a different start time) must survive the sweep
+    const bystander = new Deno.Command('/bin/sleep', { args: ['30'] }).spawn()
+    Deno.mkdirSync(`${runDir}/ep_bystander`)
+    Deno.writeTextFileSync(`${runDir}/ep_bystander/proc.json`, JSON.stringify({ pid: bystander.pid, started: 'Thu Jan  1 00:00:00 1970', comm: '/bin/sleep' }))
+    // the first gateway "crashes": a second one starts on the same state while its process still runs
+    assert(alive(pid))
+    const second = await TestGateway.start({ dirs: run.d, backendEnv: run.backend() })
+    for (let i = 0; i < 100 && alive(pid); i++) await new Promise((r) => setTimeout(r, 20)) // until it is reaped
+    assert(!alive(pid), 'the orphan was killed')
+    assert(alive(bystander.pid), 'the bystander survived')
+    bystander.kill('SIGKILL')
+    await bystander.status
+    assertEquals([...Deno.readDirSync(runDir)].map((d) => d.name), [])
+    await second.close()
+  })
+})

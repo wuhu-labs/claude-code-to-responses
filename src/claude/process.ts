@@ -91,6 +91,19 @@ async function* lines(stream: ReadableStream<Uint8Array>) {
   if (buf) yield buf
 }
 
+/**
+ * A process's start time and executable as `ps` reports them (never its arguments: they are not printed), so a
+ * recorded pid is only ever matched with the process it was recorded for.
+ */
+export async function processIdentity(pid: number): Promise<{ started: string; comm: string } | null> {
+  const run = async (field: string) => {
+    const out = await new Deno.Command('/bin/ps', { args: ['-o', `${field}=`, '-p', String(pid)], stdout: 'piped', stderr: 'null' }).output()
+    return out.success ? new TextDecoder().decode(out.stdout).trim() : ''
+  }
+  const [started, comm] = await Promise.all([run('lstart'), run('comm')])
+  return started && comm ? { started, comm } : null
+}
+
 /** `claude --version`, checked against the pinned version before anything is launched. */
 export async function claudeVersion(binary: string, env: Record<string, string>): Promise<string> {
   const out = await new Deno.Command(binary, { args: ['--version'], env, clearEnv: true, stdout: 'piped', stderr: 'piped' }).output()
