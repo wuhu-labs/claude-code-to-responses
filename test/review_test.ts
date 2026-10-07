@@ -8,6 +8,8 @@ import { assertPrefix, freePort, output, user } from './harness.ts'
 import { INSTRUCTIONS, MODEL, Run, TOOLS } from './scenario.ts'
 
 /** Posts a request; an event stream is read to its end (dropping it would cancel the response). */
+const OAUTH = { CLAUDE_CODE_OAUTH_TOKEN: 'test-token' }
+
 async function post(url: string, body: Json): Promise<{ status: number; body: Json; events?: string }> {
   const res = await fetch(`${url}/v1/responses`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
   if (res.headers.get('content-type')?.includes('event-stream')) return { status: res.status, body: null, events: await res.text() }
@@ -536,10 +538,10 @@ Deno.test('off loopback the gateway refuses to start without a token; with one, 
   const { parseArgs, ConfigError } = await import('../src/config.ts')
   const { CLAUDE, TestGateway } = await import('./harness.ts')
   const base = ['--state-dir', '/tmp/x', '--work-dir', '/tmp/y', '--claude', CLAUDE]
-  assertThrows(() => parseArgs(['--listen', '0.0.0.0:18399', ...base], {}), ConfigError, 'reachable beyond this machine')
-  assertThrows(() => parseArgs(['--listen', '0.0.0.0:18399', '--auth-token-env', 'GW_TOKEN', ...base], {}), ConfigError, 'not set')
-  assertEquals(parseArgs(['--listen', '0.0.0.0:18399', '--auth-token-env', 'GW_TOKEN', ...base], { GW_TOKEN: 's3cret' }).authToken, 's3cret')
-  assertEquals(parseArgs(['--listen', '127.0.0.1:18399', ...base], {}).authToken, undefined)
+  assertThrows(() => parseArgs(['--listen', '0.0.0.0:18399', ...base], OAUTH), ConfigError, 'reachable beyond this machine')
+  assertThrows(() => parseArgs(['--listen', '0.0.0.0:18399', '--auth-token-env', 'GW_TOKEN', ...base], OAUTH), ConfigError, 'not set')
+  assertEquals(parseArgs(['--listen', '0.0.0.0:18399', '--auth-token-env', 'GW_TOKEN', ...base], { ...OAUTH, GW_TOKEN: 's3cret' }).authToken, 's3cret')
+  assertEquals(parseArgs(['--listen', '127.0.0.1:18399', ...base], OAUTH).authToken, undefined)
   const run = new Run('auth', false)
   run.tg = await TestGateway.start({ dirs: run.d, backendEnv: run.backend(), authToken: 's3cret' })
   run.gateways.push(run.tg)
@@ -683,14 +685,34 @@ Deno.test('the device id: a typed error when malformed, from the flag or the env
   const { CLAUDE } = await import('./harness.ts')
   const base = ['--state-dir', `/tmp/cc2r-test/device-state-${Date.now().toString(36)}`, '--work-dir', '/tmp/cc2r-test/device-work', '--claude', CLAUDE]
   for (const bad of ['xyz', 'A'.repeat(64), 'a'.repeat(63)]) {
-    assertThrows(() => parseArgs([...base, '--device-id', bad], {}), ConfigError, '64 lowercase hex')
-    assertThrows(() => parseArgs(base, { [DEVICE_ID_ENV]: bad }), ConfigError, '64 lowercase hex')
+    assertThrows(() => parseArgs([...base, '--device-id', bad], OAUTH), ConfigError, '64 lowercase hex')
+    assertThrows(() => parseArgs(base, { ...OAUTH, [DEVICE_ID_ENV]: bad }), ConfigError, '64 lowercase hex')
   }
-  assertEquals(parseArgs([...base, '--device-id', 'a'.repeat(64)], {}).deviceId, 'a'.repeat(64))
-  assertEquals(parseArgs(base, { [DEVICE_ID_ENV]: 'b'.repeat(64) }).deviceId, 'b'.repeat(64))
-  const generated = prepare(parseArgs(base, {})).deviceId!
+  assertEquals(parseArgs([...base, '--device-id', 'a'.repeat(64)], OAUTH).deviceId, 'a'.repeat(64))
+  assertEquals(parseArgs(base, { ...OAUTH, [DEVICE_ID_ENV]: 'b'.repeat(64) }).deviceId, 'b'.repeat(64))
+  const generated = prepare(parseArgs(base, OAUTH)).deviceId!
   assert(/^[0-9a-f]{64}$/.test(generated))
-  assertEquals(prepare(parseArgs(base, {})).deviceId, generated, 'kept in the state dir')
-  assertEquals(prepare(parseArgs([...base, '--device-id', 'c'.repeat(64)], {})).deviceId, 'c'.repeat(64), 'the flag wins')
+  assertEquals(prepare(parseArgs(base, OAUTH)).deviceId, generated, 'kept in the state dir')
+  assertEquals(prepare(parseArgs([...base, '--device-id', 'c'.repeat(64)], OAUTH)).deviceId, 'c'.repeat(64), 'the flag wins')
   Deno.removeSync(base[1], { recursive: true })
+})
+
+Deno.test('the backend: CLAUDE_CODE_OAUTH_TOKEN, or the test-only ANTHROPIC_BASE_URL with a key; exactly one, complete', async () => {
+  const { parseArgs, ConfigError } = await import('../src/config.ts')
+  const { CLAUDE } = await import('./harness.ts')
+  const base = ['--state-dir', '/tmp/x', '--claude', CLAUDE]
+  const ok = (env: Record<string, string>) => parseArgs(base, env).backendEnv
+  assertEquals(ok({ CLAUDE_CODE_OAUTH_TOKEN: 't', PATH: '/bin' }), { CLAUDE_CODE_OAUTH_TOKEN: 't' })
+  assertEquals(ok({ ANTHROPIC_BASE_URL: 'http://127.0.0.1:1', ANTHROPIC_AUTH_TOKEN: 'k' }), {
+    ANTHROPIC_BASE_URL: 'http://127.0.0.1:1',
+    ANTHROPIC_AUTH_TOKEN: 'k',
+  })
+  for (
+    const [env, why] of [
+      [{}, 'no backend'],
+      [{ CLAUDE_CODE_OAUTH_TOKEN: 't', ANTHROPIC_BASE_URL: 'http://x' }, 'not both'],
+      [{ ANTHROPIC_API_KEY: 'k' }, 'need ANTHROPIC_BASE_URL'],
+      [{ ANTHROPIC_BASE_URL: 'http://x' }, 'needs ANTHROPIC_API_KEY'],
+    ] as const
+  ) assertThrows(() => parseArgs(base, env), ConfigError, why)
 })

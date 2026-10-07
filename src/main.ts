@@ -1,4 +1,4 @@
-// Entry point: claude-code-to-responses --state-dir … --work-root … --claude …
+// Entry point: claude-code-to-responses --state-dir … --claude … (backend from the environment)
 import { ConfigError, parseArgs, prepare } from './config.ts'
 import { Gateway } from './gateway.ts'
 import { handler } from './server.ts'
@@ -16,7 +16,10 @@ if (import.meta.main) {
   const server = Deno.serve({
     hostname: config.hostname,
     port: config.port,
-    onListen: ({ hostname, port }) => console.error(`listening on http://${hostname}:${port}`),
+    onListen: ({ hostname, port }) => {
+      if (config.backendEnv.ANTHROPIC_BASE_URL) console.error(`TEST-ONLY backend: ${config.backendEnv.ANTHROPIC_BASE_URL}`)
+      console.error(`listening on http://${hostname}:${port}`)
+    },
   }, handler(gw))
   const stop = async () => {
     await gw.close()

@@ -52,6 +52,29 @@ export function paths(c: Config): Paths {
 
 export class ConfigError extends Error {}
 
+/**
+ * The backend: CLAUDE_CODE_OAUTH_TOKEN in production; ANTHROPIC_BASE_URL with an API key or auth token for tests only
+ * (the fake endpoint, DeepSeek). Exactly one, complete, or a startup error: Claude Code is never left to find a login
+ * of its own in a config folder.
+ */
+export function backendFrom(env: Record<string, string | undefined>): Record<string, string> {
+  const set: Record<string, string> = {}
+  for (const k of BACKEND_ENV) {
+    const v = env[k]
+    if (v !== undefined && v !== '') set[k] = v
+  }
+  const oauth = 'CLAUDE_CODE_OAUTH_TOKEN' in set
+  const test = 'ANTHROPIC_BASE_URL' in set || 'ANTHROPIC_API_KEY' in set || 'ANTHROPIC_AUTH_TOKEN' in set
+  if (oauth && test) throw new ConfigError('set either CLAUDE_CODE_OAUTH_TOKEN or the test-only ANTHROPIC_* backend, not both')
+  if (oauth) return set
+  if (!test) throw new ConfigError('no backend: set CLAUDE_CODE_OAUTH_TOKEN (or, for tests only, ANTHROPIC_BASE_URL with a key)')
+  if (!('ANTHROPIC_BASE_URL' in set)) throw new ConfigError('ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN are for tests only and need ANTHROPIC_BASE_URL')
+  if (!('ANTHROPIC_API_KEY' in set) && !('ANTHROPIC_AUTH_TOKEN' in set)) {
+    throw new ConfigError('ANTHROPIC_BASE_URL needs ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN')
+  }
+  return set
+}
+
 export function isLoopback(host: string): boolean {
   return host === 'localhost' || host === '::1' || host === '[::1]' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)
 }
@@ -75,8 +98,11 @@ Usage: claude-code-to-responses [options]
                              a backend cache the same one
   --verify-logs              check each exited process's log against the stored records
 
-Backend: ${BACKEND_ENV.join(', ')} are read from the gateway's environment and handed to Claude Code.
-With none set, Claude Code uses the login in its own config dir (<state-dir>/claude/config).
+Backend, from the gateway's environment (handed to Claude Code, nothing else is):
+  CLAUDE_CODE_OAUTH_TOKEN                    the production backend: a subscription token (claude setup-token)
+  ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN
+                                             TEST ONLY: the fake endpoint, DeepSeek
+Exactly one of the two must be configured. No login in a config folder is supported or read.
 `
 
 export function parseArgs(argv: string[], env: Record<string, string | undefined>): Config {
@@ -127,11 +153,7 @@ export function parseArgs(argv: string[], env: Record<string, string | undefined
   if (deviceId !== undefined && !DEVICE_ID.test(deviceId)) {
     throw new ConfigError(`the device id must be 64 lowercase hex digits (from --device-id or ${DEVICE_ID_ENV})`)
   }
-  const backendEnv: Record<string, string> = {}
-  for (const k of BACKEND_ENV) {
-    const v = env[k]
-    if (v !== undefined && v !== '') backendEnv[k] = v
-  }
+  const backendEnv = backendFrom(env)
   return {
     hostname: m[1],
     port: Number(m[2]),
