@@ -289,6 +289,18 @@ export class Gateway {
       pendingGroups = []
     }
     if (pendingGroups.length) synth = pendingGroups
+    // Validate every synthesized group and the new delivery before taking over a live lane or importing records.
+    // Log synthesis stays after the old process settles: it must include any tail that eviction stores.
+    const lastUsed = used[used.length - 1]
+    let head: Head = { responseId: headId ?? '', end: lastUsed?.end ?? 'turn', calls: lastUsed?.calls ?? [] }
+    const synthDeliveries: Delivery[] = []
+    for (let i = 0; i < synth.length; i++) {
+      const g = synth[i]
+      synthDeliveries.push(deliveryFor(i === 0 && used.length === 0 ? null : head, g.inputs, false))
+      const calls = g.outputs.flatMap((it) => it.kind === 'function_call' ? [{ id: it.callId, name: it.name }] : [])
+      head = { responseId: '', end: calls.length ? 'calls' : 'turn', calls }
+    }
+    const delivery = deliveryFor(head, tail)
     const sessionId = session ?? crypto.randomUUID()
     this.reserve(sessionId, reservation)
     const existing = this.lanes.get(sessionId)
@@ -309,15 +321,11 @@ export class Gateway {
     const workDir = this.workDir(sessionId)
     const ctx = contextOf([...log, ...tailLines], sessionId, workDir)
     const extra: string[] = []
-    let head: Head
     if (synth.length) {
-      const lastUsed = used[used.length - 1]
       let calls: { id: string; name: string }[] = lastUsed?.end === 'calls' ? lastUsed.calls : []
       for (let i = 0; i < synth.length; i++) {
         const g = synth[i]
-        const d = i === 0 && used.length === 0
-          ? deliveryFor(null, g.inputs, false)
-          : deliveryFor({ responseId: '', end: calls.length ? 'calls' : 'turn', calls }, g.inputs, false)
+        const d = synthDeliveries[i]
         if (d.kind === 'turn') {
           extra.push(JSON.stringify(userMessageEntry(ctx, d.parts)))
           // a fresh session logs this latch after its first message; a resumed one missing it writes it outside the mirror
@@ -331,12 +339,7 @@ export class Gateway {
         for (const e of a.entries) extra.push(JSON.stringify(e))
         calls = a.calls
       }
-      head = { responseId: '', end: calls.length ? 'calls' : 'turn', calls }
-    } else {
-      const last = used[used.length - 1]
-      head = { responseId: last.id, end: last.end, calls: last.calls }
     }
-    const delivery = deliveryFor(head, tail)
     const lane = new Lane(
       sessionId,
       workDir,

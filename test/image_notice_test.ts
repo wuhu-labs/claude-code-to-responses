@@ -115,3 +115,49 @@ Deno.test('bad-format, malformed-base64 and oversized image notices are typed 40
     assertEquals((await run.send([output('toolu_badimg', 'RESULT'), { role: 'user', content: [IMAGE] }])).status, 'completed')
   })
 })
+
+for (const path of ['live', 'lost-store'] as const) {
+  Deno.test(`incomplete image-notice outputs in ${path} client history are rejected before eviction or store mutation`, async () => {
+    const { alive } = await import('./harness.ts')
+    const run = new Run(`image-history-preflight-${path}`, false, { mode: 'history' })
+    await run.run(async () => {
+      run.fake.reply({ blocks: [call('toolu_preflight1', 'echo', { text: 'x' }), call('toolu_preflight2', 'read', { name: 'y' })] })
+      await run.send([user('two tools')])
+      await run.tg.waitEvent('hold', (d) => d.call === 'toolu_preflight1')
+      const pid = run.tg.events('spawn')[0].data.pid
+      if (path === 'lost-store') await run.disrupt('restart-lost-store')
+      const notice = { role: 'user', content: [{ type: 'input_text', text: 'valid image notice' }, IMAGE] }
+      const snapshot = () =>
+        [run.tg.gw.store.dir, run.tg.gw.store.tailDir].map((dir) =>
+          [...Deno.readDirSync(dir)].map((e) => [e.name, Deno.readTextFileSync(`${dir}/${e.name}`)]).sort((a, b) => a[0].localeCompare(b[0]))
+        )
+      const before = snapshot(), kills = run.tg.events('kill').length, spawns = run.tg.events('spawn').length
+      const response = await fetch(`${run.tg.url}/v1/responses`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          instructions: run.drv.opts.instructions,
+          tools: run.drv.opts.tools,
+          model: run.drv.opts.model,
+          stream: true,
+          input: [...run.drv.history, output('toolu_preflight1', 'ONE'), notice],
+        }),
+      })
+      assertEquals(response.status, 400)
+      const body = await response.json()
+      assertEquals(body.error.type, 'invalid_request_error')
+      assertEquals(body.error.code, 'missing_tool_output')
+      assertEquals(run.tg.events('kill').length, kills)
+      assertEquals(run.tg.events('spawn').length, spawns)
+      assertEquals(snapshot(), before, 'no imported provider records or stored tails on a rejected delivery')
+      assertEquals(run.fake.main().length, 1)
+      if (path === 'live') assert(alive(pid), 'the original held process is still alive')
+      run.fake.reply({ blocks: [text('corrected retry')] })
+      const corrected = await run.send([output('toolu_preflight1', 'ONE'), output('toolu_preflight2', 'TWO'), notice])
+      assertEquals(corrected.status, 'completed')
+      assertEquals(run.drv.text(corrected), 'corrected retry')
+      assertEquals(corrected.response.x_gateway.path, 'history')
+      assertEquals(run.fake.main().at(-1)!.body.messages.at(-1).content.find((b: Json) => b.type === 'image'), IMAGE_BLOCK)
+    })
+  })
+}
