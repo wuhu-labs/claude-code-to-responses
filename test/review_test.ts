@@ -571,3 +571,23 @@ for (const evict of [false, true]) {
     })
   })
 }
+
+Deno.test('the README documents every error code the gateway can answer with', async () => {
+  const { ERROR_CODES } = await import('../src/errors.ts')
+  const { REPO } = await import('./harness.ts')
+  const readme = Deno.readTextFileSync(`${REPO}/README.md`)
+  const missing = ERROR_CODES.filter((c) => !readme.includes(`\`${c}\``))
+  assertEquals(missing, [])
+})
+
+Deno.test('cancel: an unknown id is 404 not_found, a finished response 409 response_not_in_progress', async () => {
+  const run = new Run('cancel-codes', false)
+  await run.run(async () => {
+    run.fake.reply({ blocks: [text('done')] })
+    const r = await run.turn('one')
+    for (const [id, status, code] of [['resp_0123456789abcdef0123456789abcdef', 404, 'not_found'], [r.response.id, 409, 'response_not_in_progress']] as const) {
+      const res = await fetch(`${run.tg.url}/v1/responses/${id}/cancel`, { method: 'POST' })
+      assertEquals([res.status, (await res.json()).error.code], [status, code])
+    }
+  })
+})

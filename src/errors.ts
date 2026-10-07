@@ -3,11 +3,52 @@
 
 export type ErrorType = 'invalid_request_error' | 'not_found_error' | 'conflict_error' | 'server_error'
 
+/** Every error code the gateway can answer with. README.md documents each (a test checks it). */
+export const ERROR_CODES = [
+  // the request
+  'invalid_request',
+  'unsupported',
+  'invalid_api_key',
+  'previous_response_not_found',
+  'invalid_function_arguments',
+  'invalid_provider_record',
+  'unexpected_reasoning_item',
+  'missing_tool_output',
+  'unexpected_tool_output',
+  'tool_output_too_large',
+  'conversation_busy',
+  'not_found',
+  'response_not_in_progress',
+  'shutting_down',
+  // the response
+  'cancelled',
+  'context_length_exceeded',
+  'upstream_invalid_request',
+  'upstream_authentication_error',
+  'rate_limit_exceeded',
+  'upstream_overloaded',
+  'upstream_error',
+  'upstream_stream_cut',
+  'malformed_model_message',
+  'unexpected_tool',
+  'unexpected_block',
+  'unexpected_control_request',
+  'turn_ended_without_message',
+  'notice_undelivered',
+  'record_incomplete',
+  'claude_code_exited',
+  'claude_code_killed',
+  'claude_code_stdin',
+  'claude_code_error',
+  'internal_error',
+] as const
+export type ErrorCode = typeof ERROR_CODES[number]
+
 export class GatewayError extends Error {
   constructor(
     readonly status: number,
     readonly type: ErrorType,
-    readonly code: string,
+    readonly code: ErrorCode,
     message: string,
     readonly param: string | null = null,
   ) {
@@ -30,7 +71,7 @@ export function unsupported(param: string, message: string): GatewayError {
   return new GatewayError(400, 'invalid_request_error', 'unsupported', message, param)
 }
 
-export function invalid(param: string | null, message: string, code = 'invalid_request'): GatewayError {
+export function invalid(param: string | null, message: string, code: ErrorCode = 'invalid_request'): GatewayError {
   return new GatewayError(400, 'invalid_request_error', code, message, param)
 }
 
@@ -45,7 +86,7 @@ export function previousResponseNotFound(id: string, why: string): GatewayError 
   )
 }
 
-export function serverError(code: string, message: string): GatewayError {
+export function serverError(code: ErrorCode, message: string): GatewayError {
   return new GatewayError(500, 'server_error', code, message)
 }
 

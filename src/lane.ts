@@ -7,7 +7,7 @@ import { type Bridge, type BridgeTarget, McpCallError, StaleEpoch } from './brid
 import { ClaudeProcess, type Frame, processIdentity } from './claude/process.ts'
 import { type LaunchSpec, logPath, MAX_RESULT_CHARS, MCP_PREFIX, mcpConfigJson, projectDir, settingsJson } from './claude/pins.ts'
 import { type Config, paths } from './config.ts'
-import { GatewayError, serverError } from './errors.ts'
+import { type ErrorCode, GatewayError, serverError } from './errors.ts'
 import { type CallRef, digestItems, encodeRecord, encodeThinking, type ProviderRecord } from './records.ts'
 import type { ResponseStore } from './store.ts'
 
@@ -377,7 +377,7 @@ export class Lane implements BridgeTarget {
     if (!a || a.finished || a.state.id !== responseId) return false
     a.finished = true
     a.state.status = 'cancelled'
-    a.state.error = { code: 'cancelled', message: `The response was cancelled (${reason}).` }
+    a.state.error = { code: 'cancelled' satisfies ErrorCode, message: `The response was cancelled (${reason}).` }
     a.sink.send('response.failed', { response: a.state.object() })
     a.sink.close()
     this.active = null

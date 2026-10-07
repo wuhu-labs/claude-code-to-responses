@@ -46,22 +46,36 @@ Claude Code uses whatever login its isolated config dir (`<state-dir>/claude/con
 - Anything else is a `400` with `code: unsupported` and the offending `param`: other tool types, `strict: true`,
   `store: false`, `background`, `max_output_tokens`, `temperature`, `top_p`, non-text output formats, `system` or
   `developer` messages, item references, images outside base64 data URLs, images in notices.
-- `POST /v1/responses/{id}/cancel` cancels a response in progress (`409 response_not_in_progress` otherwise).
+- `POST /v1/responses/{id}/cancel` cancels a response in progress and returns it. An id the gateway never saw is a
+  `404 not_found`; a response that is no longer streaming is a `409 response_not_in_progress`. A cancelled response
+  ends with `response.failed`, status `cancelled`, code `cancelled`, and is not a continuation point: the client goes
+  on from the last completed response.
 - Errors use OpenAI's shape `{"error": {"message", "type", "param", "code"}}`. Before streaming they are HTTP errors;
-  once streaming they end the response with `response.failed`. Codes the client should know:
-  - `previous_response_not_found`: send the full history instead. Also returned when `instructions`, `tools`, `model`
-    or effort changed, which starts a new Claude Code session.
-  - `context_length_exceeded`: Claude Code hit its blocking context limit (auto-compaction is off, so compaction is
-    the client's job).
-  - `missing_tool_output`, `unexpected_tool_output`, `tool_output_too_large` (over 500,000 characters),
-    `invalid_function_arguments` (a history `function_call` whose arguments are not a JSON object),
-    `invalid_provider_record` (a malformed record in the history), `unexpected_reasoning_item`, `conversation_busy`
-    (`409`: another response of the chain is streaming or starting), `cancelled`.
-  - Upstream errors end the response at once (Claude Code's own retries are off, so the client's retry policy is the
-    only one): `upstream_invalid_request` (400), `upstream_authentication_error` (401/403), `rate_limit_exceeded`
-    (429), `upstream_overloaded` (529), `upstream_error` (5xx), `upstream_stream_cut` (an error in mid-stream).
-  - Gateway-side failures: `malformed_model_message` (a tool-use stop without a tool call), `record_incomplete`,
-    `claude_code_exited`, `claude_code_stdin`, `internal_error`.
+  once streaming they end the response with `response.failed`. Every code:
+
+  | Code | When |
+  |---|---|
+  | `invalid_request` | A malformed request (missing `model` or `instructions`, wrong types). |
+  | `unsupported` | A field or value outside the subset (above). |
+  | `invalid_api_key` | `401`: the bearer token is missing or wrong (with `--auth-token-env`). |
+  | `previous_response_not_found` | The id is unknown, or `instructions`, `tools`, `model` or effort changed (a new Claude Code session): send the full history instead. |
+  | `invalid_function_arguments` | A history `function_call` whose arguments are not a JSON object. |
+  | `invalid_provider_record` | A malformed provider record in the history. |
+  | `unexpected_reasoning_item` | A reasoning item next to new input that the gateway did not issue in this conversation. |
+  | `missing_tool_output`, `unexpected_tool_output` | The outputs don't match the calls the conversation waits on. |
+  | `tool_output_too_large` | An output over 500,000 characters (Claude Code would move it to a file). |
+  | `conversation_busy` | `409`: another response of the conversation is streaming or starting. |
+  | `not_found`, `response_not_in_progress` | Cancel of an unknown response, or of one that is no longer streaming. |
+  | `shutting_down` | `503`: the gateway is stopping. |
+  | `cancelled` | The response was cancelled (by the cancel route or a client that went away). |
+  | `context_length_exceeded` | Claude Code hit its blocking context limit; auto-compaction is off, so compaction is the client's job. |
+  | `upstream_invalid_request`, `upstream_authentication_error`, `rate_limit_exceeded`, `upstream_overloaded`, `upstream_error` | The backend answered 400, 401/403, 429, 529 or 5xx. Claude Code's own retries are off: the client's retry policy is the only one. |
+  | `upstream_stream_cut` | The model stream broke mid-message; streamed output cannot be withdrawn. |
+  | `malformed_model_message`, `unexpected_tool`, `unexpected_block` | The model stopped for tool use without a tool call, called a tool that isn't a client tool, or sent a block type the subset doesn't carry. |
+  | `turn_ended_without_message`, `notice_undelivered`, `record_incomplete` | Claude Code ended a turn without a model message, called tools again before staged notices could go in, or did not log what it streamed. |
+  | `unexpected_control_request` | Claude Code asked the host something (a permission prompt) it should never need. |
+  | `claude_code_exited`, `claude_code_killed`, `claude_code_stdin`, `claude_code_error` | The process exited, was killed, could not be written to, or ended the turn with an error of its own. |
+  | `internal_error` | A bug in the gateway; the process is killed and the next request rebuilds. |
 - Events are the standard streaming events: `response.created`, `response.in_progress`, `response.output_item.added`
   / `.done`, `response.content_part.added` / `.done`, `response.output_text.delta` / `.done`,
   `response.reasoning_text.delta` / `.done`, `response.function_call_arguments.delta` / `.done`, and one final
