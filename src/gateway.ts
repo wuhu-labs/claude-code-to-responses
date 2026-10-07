@@ -232,7 +232,7 @@ export class Gateway {
   }
 
   /** The tool results plus one user text: the notices that came with the outputs, else a fixed line. */
-  private interruptedEntries(ctx: LogContext, log: string[], head: Head, d: Extract<Delivery, { kind: 'outputs' }>, tools: FnTool[]): string[] {
+  private interruptedEntries(ctx: LogContext, log: string[], head: Head, d: Extract<Delivery, { kind: 'outputs' }>, tools: FnTool[] | null): string[] {
     const out = resultEntries(ctx, log, head.calls, d.outputs, tools)
     out.push(JSON.stringify(userTextEntry(ctx, d.notices ?? RESUME_LINE)))
     return out
@@ -303,7 +303,8 @@ export class Gateway {
           // a fresh session logs this latch after its first message; a resumed one missing it writes it outside the mirror
           if (i === 0 && used.length === 0) extra.push(JSON.stringify({ type: 'atis-latch', atis: '', sessionId }))
         } else {
-          extra.push(...resultEntries(ctx, [...log, ...tailLines, ...extra], calls, d.outputs, chain.tools))
+          // completed calls: their outputs are history, whatever tools this request offers
+          extra.push(...resultEntries(ctx, [...log, ...tailLines, ...extra], calls, d.outputs, null))
           if (d.notices !== null) extra.push(JSON.stringify(userTextEntry(ctx, d.notices)))
         }
         const a = assistantEntries(ctx, g.outputs, chain.model)
@@ -334,7 +335,8 @@ export class Gateway {
       spawn = { resume: true, interruptedTurn: false, log, attempt: extra }
     } else {
       const all = [...log, ...tailLines, ...extra]
-      const r7 = this.interruptedEntries(contextOf(all, sessionId, workDir), all, head, delivery, chain.tools)
+      // calls Claude Code made (the head of the records) may be ones it answers itself; synthesized ones never are
+      const r7 = this.interruptedEntries(contextOf(all, sessionId, workDir), all, head, delivery, synth.length ? null : chain.tools)
       spawn = { resume: true, interruptedTurn: true, log, attempt: [...extra, ...r7] }
     }
     state.gateway = {
@@ -349,17 +351,18 @@ export class Gateway {
 }
 
 /**
- * Tool results for a log that stops at tool calls, in call order: the client's output for each, except that a call
- * of a tool the chain doesn't define gets Claude Code's own error (as on the live path), and a call the log already
- * answers gets nothing more.
+ * Tool results for a log that stops at tool calls, in call order: the client's output for each; a call the log already
+ * answers gets nothing more. `tools` is given only for outstanding calls Claude Code itself made in this chain: one of a
+ * tool the chain doesn't define gets Claude Code's own error, as on the live path. Completed calls from a history
+ * (`tools` null) always keep the client's outputs: a tool missing from this request changes nothing about them.
  */
-function resultEntries(ctx: LogContext, log: string[], calls: CallRef[], outputs: Map<string, Part[]>, tools: FnTool[]): string[] {
-  const names = new Set(tools.map((t) => t.name))
+function resultEntries(ctx: LogContext, log: string[], calls: CallRef[], outputs: Map<string, Part[]>, tools: FnTool[] | null): string[] {
+  const names = tools ? new Set(tools.map((t) => t.name)) : null
   const out: string[] = []
   for (const c of calls) {
     const all = [...log, ...out]
     if (hasToolResult(all, c.id)) continue
-    const entry = names.has(c.name)
+    const entry = names === null || names.has(c.name)
       ? toolResultEntry(ctx, c.id, outputs.get(c.id)!, assistantUuidFor(all, c.id))
       : unknownToolEntry(ctx, c.id, MCP_PREFIX + c.name, assistantUuidFor(all, c.id))
     out.push(JSON.stringify(entry))

@@ -531,3 +531,19 @@ Deno.test('off loopback the gateway refuses to start without a token; with one, 
     assertEquals(run.drv.text(await run.turn('hello')), 'authorized')
   }, false)
 })
+
+Deno.test('a completed call keeps its real output in a rebuilt history, even when the next request drops its tool', async () => {
+  const run = new Run('tool-dropped', false)
+  await run.run(async () => {
+    run.fake.reply({ blocks: [call('toolu_read', 'read', { name: 'notes' })] }, { blocks: [text('read it')] })
+    await run.turn('read the notes')
+    // the next request offers only echo: a new chain, so the full history goes in, synthesized
+    run.drv.opts.tools = TOOLS.filter((t) => t.name === 'echo')
+    run.fake.reply({ blocks: [text('fine')] })
+    const r = await run.send([user('what did the notes say?')])
+    assertEquals([r.status, r.response.x_gateway.path, r.response.x_gateway.records], ['completed', 'history', 0])
+    const sent = JSON.stringify(run.fake.main().at(-1)!.body.messages)
+    assertStringIncludes(sent, 'CONTENT OF notes')
+    assert(!sent.includes('No such tool available'))
+  })
+})
