@@ -1,5 +1,5 @@
 // Regression tests for the M1 review findings.
-import { assert, assertEquals, assertRejects, assertThrows } from '@std/assert'
+import { assert, assertEquals, assertRejects, assertStringIncludes, assertThrows } from '@std/assert'
 import { decodeRecord, encodeRecord } from '../src/records.ts'
 import { parseRequest } from '../src/api/request.ts'
 import { call, type Json, text, think } from './fake.ts'
@@ -407,3 +407,31 @@ Deno.test('upstream errors map to typed failures, at once: the client owns retri
     assertEquals((await run.send([user('and now it works')])).status, 'completed')
   })
 })
+
+for (const unknownFirst of [false, true]) {
+  Deno.test(`a call of an undefined tool gets Claude Code's own error after a hold eviction too (unknown ${unknownFirst ? 'first' : 'last'})`, async () => {
+    const calls = [call('toolu_k', 'echo', { text: 'k' }), call('toolu_u', 'nonexistent', { q: 1 })]
+    if (unknownFirst) calls.reverse()
+    const results: Json[][] = []
+    for (const evict of [false, true]) {
+      const run = new Run(`unknown-${evict ? 'evicted' : 'live'}`, false)
+      await run.run(async () => {
+        run.fake.reply({ blocks: calls }, { blocks: [text('after')] })
+        await run.send([user('go')])
+        await run.tg.waitEvent('hold')
+        if (evict) await run.disrupt('hold')
+        const r = await run.send([output('toolu_k', 'K'), output('toolu_u', 'the client had no such tool')])
+        assertEquals(r.status, 'completed')
+        if (evict) assertEquals(r.response.x_gateway.resume, 'interrupted_turn')
+        const msgs = run.fake.main()[1].body.messages
+        results.push(msgs.flatMap((m: Json) => Array.isArray(m.content) ? m.content.filter((b: Json) => b.type === 'tool_result') : []))
+      })
+    }
+    const [live, evicted] = results
+    const byId = (rs: Json[]) => Object.fromEntries(rs.map(({ cache_control: _c, ...b }) => [b.tool_use_id, JSON.stringify(b)]))
+    assertEquals(evicted.length, 2, 'one result per call')
+    assertEquals(byId(evicted), byId(live))
+    assert(!JSON.stringify(evicted).includes('the client had no such tool'))
+    assertStringIncludes(byId(evicted).toolu_u, 'No such tool available: mcp__fn__nonexistent')
+  })
+}

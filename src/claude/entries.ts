@@ -70,6 +70,26 @@ export function toolResultEntry(ctx: LogContext, callId: string, parts: Part[], 
   })
 }
 
+/**
+ * Claude Code's own answer to a call of a tool it doesn't have, as 2.1.284 logs it the moment the call streams in.
+ * The client's output for such a call never reaches the model, on the live path or after a rebuild.
+ */
+export function unknownToolEntry(ctx: LogContext, callId: string, mcpName: string, assistantUuid: string | null): Json {
+  const error = `Error: No such tool available: ${mcpName}`
+  return base(ctx, {
+    ...(ctx.promptId ? { promptId: ctx.promptId } : {}),
+    type: 'user',
+    message: { role: 'user', content: [{ type: 'tool_result', content: `<tool_use_error>${error}</tool_use_error>`, is_error: true, tool_use_id: callId }] },
+    toolUseResult: error,
+    ...(assistantUuid ? { sourceToolAssistantUUID: assistantUuid } : {}),
+  })
+}
+
+/** Whether the log already answers a tool call (Claude Code answers calls of unknown tools by itself). */
+export function hasToolResult(lines: string[], callId: string): boolean {
+  return lines.some((l) => l.includes(callId) && l.includes('"tool_result"') && l.includes(`"tool_use_id":"${callId}"`))
+}
+
 /** A plain (non-meta) user text entry: what the interrupted-turn resume sends after the tool results. */
 export function userTextEntry(ctx: LogContext, text: string): Json {
   return base(ctx, {

@@ -1,15 +1,25 @@
 // Routes each Responses request to a lane: the live process when it sits at the previous response, otherwise a
 // process rebuilt from the response store or from the client's history and the provider records it carries.
-import type { InItem, NormRequest, Part } from './api/request.ts'
+import type { FnTool, InItem, NormRequest, Part } from './api/request.ts'
 import { ResponseState, SseSink } from './api/stream.ts'
 import { Bridge } from './bridge.ts'
-import { assistantEntries, assistantUuidFor, contextOf, type LogContext, toolResultEntry, userMessageEntry, userTextEntry } from './claude/entries.ts'
-import { CLAUDE_CODE_VERSION, RESUME_LINE } from './claude/pins.ts'
+import {
+  assistantEntries,
+  assistantUuidFor,
+  contextOf,
+  hasToolResult,
+  type LogContext,
+  toolResultEntry,
+  unknownToolEntry,
+  userMessageEntry,
+  userTextEntry,
+} from './claude/entries.ts'
+import { CLAUDE_CODE_VERSION, MCP_PREFIX, RESUME_LINE } from './claude/pins.ts'
 import { claudeVersion } from './claude/process.ts'
 import { type Config, paths } from './config.ts'
 import { GatewayError, invalid, previousResponseNotFound, unsupported } from './errors.ts'
 import { Active, type ChainSpec, type Head, Lane, MAX_RESULT_CHARS, outputChars } from './lane.ts'
-import { decodeRecord, decodeThinking, digestItems, type ProviderRecord, RecordError, sha256, THINKING_PREFIX } from './records.ts'
+import { type CallRef, decodeRecord, decodeThinking, digestItems, type ProviderRecord, RecordError, sha256, THINKING_PREFIX } from './records.ts'
 import { ResponseStore } from './store.ts'
 
 // deno-lint-ignore no-explicit-any
@@ -216,14 +226,13 @@ export class Gateway {
   private resumePlan(lane: Lane, log: string[], head: Head, delivery: Delivery) {
     if (delivery.kind === 'turn') return { resume: true, interruptedTurn: false, log, attempt: [] }
     const before = [...log, ...lane.pending]
-    const attempt = this.interruptedEntries(contextOf(before, lane.sessionId, lane.workDir), before, head, delivery)
+    const attempt = this.interruptedEntries(contextOf(before, lane.sessionId, lane.workDir), before, head, delivery, lane.chain.tools)
     return { resume: true, interruptedTurn: true, log, attempt }
   }
 
   /** The tool results plus one user text: the notices that came with the outputs, else a fixed line. */
-  private interruptedEntries(ctx: LogContext, log: string[], head: Head, d: Extract<Delivery, { kind: 'outputs' }>): string[] {
-    const out: string[] = []
-    for (const c of head.calls) out.push(JSON.stringify(toolResultEntry(ctx, c.id, d.outputs.get(c.id)!, assistantUuidFor(log, c.id))))
+  private interruptedEntries(ctx: LogContext, log: string[], head: Head, d: Extract<Delivery, { kind: 'outputs' }>, tools: FnTool[]): string[] {
+    const out = resultEntries(ctx, log, head.calls, d.outputs, tools)
     out.push(JSON.stringify(userTextEntry(ctx, d.notices ?? RESUME_LINE)))
     return out
   }
@@ -293,8 +302,7 @@ export class Gateway {
           // a fresh session logs this latch after its first message; a resumed one missing it writes it outside the mirror
           if (i === 0 && used.length === 0) extra.push(JSON.stringify({ type: 'atis-latch', atis: '', sessionId }))
         } else {
-          const all = [...log, ...tailLines, ...extra]
-          for (const c of calls) extra.push(JSON.stringify(toolResultEntry(ctx, c.id, d.outputs.get(c.id)!, assistantUuidFor(all, c.id))))
+          extra.push(...resultEntries(ctx, [...log, ...tailLines, ...extra], calls, d.outputs, chain.tools))
           if (d.notices !== null) extra.push(JSON.stringify(userTextEntry(ctx, d.notices)))
         }
         const a = assistantEntries(ctx, g.outputs, chain.model)
@@ -325,7 +333,7 @@ export class Gateway {
       spawn = { resume: true, interruptedTurn: false, log, attempt: extra }
     } else {
       const all = [...log, ...tailLines, ...extra]
-      const r7 = this.interruptedEntries(contextOf(all, sessionId, workDir), all, head, delivery)
+      const r7 = this.interruptedEntries(contextOf(all, sessionId, workDir), all, head, delivery, chain.tools)
       spawn = { resume: true, interruptedTurn: true, log, attempt: [...extra, ...r7] }
     }
     state.gateway = {
@@ -337,6 +345,25 @@ export class Gateway {
     }
     return { lane, delivery: spawn.interruptedTurn ? null : delivery, prevId: headId, covered, spawn }
   }
+}
+
+/**
+ * Tool results for a log that stops at tool calls, in call order: the client's output for each, except that a call
+ * of a tool the chain doesn't define gets Claude Code's own error (as on the live path), and a call the log already
+ * answers gets nothing more.
+ */
+function resultEntries(ctx: LogContext, log: string[], calls: CallRef[], outputs: Map<string, Part[]>, tools: FnTool[]): string[] {
+  const names = new Set(tools.map((t) => t.name))
+  const out: string[] = []
+  for (const c of calls) {
+    const all = [...log, ...out]
+    if (hasToolResult(all, c.id)) continue
+    const entry = names.has(c.name)
+      ? toolResultEntry(ctx, c.id, outputs.get(c.id)!, assistantUuidFor(all, c.id))
+      : unknownToolEntry(ctx, c.id, MCP_PREFIX + c.name, assistantUuidFor(all, c.id))
+    out.push(JSON.stringify(entry))
+  }
+  return out
 }
 
 interface Reservation {
