@@ -296,8 +296,8 @@ export class Gateway {
       for (let i = 0; i < synth.length; i++) {
         const g = synth[i]
         const d = i === 0 && used.length === 0
-          ? deliveryFor(null, g.inputs)
-          : deliveryFor({ responseId: '', end: calls.length ? 'calls' : 'turn', calls }, g.inputs)
+          ? deliveryFor(null, g.inputs, false)
+          : deliveryFor({ responseId: '', end: calls.length ? 'calls' : 'turn', calls }, g.inputs, false)
         if (d.kind === 'turn') {
           extra.push(JSON.stringify(userMessageEntry(ctx, d.parts)))
           // a fresh session logs this latch after its first message; a resumed one missing it writes it outside the mirror
@@ -445,8 +445,11 @@ export function segment(items: InItem[]): { groups: Group[]; tail: InItem[] } {
   return { groups, tail: cur.inputs }
 }
 
-/** What the new input asks of Claude Code given where its log stops. */
-function deliveryFor(head: Head | null, input: InItem[]): Delivery {
+/**
+ * What the new input asks of Claude Code given where its log stops. A new turn must carry something (`isNew`; a
+ * history being rebuilt is taken as it is): an empty one would be a billed turn that answers nothing.
+ */
+function deliveryFor(head: Head | null, input: InItem[], isNew = true): Delivery {
   if (head === null || head.end === 'turn') {
     const parts: Part[] = []
     input.forEach((it, i) => {
@@ -454,6 +457,9 @@ function deliveryFor(head: Head | null, input: InItem[]): Delivery {
       if (it.kind !== 'message' || it.role !== 'user') throw invalid(`input[${i}]`, 'New input must be user messages here.')
       parts.push(...it.parts)
     })
+    if (isNew && !parts.some((p) => p.type === 'image' || p.text.trim() !== '')) {
+      throw invalid('input', 'There is nothing new to respond to: the new input carries no content.')
+    }
     return { kind: 'turn', parts }
   }
   const outputs = new Map<string, Part[]>()

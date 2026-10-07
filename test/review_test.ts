@@ -606,3 +606,19 @@ Deno.test('the record timeout never covers the end-of-turn hook round trip or a 
     assertEquals(run.drv.text(r), 'first part and the rest')
   })
 })
+
+Deno.test('input with nothing new in it is refused, not sent as an empty turn', async () => {
+  const run = new Run('nothing-new', false)
+  await run.run(async () => {
+    run.fake.reply({ blocks: [think('p'), text('one')] })
+    const r1 = await run.turn('one')
+    const mine = r1.response.output.filter((o: Json) => o.type === 'reasoning')
+    const base = { model: MODEL, instructions: INSTRUCTIONS, tools: TOOLS, stream: true, previous_response_id: r1.response.id }
+    for (const input of [mine, [{ role: 'user', content: '' }], [{ role: 'user', content: [] }], [{ role: 'user', content: '   ' }]]) {
+      const r = await post(run.tg.url, { ...base, input })
+      assertEquals([r.status, r.body?.error?.code], [400, 'invalid_request'], JSON.stringify(input).slice(0, 80))
+      assertStringIncludes(r.body.error.message, 'nothing new')
+    }
+    assertEquals(run.fake.main().length, 1)
+  })
+})
