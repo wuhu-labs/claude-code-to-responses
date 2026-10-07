@@ -133,8 +133,8 @@ response is attached, so simultaneous requests never rebuild it twice. The next 
 ## Claude Code pins (measured on 2.1.284)
 
 Every pin in this table is asserted by the per-release probe (`deno task probe`, `probe/probe_test.ts`), most of them
-paired with a run that drops the pin to show its effect; two more variables are set without being verified (below the
-table). The source of truth is `src/claude/pins.ts`.
+paired with a run that drops the pin to show its effect; three more variables are set without being verified (below
+the table). The source of truth is `src/claude/pins.ts`.
 
 | Flag or variable | Value | Why | Probe |
 |---|---|---|---|
@@ -153,16 +153,19 @@ table). The source of truth is `src/claude/pins.ts`.
 | MCP tool `_meta["anthropic/maxResultSizeChars"]` | `500000` | Results up to 500,000 characters stay inline, never moved to a file (the gateway refuses longer outputs) | anthropic/maxResultSizeChars … (paired) |
 | `HOME`, `CLAUDE_CONFIG_DIR` | `<state-dir>/claude/{home,config}` | Isolation; logs live in the config dir | headless … |
 | `TZ` | `--tz` | Decides the date Claude Code announces | TZ decides the date … |
-| `PATH` | `/usr/bin:/bin` | The environment is otherwise cleared | |
 | `ENABLE_TOOL_SEARCH` | `false` | MCP tools load eagerly, in every request | ENABLE_TOOL_SEARCH=false … (paired with `true`) |
 | `DISABLE_AUTO_COMPACT` | `1` | The client is the only compactor; at the limit the turn ends as `blocking_limit` | DISABLE_AUTO_COMPACT=1 … (paired) |
 | `CLAUDE_CODE_TOTAL_TOKENS_REMINDER` | `off` | No usage-dependent `<total_tokens>` lines in the prompt | CLAUDE_CODE_TOTAL_TOKENS_REMINDER=off … (paired) |
 | `CLAUDE_CODE_SILENT_TURN_REMINDER` | `0` | No "The user hasn't heard from you in a while" after silent tool rounds | CLAUDE_CODE_SILENT_TURN_REMINDER=0 … (paired) |
-| `MAX_MCP_OUTPUT_TOKENS` | `1000000` | Backstop against truncating a result the gateway accepted | anthropic/maxResultSizeChars … |
+| `MAX_MCP_OUTPUT_TOKENS` | `1000000` | Lifts Claude Code's 25,000-token cap on MCP results. With the size annotation a 500,000-character result stays inline even without it, so it is a backstop | MAX_MCP_OUTPUT_TOKENS … (paired, without the annotation) |
 | `CLAUDE_CODE_RESUME_INTERRUPTED_TURN` | `1` on the held-call resume only | Resumes the turn from tool results + user text with nothing foreign | CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1 … (paired) |
 | `CLAUDE_CODE_MAX_RETRIES` | `0` | An upstream error ends the turn at once as `terminal_reason: api_error` with `api_error_status`; the client owns retries | CLAUDE_CODE_MAX_RETRIES=0 … (paired: unset retries) |
 
 Set but **not verified** by the probe:
+
+- `PATH=/usr/bin:/bin`, so any helper Claude Code starts finds the system tools; the rest of the environment is
+  cleared. Nothing the gateway uses spawns one (no native tools; hooks and MCP are HTTP), and with `PATH` unset the
+  model sees the same prompt (measured), so there is no effect to assert.
 
 - `DISABLE_AUTOUPDATER=1`. In 2.1.284 the updater fetches from a fixed `https://downloads.claude.ai/claude-code-releases`
   that no flag or variable redirects, so no test can offer it an update without letting Claude Code reach Anthropic.
@@ -170,7 +173,7 @@ Set but **not verified** by the probe:
   the conversation's own and one `GET /api/hello`); what it turns off in 2.1.284 (telemetry, the model catalog and
   plugin downloads from fixed Anthropic hosts, and auto-updates as well) never goes to `ANTHROPIC_BASE_URL`.
 
-Both are hygiene only; nothing in the gateway depends on them.
+All three are hygiene only; nothing in the gateway depends on them.
 
 Claude Code internals the gateway also relies on, asserted by the probe: the log a process mirrored resumes into a
 byte-identical request (`a log rebuilt from the mirrored entries …`), and a resumed log missing the `atis-latch` line

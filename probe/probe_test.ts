@@ -266,6 +266,31 @@ probe('CLAUDE_CODE_MAX_RETRIES=0 and the error result: an upstream error ends th
   assertEquals(retry.error_status, 529)
 })
 
+probe(
+  'MAX_MCP_OUTPUT_TOKENS lifts the 25,000-token cap on MCP results (paired, without the size annotation); with the annotation it is a backstop only',
+  async (p, fake) => {
+    const big = (label: string, meta: boolean, env: Record<string, string | undefined>, size: number) => {
+      const t = new ProbeTarget(['echo'])
+      t.withMeta = meta
+      t.resultFor = () => ({ content: [{ type: 'text', text: 'r'.repeat(size) }] })
+      fake.reply({ blocks: [call(`toolu_${label.replace(/\W/g, '')}`, 'echo', {})] }, { blocks: [text('done')] })
+      return p.launch({ name: label, fake, target: t, env }).turn('go', 60000).then(() =>
+        fake.main().at(-1)!.body.messages.at(-1).content.find((b: Json) => b.type === 'tool_result')
+      )
+    }
+    // without the annotation: unset, the token cap refuses the result; set, it passes the cap (and the size limit applies)
+    const capped = JSON.stringify(await big('cap-unset', false, { MAX_MCP_OUTPUT_TOKENS: undefined }, 120_000))
+    assertStringIncludes(capped, 'exceeds maximum allowed tokens')
+    const lifted = JSON.stringify(await big('cap-set', false, {}, 120_000))
+    assert(!lifted.includes('exceeds maximum allowed tokens'))
+    assertStringIncludes(lifted, '<persisted-output>')
+    // with the annotation a 500,000-character result stays inline either way
+    for (const [label, env] of [['annotated-set', {}], ['annotated-unset', { MAX_MCP_OUTPUT_TOKENS: undefined }]] as const) {
+      assertEquals((await big(label, true, env, 500_000)).content[0].text.length, 500_000, label)
+    }
+  },
+)
+
 probe('a log rebuilt from the mirrored entries resumes into a byte-identical request', async (p, fake) => {
   const work = '/tmp/cc2r-probe/rebuild'
   const script = () => {
