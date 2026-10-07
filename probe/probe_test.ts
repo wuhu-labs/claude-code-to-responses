@@ -113,35 +113,68 @@ probe('--tools "": no native tools, no Skill tool (paired with --tools default)'
   assert(native.includes('Read') && native.length > 2, native.join(','))
 })
 
-probe('--setting-sources "" and --strict-mcp-config: planted settings, hooks and MCP servers are ignored (paired)', async (p, fake) => {
-  const marker = `${p.root}/planted-hook-ran`
-  const work = `/tmp/cc2r-probe/planted`
+probe('--setting-sources "": planted user and project settings (Stop hooks) are ignored (paired: dropping the flag runs them)', async (p, fake) => {
+  const userMarker = `${p.root}/user-hook-ran`, projectMarker = `${p.root}/project-hook-ran`
+  const work = `/tmp/cc2r-probe/planted-settings`
   Deno.mkdirSync(`${work}/.claude`, { recursive: true })
   Deno.mkdirSync(`${p.root}/config`, { recursive: true })
-  const hook = { hooks: { Stop: [{ hooks: [{ type: 'command', command: `/usr/bin/touch ${marker}` }] }] } }
-  Deno.writeTextFileSync(`${p.root}/config/settings.json`, JSON.stringify(hook))
-  Deno.writeTextFileSync(`${work}/.claude/settings.json`, JSON.stringify(hook))
-  Deno.writeTextFileSync(`${work}/.mcp.json`, JSON.stringify({ mcpServers: { planted: { type: 'stdio', command: '/usr/bin/true' } } }))
-  try {
-    fake.reply({ blocks: [text('a')] }, { blocks: [text('b')] })
-    const r1 = p.launch({ name: 'planted-pinned', fake, target: new ProbeTarget(), workDir: work })
-    await r1.turn('x')
-    await new Promise((res) => setTimeout(res, 300))
-    assert(!exists(marker), 'planted hook did not run')
-    assertEquals(r1.frames.find((f) => f.subtype === 'init').mcp_servers.map((s: Json) => s.name), ['fn'])
-    const r2 = p.launch({
-      name: 'planted-open',
-      fake,
-      target: new ProbeTarget(),
-      workDir: work,
-      args: (a) => without('--strict-mcp-config', false)(without('--setting-sources')(a)),
-    })
-    await r2.turn('x')
-    await new Promise((res) => setTimeout(res, 500))
-    assert(exists(marker), 'without the pins the planted Stop hook runs')
-  } finally {
-    Deno.removeSync(`${p.root}/config/settings.json`)
-  }
+  const hook = (marker: string) => JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: `/usr/bin/touch ${marker}` }] }] } })
+  Deno.writeTextFileSync(`${p.root}/config/settings.json`, hook(userMarker))
+  Deno.writeTextFileSync(`${work}/.claude/settings.json`, hook(projectMarker))
+  fake.reply({ blocks: [text('a')] }, { blocks: [text('b')] })
+  await p.launch({ name: 'settings-pinned', fake, target: new ProbeTarget(), workDir: work }).turn('x')
+  await new Promise((res) => setTimeout(res, 300))
+  assert(!exists(userMarker) && !exists(projectMarker), 'no planted hook ran')
+  await p.launch({ name: 'settings-open', fake, target: new ProbeTarget(), workDir: work, args: without('--setting-sources') }).turn('x')
+  await new Promise((res) => setTimeout(res, 500))
+  assert(exists(userMarker), 'without the flag the user settings hook runs')
+  assert(exists(projectMarker), 'without the flag the project settings hook runs')
+})
+
+/** Plants an approved, observable MCP server in user scope (.claude.json) and project scope (.mcp.json). */
+function plantMcp(p: Probe, work: string) {
+  p.bridge.register('ep_planted', new ProbeTarget(['planted_tool']))
+  const server = { type: 'http', url: p.bridge.mcpUrl('ep_planted'), headers: { Authorization: `Bearer ${p.bridge.bearer}` } }
+  Deno.mkdirSync(`${p.root}/config`, { recursive: true })
+  Deno.mkdirSync(work, { recursive: true })
+  Deno.writeTextFileSync(`${p.root}/config/.claude.json`, JSON.stringify({ mcpServers: { planted: server } }))
+  Deno.writeTextFileSync(`${work}/.mcp.json`, JSON.stringify({ mcpServers: { plantedproj: server } }))
+}
+const plantedTools = (b: Json) => toolNames(b).filter((n: string) => n.includes('planted'))
+
+probe('--strict-mcp-config: with settings open, planted user and project MCP servers are ignored (paired: dropping the flag loads them)', async (p, fake) => {
+  const work = '/tmp/cc2r-probe/planted-mcp-strict'
+  plantMcp(p, work)
+  fake.reply({ blocks: [text('a')] }, { blocks: [text('b')] })
+  const strict = p.launch({ name: 'mcp-strict', fake, target: new ProbeTarget(), workDir: work, args: without('--setting-sources') })
+  await strict.turn('x')
+  assertEquals(strict.frames.find((f) => f.subtype === 'init').mcp_servers.map((s: Json) => s.name), ['fn'])
+  assertEquals(plantedTools(fake.main()[0].body), [])
+  const open = p.launch({
+    name: 'mcp-open',
+    fake,
+    target: new ProbeTarget(),
+    workDir: work,
+    args: (a) => without('--strict-mcp-config', false)(without('--setting-sources')(a)),
+  })
+  await open.turn('x')
+  assertEquals(plantedTools(fake.main()[1].body), ['mcp__planted__planted_tool', 'mcp__plantedproj__planted_tool'])
+})
+
+probe('--setting-sources "" keeps planted MCP servers out on its own too (paired, with --strict-mcp-config dropped)', async (p, fake) => {
+  const work = '/tmp/cc2r-probe/planted-mcp-sources'
+  plantMcp(p, work)
+  fake.reply({ blocks: [text('a')] }, { blocks: [text('b')] })
+  await p.launch({ name: 'mcp-sources-pinned', fake, target: new ProbeTarget(), workDir: work, args: without('--strict-mcp-config', false) }).turn('x')
+  assertEquals(plantedTools(fake.main()[0].body), [])
+  await p.launch({
+    name: 'mcp-sources-open',
+    fake,
+    target: new ProbeTarget(),
+    workDir: work,
+    args: (a) => without('--strict-mcp-config', false)(without('--setting-sources')(a)),
+  }).turn('x')
+  assertEquals(plantedTools(fake.main()[1].body).length, 2)
 })
 
 function exists(p: string) {
