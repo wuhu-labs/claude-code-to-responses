@@ -165,8 +165,16 @@ export class Lane implements BridgeTarget {
     this.turnOpen = opts.interruptedTurn
     // the interrupted-turn resume starts the active response's turn by itself
     if (opts.interruptedTurn && this.active) this.active.ownsTurn = true
-    this.proc = new ClaudeProcess(spec, (f) => this.onFrame(f), (s) => this.onExit(epoch, s))
+    this.proc = new ClaudeProcess(spec, (f) => this.onFrame(f), (s) => this.onExit(epoch, s), (e) => this.onFrameError(e))
     this.events.note('spawn', { session: this.sessionId, pid: this.proc.pid, epoch, resume: opts.resume, interruptedTurn: opts.interruptedTurn })
+  }
+
+  /** A bug in handling Claude Code's output: the response fails visibly and the process goes. */
+  private onFrameError(e: unknown): void {
+    const message = e instanceof Error ? e.message : String(e)
+    this.events.note('frame_error', { session: this.sessionId, message })
+    this.fail(serverError('internal_error', `The gateway failed on Claude Code's output: ${message}`))
+    void this.kill('frame_error')
   }
 
   private onExit(epoch: string, s: Deno.CommandStatus): void {
@@ -212,7 +220,11 @@ export class Lane implements BridgeTarget {
     const proc = this.proc
     if (proc) await proc.kill()
     this.events.note('kill', { session: this.sessionId, pid: proc?.pid, reason })
-    if (this.active && !this.active.finished) this.fail(serverError('claude_code_killed', `Claude Code was killed (${reason}).`))
+    // a response still open when its process goes always ends, even one caught between finishing and completing
+    if (this.active && this.active.state.status === 'in_progress') {
+      this.active.finished = false
+      this.fail(serverError('claude_code_killed', `Claude Code was killed (${reason}).`))
+    }
     try {
       Deno.removeSync(this.runDir, { recursive: true })
     } catch { /* gone */ }
@@ -605,6 +617,10 @@ export class Lane implements BridgeTarget {
     const m = this.mirrored.get(msg.id)
     for (const i of msg.blocks.keys()) if (!m?.indexes.has(i)) return
     const calls = msg.stopReason === 'tool_use'
+    const callBlocks = [...msg.blocks.values()].filter((b) => b.type === 'tool_use')
+    if (calls && (callBlocks.length === 0 || !m)) {
+      return this.fail(serverError('malformed_model_message', 'The model stopped for tool use without calling a tool.'))
+    }
     if (!calls && (this.staged || this.continuing)) return // notices go in at the end-of-turn hook; inference goes on
     if (!calls && !a.turnEnded) return
     if (calls && this.staged) return this.fail(serverError('notice_undelivered', 'The model called tools again before the notices could be delivered.'))
@@ -615,9 +631,7 @@ export class Lane implements BridgeTarget {
     const entries = this.pending.slice(0, cut)
     this.pending = this.pending.slice(cut)
     this.mirrored.clear()
-    const callRefs: CallRef[] = calls
-      ? [...msg.blocks.values()].filter((b) => b.type === 'tool_use').map((b) => ({ id: b.item.call_id, name: b.item.name }))
-      : []
+    const callRefs: CallRef[] = calls ? callBlocks.map((b) => ({ id: b.item.call_id, name: b.item.name })) : []
     void this.complete(a, calls ? 'calls' : 'turn', callRefs, entries, msg.stopReason!)
   }
 

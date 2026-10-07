@@ -12,7 +12,8 @@ export class ClaudeProcess {
   private stderrTail = ''
   private killed = false
 
-  constructor(spec: LaunchSpec, onFrame: (f: Frame) => void, onExit: (s: Deno.CommandStatus) => void) {
+  /** `onError` gets every exception a frame handler throws: none is swallowed. */
+  constructor(spec: LaunchSpec, onFrame: (f: Frame) => void, onExit: (s: Deno.CommandStatus) => void, onError: (e: unknown) => void) {
     this.child = new Deno.Command(spec.binary, {
       args: launchArgs(spec),
       env: launchEnv(spec),
@@ -24,7 +25,7 @@ export class ClaudeProcess {
     }).spawn()
     this.pid = this.child.pid
     this.stdin = this.child.stdin.getWriter()
-    const out = this.readOut(onFrame)
+    const out = this.readOut(onFrame, onError)
     const err = this.readErr()
     this.exited = this.child.status.then(async (s) => {
       await Promise.allSettled([out, err])
@@ -51,7 +52,7 @@ export class ClaudeProcess {
     return this.exited
   }
 
-  private async readOut(onFrame: (f: Frame) => void) {
+  private async readOut(onFrame: (f: Frame) => void, onError: (e: unknown) => void) {
     for await (const line of lines(this.child.stdout)) {
       let f: Frame
       try {
@@ -62,7 +63,7 @@ export class ClaudeProcess {
       try {
         onFrame(f)
       } catch (e) {
-        console.error('frame handler failed', e)
+        onError(e)
       }
     }
   }

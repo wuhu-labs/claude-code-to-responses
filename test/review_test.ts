@@ -301,3 +301,44 @@ Deno.test('an end-of-turn continuation may stream longer than the record timeout
     assertEquals(run.drv.text(r), 'first partsecond part streams slowly')
   })
 })
+
+Deno.test('a model message that stops for tool use without calling one fails the response; the chain goes on', async () => {
+  const run = new Run('zero-blocks', false, { recordTimeoutMs: 3000 })
+  await run.run(async () => {
+    run.fake.reply({ blocks: [text('one')] }, { blocks: [], stop: 'tool_use' }, { blocks: [text('fine')] })
+    await run.turn('one')
+    const r = await run.send([user('two')])
+    assertEquals([r.status, r.response.error.code], ['failed', 'malformed_model_message'])
+    const r2 = await run.send([user('two again')])
+    assertEquals(r2.status, 'completed')
+    assertEquals(run.drv.text(r2), 'fine')
+  })
+})
+
+Deno.test('an exception while handling Claude Code output fails the response visibly, never silently', async () => {
+  const run = new Run('frame-error', false)
+  await run.run(async () => {
+    run.fake.reply({ blocks: [text('one')] }, { blocks: [text('boom')] }, { blocks: [text('fine')] })
+    await run.turn('one')
+    const lane = [...run.tg.gw.lanes.values()][0] as unknown as { streamEvent: () => void }
+    lane.streamEvent = () => {
+      throw new Error('injected bug')
+    }
+    const r = await run.send([user('two')])
+    assertEquals([r.status, r.response.error.code], ['failed', 'internal_error'])
+    assert(run.tg.events('frame_error').length > 0)
+    const r2 = await run.send([user('two again')])
+    assertEquals(r2.status, 'completed')
+  })
+})
+
+Deno.test('an empty model message that ends the turn completes; what Claude Code does next stays in the response', async () => {
+  const run = new Run('empty-turn', false, { recordTimeoutMs: 3000 })
+  await run.run(async () => {
+    run.fake.reply({ blocks: [] }, { blocks: [text('after the empty one')] })
+    const r = await run.send([user('one')])
+    assertEquals(r.status, 'completed')
+    assertEquals(run.drv.text(r), 'after the empty one')
+    assertEquals(run.tg.events('unowned_inference').length, 0)
+  })
+})
