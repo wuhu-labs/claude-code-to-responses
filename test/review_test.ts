@@ -768,3 +768,30 @@ Deno.test({
     })
   },
 })
+
+Deno.test('terminal orphan registries emit one unmatched event and are removed instead of accumulating across sweeps', async () => {
+  const { sweepOrphans } = await import('../src/gateway.ts')
+  const root = Deno.makeTempDirSync({ prefix: 'cc2r-orphan-terminal-' })
+  const binary = Deno.realPathSync(Deno.execPath())
+  const events: Json[] = []
+  const registries: [string, Json | null][] = [
+    ['process_unavailable', { pid: 2147483647, binary, spawnedFrom: 0, spawnedTo: 1000 }],
+    ['start_time_mismatch', { pid: Deno.pid, binary, spawnedFrom: 0, spawnedTo: 1000 }],
+    ['registry_invalid', { pid: -1, binary }],
+    ['registry_unavailable', null],
+  ]
+  try {
+    for (const [reason, registry] of registries) {
+      Deno.mkdirSync(`${root}/${reason}`)
+      if (registry !== null) Deno.writeTextFileSync(`${root}/${reason}/proc.json`, JSON.stringify(registry))
+    }
+    await sweepOrphans(root, binary, (kind, data) => events.push({ kind, ...data }))
+    assertEquals(events.length, registries.length)
+    assertEquals(events.map((e) => [e.kind, e.epoch, e.reason]).sort(), registries.map(([reason]) => ['orphan_unmatched', reason, reason]).sort())
+    assertEquals([...Deno.readDirSync(root)], [])
+    await sweepOrphans(root, binary, (kind, data) => events.push({ kind, ...data }))
+    assertEquals(events.length, registries.length, 'a gone-pid registry and other terminal registries emit only once over two sweeps')
+  } finally {
+    Deno.removeSync(root, { recursive: true })
+  }
+})

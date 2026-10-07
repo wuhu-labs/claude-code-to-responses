@@ -396,14 +396,17 @@ function resultEntries(ctx: LogContext, log: string[], calls: CallRef[], outputs
 /**
  * Kills the Claude Code processes a gateway that died without cleaning up left behind: every run folder still holding
  * a proc.json whose pid has the same start time and executable as recorded. A pid alone is never trusted.
- * An unmatched registry emits orphan_unmatched with a reason and is retained for diagnosis and later sweeps.
+ * An unmatched registry emits orphan_unmatched with a reason. Only potentially recoverable mismatches are retained.
  */
 export async function sweepOrphans(runDir: string, binary: string, note: (kind: string, data: Json) => void): Promise<void> {
   binary = executableIdentity(binary)
   for (const d of Deno.readDirSync(runDir)) {
     const dir = `${runDir}/${d.name}`
     let rec: Json
-    const unmatched = (reason: string) => note('orphan_unmatched', { epoch: d.name, ...(Number.isInteger(rec?.pid) ? { pid: rec.pid } : {}), reason })
+    const unmatched = (reason: string) => {
+      note('orphan_unmatched', { epoch: d.name, ...(Number.isInteger(rec?.pid) ? { pid: rec.pid } : {}), reason })
+      if (!['executable_unavailable', 'executable_mismatch', 'kill_failed'].includes(reason)) Deno.removeSync(dir, { recursive: true })
+    }
     try {
       rec = JSON.parse(Deno.readTextFileSync(`${dir}/proc.json`))
     } catch {
