@@ -2,6 +2,7 @@
 // still does what README.md says. Most checks are paired: the pin on, then the pin off, so each one shows its effect.
 // Run against a new Claude Code release before adding it to the supported versions: `deno task probe`.
 import { assert, assertEquals, assertNotEquals, assertStringIncludes } from '@std/assert'
+import { MAX_IMAGE_BASE64_CHARS } from '../src/api/request.ts'
 import { assistantUuidFor, contextOf, toolResultEntry, userContentEntry, userTextEntry } from '../src/claude/entries.ts'
 import { CLAUDE_CODE_VERSION, launchArgs } from '../src/claude/pins.ts'
 import { claudeVersion } from '../src/claude/process.ts'
@@ -474,4 +475,49 @@ probe('2.1.284: images in an appended user log entry resume as real base64 image
   assertStringIncludes(last.content[3].text, '/images/1.png]')
   await b.kill()
   assertEquals(b.log().slice(0, log.length + tail.length), [...log, ...tail], 'resume does not rewrite appended log entries')
+})
+
+probe('appended large images may be re-encoded by Claude Code; both boundary and oversized padded PNGs remain real images', async (p, fake) => {
+  const t = new ProbeTarget(['hold'])
+  fake.reply({ blocks: [call('toolu_imgsize', 'hold', {})] })
+  const a = p.launch({ name: 'imgsize-a', fake, target: t })
+  await a.user('hold')
+  while (!t.held.has('toolu_imgsize')) await new Promise((res) => setTimeout(res, 50))
+  await new Promise((res) => setTimeout(res, 300))
+  await a.kill()
+  const log = a.log()
+  // A real PNG padded after IEND at the gateway's cap and just above it. Direct Claude Code can process
+  // these rather than refuse them; the gateway must enforce its typed-400 cap before launching.
+  const raw = atob(PNG)
+  const data = btoa(raw + '\0'.repeat(MAX_IMAGE_BASE64_CHARS / 4 * 3 - raw.length))
+  assertEquals(data.length, MAX_IMAGE_BASE64_CHARS)
+  for (const oversize of [true, false]) {
+    const ctx = contextOf(log, a.spec.sessionId, a.spec.workDir)
+    const payload = oversize ? data + 'AAAA' : data
+    const tail = [
+      toolResultEntry(ctx, 'toolu_imgsize', [{ type: 'text', text: 'RESULT' }], assistantUuidFor(log, 'toolu_imgsize')),
+      userContentEntry(ctx, [{ type: 'image', mediaType: 'image/png', data: payload }]),
+    ].map((e) => JSON.stringify(e))
+    fake.reply({ blocks: [text('accepted')] })
+    const b = p.launch({
+      name: `imgsize-${oversize ? 'large' : 'boundary'}`,
+      fake,
+      target: t,
+      workDir: a.spec.workDir,
+      sessionId: a.spec.sessionId,
+      resume: true,
+      interruptedTurn: true,
+      log: [...log, ...tail],
+    })
+    const result = await b.until((f) => f.type === 'result', 20000)
+    assertEquals(result.subtype, 'success')
+    const image = fake.main().at(-1)!.body.messages.at(-1).content.find((c: Json) => c.type === 'image')
+    assert(['image/png', 'image/jpeg'].includes(image.source.media_type))
+    assert(image.source.data.startsWith(image.source.media_type === 'image/jpeg' ? '/9j/' : 'iVBOR'))
+    assert(image.source.data.length > 0 && image.source.data.length < payload.length, 'real image retained, padding removed by image processing')
+    await b.kill()
+    const expected = [...log, ...tail]
+    const disk = b.log().slice(0, expected.length)
+    assertEquals(disk.map((l, i) => l === expected[i]), expected.map(() => true), 'image processing does not rewrite appended log bytes')
+  }
 })

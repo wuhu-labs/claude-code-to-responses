@@ -68,7 +68,7 @@ reads `~/.claude`.
   | `unexpected_reasoning_item` | A reasoning item next to new input that the gateway did not issue in this conversation. |
   | `missing_tool_output`, `unexpected_tool_output` | The outputs don't match the calls the conversation waits on. |
   | `tool_output_too_large` | An output over 500,000 characters (Claude Code would move it to a file). |
-  | `image_too_large` | `400`: an image whose base64 payload exceeds 5,242,880 characters (5 MiB encoded, up to 3,932,160 decoded bytes), the pinned version’s default per-image API limit. Resize it before sending. |
+  | `image_too_large` | `400`: an image whose base64 payload exceeds 5,242,880 characters (5 MiB encoded, up to 3,932,160 decoded bytes), the pinned version’s default per-image API limit after its image processing. Resize it before sending. |
   | `conversation_busy` | `409`: another response of the conversation is streaming or starting. |
   | `not_found`, `response_not_in_progress` | Cancel of an unknown response, or of one that is no longer streaming. |
   | `shutting_down` | `503`: the gateway is stopping. |
@@ -224,6 +224,8 @@ gets one written outside the mirror, so synthesized logs include it (`a resumed 
 The `2.1.284: images in an appended user log entry …` probe asserts that a user entry appended after held-tool
 results sends actual base64 PNG image blocks (correct media type and unchanged payload) immediately after the
 results in the same user turn, retains the prior request’s prefix and leaves the appended log bytes unchanged.
+The large-image probe shows that Claude Code can resize/re-encode appended images, even over its nominal API
+limit; the gateway caps input before that processing, rather than relying on it as a fallback.
 
 Not pinned on purpose: `CLAUDE_CODE_RESUME_INTERRUPTED_TURN_MAX_AGE_MS` (unset means no age limit on resuming a
 held call in 2.1.284), `CLAUDE_CODE_OVERRIDE_DATE` (no effect in 2.1.284), the prompt-cache TTL variables.
@@ -283,8 +285,10 @@ Whether Anthropic's own cache depends on `metadata` is unknown: no request in th
 
 - Image input is limited to PNG, JPEG, GIF and WebP base64 data URLs, each at most 5,242,880 base64 characters.
   The limit applies at turn starts, to notices, and to images inside tool outputs. Remote URLs and other formats
-  are refused, never downloaded or silently dropped. The gateway does not transcode images; image validity and
-  any tighter model-specific limits are the backend’s responsibility.
+  are refused, never downloaded or silently dropped. The gateway does not transcode images; Claude Code may
+  resize/re-encode them (including on an appended-log resume), so arbitrary image payloads need not reach the
+  model unchanged. It does not rewrite the appended log entry. Image validity and any tighter model-specific
+  limits are Claude Code’s and the backend’s responsibility.
 - Image notices require an eviction/resume and therefore cost a process restart. Claude Code 2.1.284 sends the real
   images, then adds its own `[Image: source: …/images/N.png]` text labels. These are not replacements for the images.
   Their temporary paths are deterministic for the same user, working folder and session (the rebuild tests check
