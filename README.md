@@ -258,19 +258,23 @@ deno task test:deepseek   # real tool rounds on DeepSeek's Anthropic-compatible 
 
 Tests launch the real Claude Code 2.1.284 at `~/.wuhu/vendors/claude/2.1.284/claude` by default; set `CLAUDE_BINARY`
 to use a different install (for example `CLAUDE_BINARY=$PWD/.state/vendors/claude/2.1.284/claude deno task test`).
-The probes use the same setting. The binary must still be 2.1.284. Processes are isolated under `.state/`, with
-working folders under `/tmp/cc2r-test`. They use ports 18300-18399 and fail if any Claude Code process outlives them.
+The probes use the same setting. The binary must still be 2.1.284. Gateway tests isolate state under `.state/`, with
+working folders under `/tmp/cc2r-test`. Each probe owns a unique `/tmp/cc2r-probe-*` root for its configuration, logs
+and working folders; cleanup removes only that root. Tests use ports 18300-18399 and fail if any Claude Code process outlives them.
 
-The byte assertions (`test/core_test.ts`, `test/hold_test.ts`, `test/matrix_test.ts`, `test/image_notice_test.ts`): one conversation runs twice,
+The byte assertions (`test/core_test.ts`, `test/hold_test.ts`, `test/matrix_test.ts`): one conversation runs twice,
 once on a single live process and once with idle evictions, a gateway restart that keeps the store and one that
 loses it (full-history rebuild from records); every request the model receives is byte-identical (working folder
 normalized). Around each disruption, the next request repeats the one before it up to the new tail. The matrix adds
 parallel calls released out of order, notices mid-turn, at a turn start and at the end-of-turn hook, eviction during a
-hold (with and without notices, then evicted and rebuilt again), image notices against live/evicted/rebuilt holds
-followed by idle and lost-store rebuilds, a midnight via `TZ`, cancellation mid-stream and
+hold (with and without notices, then evicted and rebuilt again), a midnight via `TZ`, cancellation mid-stream and
 mid-continuation, a client disconnect, stale-call fencing, typed errors, and two negative controls: a moved working
 folder (an environment update at the tail, prefix intact) and a history without records (synthesized, a cache miss,
 warm again on the next rebuild).
+
+`test/image_notice_test.ts` checks real image delivery against live/evicted/rebuilt holds, prefix stability within
+each run, and verbatim provider-record replay through idle eviction and lost-store rebuilds. It does not assert
+that independent runs using different delivery paths produce byte-identical image-result tails.
 
 ## DeepSeek
 
@@ -316,7 +320,7 @@ Whether Anthropic's own cache depends on `metadata` is unknown: no request in th
   state directories. Verbatim provider-record replay preserves existing tool-output labels, even into a different
   state directory; the tests check that the real image blocks and full request prefix survive both idle eviction
   and lost-store replay. Config-rooted label regeneration is not guaranteed byte-identical across state directories.
-  Live MCP delivery may add a source label that evicted delivery does not: this changes the new tail, not faithful replay of each saved record.
+  Live MCP delivery may add a source label that evicted delivery does not; it is saved in the provider record and persists in every later replay.
 - No per-request `tool_choice`, `max_output_tokens` or forced compaction: Claude Code has no per-request knob.
 - A model stream Claude Code retries mid-message fails the response (`upstream_stream_cut`): streamed output cannot be
   withdrawn. The client retries; the rebuild is warm.
