@@ -285,12 +285,19 @@ export class Lane implements BridgeTarget {
   }
 
   /** A new user turn through stdin, once Claude Code's previous turn has ended. */
+  /** Never rejects: a failed write (a broken pipe) fails the response and kills the process. */
   async startTurn(parts: Part[]): Promise<void> {
     await this.turnClosed()
     if (this.dead) return
     this.turnOpen = true
     if (this.active) this.active.ownsTurn = true
-    await this.proc!.write({ type: 'user', session_id: '', parent_tool_use_id: null, message: { role: 'user', content: contentFor(parts) } })
+    try {
+      await this.proc!.write({ type: 'user', session_id: '', parent_tool_use_id: null, message: { role: 'user', content: contentFor(parts) } })
+    } catch (e) {
+      this.events.note('stdin_failed', { session: this.sessionId, message: String(e) })
+      this.fail(serverError('claude_code_stdin', `Could not write the turn to Claude Code: ${e instanceof Error ? e.message : e}`))
+      void this.kill('stdin_failed')
+    }
   }
 
   /** Releases held calls with the client's outputs. Notices are staged on the last call's hook first. */

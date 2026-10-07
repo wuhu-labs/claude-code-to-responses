@@ -342,3 +342,17 @@ Deno.test('an empty model message that ends the turn completes; what Claude Code
     assertEquals(run.tg.events('unowned_inference').length, 0)
   })
 })
+
+Deno.test('a turn that cannot be written to Claude Code fails its response instead of crashing the gateway', async () => {
+  const run = new Run('stdin-broken', false)
+  await run.run(async () => {
+    run.fake.reply({ blocks: [text('one')] }, { blocks: [text('fine')] })
+    await run.turn('one')
+    const lane = [...run.tg.gw.lanes.values()][0]
+    lane.proc!.write = () => Promise.reject(new Error('Broken pipe (os error 32)'))
+    const r = await run.send([user('two')])
+    assertEquals([r.status, r.response.error.code], ['failed', 'claude_code_stdin'])
+    const r2 = await run.send([user('two')])
+    assertEquals([r2.status, r2.response.x_gateway.path], ['completed', 'store'])
+  })
+})
