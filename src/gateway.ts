@@ -9,7 +9,7 @@ import { claudeVersion } from './claude/process.ts'
 import { type Config, paths } from './config.ts'
 import { GatewayError, invalid, previousResponseNotFound, unsupported } from './errors.ts'
 import { Active, type ChainSpec, type Head, Lane, MAX_RESULT_CHARS, outputChars } from './lane.ts'
-import { decodeRecord, digestItems, type ProviderRecord, sha256 } from './records.ts'
+import { decodeRecord, digestItems, type ProviderRecord, RecordError, sha256 } from './records.ts'
 import { ResponseStore } from './store.ts'
 
 // deno-lint-ignore no-explicit-any
@@ -193,7 +193,7 @@ export class Gateway {
       const g = groups[gi]
       pendingGroups.push(g)
       const recs = (await Promise.all(
-        g.outputs.filter((i) => i.kind === 'reasoning' && i.encrypted).map((i) => decodeRecord((i as { encrypted: string }).encrypted)),
+        g.outputs.filter((i) => i.kind === 'reasoning' && i.encrypted).map((i) => clientRecord((i as { encrypted: string }).encrypted, gi)),
       )).filter((r) => r !== null)
       if (recs.length === 0) continue
       const r = recs[recs.length - 1]!
@@ -282,6 +282,18 @@ export class Gateway {
 interface Group {
   inputs: InItem[]
   outputs: InItem[]
+}
+
+/** A provider record from the client's history; a malformed one is the client's error, never silently skipped. */
+async function clientRecord(s: string, group: number): Promise<ProviderRecord | null> {
+  try {
+    return await decodeRecord(s)
+  } catch (e) {
+    if (e instanceof RecordError) {
+      throw invalid('input', `The provider record of response ${group + 1} in the history is malformed: ${e.message}.`, 'invalid_provider_record')
+    }
+    throw e
+  }
 }
 
 function isOutput(i: InItem): boolean {

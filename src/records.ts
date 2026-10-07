@@ -61,15 +61,59 @@ export async function encodeRecord(r: ProviderRecord): Promise<string> {
   return RECORD_PREFIX + b64(await gzip(new TextEncoder().encode(JSON.stringify(r))))
 }
 
-/** Decodes a record; null when the string is not one of ours or is damaged. */
+export class RecordError extends Error {}
+
+export const RESPONSE_ID = /^resp_[0-9a-f]{32}$/
+export const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+const HEX64 = /^[0-9a-f]{64}$/
+const CALL_ID = /^[A-Za-z0-9_-]{1,128}$/
+const TOOL_NAME = /^[a-zA-Z0-9_-]{1,64}$/
+
+/**
+ * Decodes a record: null when the string is not one of ours. A string with our prefix that is not a well-formed
+ * record throws RecordError: its fields reach file paths and Claude Code's log, so nothing unchecked gets through.
+ */
 export async function decodeRecord(s: string): Promise<ProviderRecord | null> {
   if (!s.startsWith(RECORD_PREFIX)) return null
+  // deno-lint-ignore no-explicit-any
+  let r: any
   try {
-    const r = JSON.parse(new TextDecoder().decode(await gunzip(unb64(s.slice(RECORD_PREFIX.length)))))
-    if (r?.v !== 1 || typeof r.id !== 'string' || !Array.isArray(r.entries) || r.entries.some((e: unknown) => typeof e !== 'string')) return null
-    return r as ProviderRecord
+    r = JSON.parse(new TextDecoder().decode(await gunzip(unb64(s.slice(RECORD_PREFIX.length)))))
   } catch {
-    return null
+    throw new RecordError('not valid gzip+base64 JSON')
+  }
+  checkRecord(r)
+  return r as ProviderRecord
+}
+
+// deno-lint-ignore no-explicit-any
+export function checkRecord(r: any): void {
+  const fail = (why: string) => {
+    throw new RecordError(why)
+  }
+  if (typeof r !== 'object' || r === null || r.v !== 1) fail('unknown version')
+  if (typeof r.id !== 'string' || !RESPONSE_ID.test(r.id)) fail('bad id')
+  if (r.prev !== null && (typeof r.prev !== 'string' || !RESPONSE_ID.test(r.prev))) fail('bad prev')
+  if (typeof r.chain !== 'string' || !HEX64.test(r.chain)) fail('bad chain')
+  if (typeof r.digest !== 'string' || !HEX64.test(r.digest)) fail('bad digest')
+  if (typeof r.session !== 'string' || !SESSION_ID.test(r.session)) fail('bad session')
+  if (r.end !== 'turn' && r.end !== 'calls') fail('bad end')
+  if (!Array.isArray(r.calls) || (r.end === 'turn') !== (r.calls.length === 0)) fail('bad calls')
+  for (const c of r.calls) {
+    if (typeof c !== 'object' || c === null || typeof c.id !== 'string' || !CALL_ID.test(c.id) || typeof c.name !== 'string' || !TOOL_NAME.test(c.name)) {
+      fail('bad call')
+    }
+  }
+  if (!Array.isArray(r.entries)) fail('bad entries')
+  for (const e of r.entries) {
+    if (typeof e !== 'string' || e.includes('\n') || e.includes('\r')) fail('bad entry')
+    let o: unknown
+    try {
+      o = JSON.parse(e)
+    } catch {
+      fail('entry is not JSON')
+    }
+    if (typeof o !== 'object' || o === null || Array.isArray(o)) fail('entry is not an object')
   }
 }
 
