@@ -26,6 +26,8 @@ export interface Reply {
   usage?: { input_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number; output_tokens?: number }
   /** ms to wait between content blocks while streaming */
   gapMs?: number
+  /** ms to wait before answering at all (a slow first byte) */
+  delayMs?: number
 }
 
 export class FakeAnthropic {
@@ -95,6 +97,7 @@ export class FakeAnthropic {
       const q = this.queue.shift()
       r = q === undefined ? this.fallback(ex) : typeof q === 'function' ? q(ex) : q
     }
+    if (r.delayMs) await new Promise((res) => setTimeout(res, r.delayMs))
     // an error in the stream is the error of the non-streamed retry too
     if (r.error && (!r.error.inStream || !body.stream)) {
       const status = r.error.inStream ? 529 : r.error.status

@@ -678,6 +678,8 @@ export class Lane implements BridgeTarget {
     const msg = a.msg
     const m = this.mirrored.get(msg.id)
     for (const i of msg.blocks.keys()) if (!m?.has(i)) return
+    // every block is logged: the wait the record timer guards is over (the turn's end may legitimately take longer)
+    clearTimeout(a.mirrorTimer)
     const calls = msg.stopReason === 'tool_use'
     const callBlocks = [...msg.blocks.values()].filter((b) => b.type === 'tool_use')
     if (calls && (callBlocks.length === 0 || !m)) {

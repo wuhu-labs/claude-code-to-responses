@@ -591,3 +591,18 @@ Deno.test('cancel: an unknown id is 404 not_found, a finished response 409 respo
     }
   })
 })
+
+Deno.test('the record timeout never covers the end-of-turn hook round trip or a slow first byte of the continuation', async () => {
+  const run = new Run('slow-continuation-start', false, { recordTimeoutMs: 800 })
+  await run.run(async () => {
+    run.fake.reply(
+      { blocks: [call('toolu_k', 'echo', { text: 'k' }), call('toolu_u', 'nonexistent', {})] },
+      { blocks: [text('first part')] },
+      { blocks: [text(' and the rest')], delayMs: 2000 },
+    )
+    await run.send([user('T1')])
+    const r = await run.send([output('toolu_k', 'K'), output('toolu_u', 'unknown tool'), user('NOTICE-STOP')])
+    assertEquals(r.status, 'completed', JSON.stringify(r.response.error))
+    assertEquals(run.drv.text(r), 'first part and the rest')
+  })
+})
