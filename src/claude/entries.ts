@@ -115,12 +115,8 @@ export function assistantEntries(ctx: LogContext, outputs: InItem[], model: stri
     } else if (it.kind === 'message') {
       for (const p of it.parts) if (p.type === 'text') blocks.push({ type: 'text', text: p.text })
     } else if (it.kind === 'function_call') {
-      let input: Json
-      try {
-        input = it.arguments.trim() ? JSON.parse(it.arguments) : {}
-      } catch {
-        input = {}
-      }
+      // parseRequest already refused arguments that are not a JSON object
+      const input: Json = JSON.parse(it.arguments)
       blocks.push({ type: 'tool_use', id: it.callId, name: MCP_PREFIX + it.name, input })
       calls.push({ id: it.callId, name: it.name })
     }

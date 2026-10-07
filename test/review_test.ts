@@ -174,3 +174,19 @@ Deno.test('a cancelled attempt never becomes a tail', async () => {
     assertEquals(run.tg.gw.store.tail(r1.response.id), [])
   })
 })
+
+Deno.test('history with tool arguments that are not a JSON object is refused, never rewritten', async () => {
+  const run = new Run('bad-args', false)
+  await run.run(async () => {
+    for (const args of ['not json', '', '[1,2]', '"text"']) {
+      const input = [user('q'), { type: 'function_call', call_id: 'call_1', name: 'echo', arguments: args }, {
+        type: 'function_call_output',
+        call_id: 'call_1',
+        output: 'x',
+      }]
+      const r = await post(run.tg.url, { model: MODEL, instructions: INSTRUCTIONS, tools: TOOLS, stream: true, input })
+      assertEquals([r.status, r.body?.error?.code, r.body?.error?.param], [400, 'invalid_function_arguments', 'input[1].arguments'], args)
+    }
+    assertEquals(run.fake.main().length, 0)
+  })
+})

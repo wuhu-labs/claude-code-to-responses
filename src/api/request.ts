@@ -200,6 +200,15 @@ function parseItem(it: unknown, p: string): InItem {
       if (typeof it.call_id !== 'string' || !it.call_id) throw invalid(`${p}.call_id`, 'function_call items need a call_id.')
       if (typeof it.name !== 'string' || !it.name) throw invalid(`${p}.name`, 'function_call items need a name.')
       if (typeof it.arguments !== 'string') throw invalid(`${p}.arguments`, 'function_call arguments must be a JSON string.')
+      let args: unknown
+      try {
+        args = JSON.parse(it.arguments)
+      } catch {
+        args = undefined
+      }
+      if (typeof args !== 'object' || args === null || Array.isArray(args)) {
+        throw invalid(`${p}.arguments`, 'function_call arguments must be a JSON object, as the model produced them.', 'invalid_function_arguments')
+      }
       return { kind: 'function_call', callId: it.call_id, name: it.name, arguments: it.arguments }
     }
     case 'function_call_output': {
