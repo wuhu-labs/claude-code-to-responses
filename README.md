@@ -194,7 +194,31 @@ warm again on the next rebuild).
 
 ## DeepSeek
 
-_Filled in by the DeepSeek run (M3)._
+`deno task test:deepseek` runs real tool rounds on DeepSeek Flash through its Anthropic-compatible endpoint
+(`https://api.deepseek.com/anthropic`, model `deepseek-flash`) with the OpenAI SDK driver: a librarian with `read_doc`
+and `add` tools, about 5,500 tokens of context, then each kind of eviction. It needs `DEEPSEEK_API_KEY` and fails
+without it. Measured 2026-10-07; "prefix" is the share of the previous request's input that DeepSeek reported reading
+from its cache on the first request after the eviction (DeepSeek caches in 64-token units). The test requires at least
+90%.
+
+| First request after | Input | Cached | Hit | Prefix |
+|---|---|---|---|---|
+| a live turn start (for comparison) | 2,208 | 2,048 | 92.8% | 95.6% |
+| an idle eviction (store rebuild) | 3,843 | 3,584 | 93.3% | 94.3% |
+| an eviction during a hold (interrupted-turn resume) | 5,397 | 3,840 | 71.2% | 98.9% |
+| a gateway restart (store rebuild) | 5,421 | 5,248 | 96.8% | 97.2% |
+| a restart that lost the response store (history rebuild from records) | 5,515 | 5,376 | 97.5% | 97.9% |
+| a restart with a fresh state dir (history rebuild, new device id) | 5,577 | 0 | 0% | 0% |
+
+The hold row's hit is lower only because its new tail is a 1,500-token tool result no cache has seen; everything before
+it was read from the cache.
+
+DeepSeek keys its prompt cache on Anthropic's `metadata.user_id`, which Claude Code fills with its device id (kept in
+its config dir) and the session id: the same request under another device id or session id reads nothing from the
+cache (measured directly against the endpoint). The gateway keeps the session id across every rebuild, and the device
+id lives as long as `<state-dir>/claude/config` does. So a gateway that loses its whole state dir misses DeepSeek's
+cache once (last row), although the bytes the model sees are identical; the turn after is warm again. Whether
+Anthropic's own cache depends on `metadata` is unknown: no request in this repository goes to Anthropic.
 
 ## Known limits
 
