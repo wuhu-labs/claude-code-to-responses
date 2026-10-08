@@ -20,6 +20,7 @@ export const ERROR_CODES = [
   'conversation_busy',
   'websocket_response_in_progress',
   'websocket_message_too_large',
+  'response_too_large',
   'websocket_backpressure',
   'not_found',
   'response_not_in_progress',

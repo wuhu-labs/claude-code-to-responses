@@ -31,7 +31,7 @@ export interface NormRequest {
   previousResponseId: string | null
   input: InItem[]
   metadata: Record<string, string>
-  /** The request body as sent, for echoing fields back in the response object. */
+  /** Only response echo fields; never retain the original input body. */
   body: Json
 }
 
@@ -192,7 +192,17 @@ export function parseRequest(body: unknown, transport: 'sse' | 'websocket' = 'ss
   }
   const { instructions, input } = parseInstructionsAndInput(body, previousResponseId)
   if (input.length === 0) throw invalid('input', "'input' must not be empty.")
-  return { model: body.model, instructions, maxOutputTokens, tools, effort, previousResponseId, input, metadata, body }
+  return {
+    model: body.model,
+    instructions,
+    maxOutputTokens,
+    tools,
+    effort,
+    previousResponseId,
+    input,
+    metadata,
+    body: { reasoning: { effort: body.reasoning?.effort }, user: body.user },
+  }
 }
 
 function parseInstructionsAndInput(body: Json, previous: string | null): { instructions: string | null; input: InItem[] } {

@@ -99,6 +99,50 @@ Deno.test('WebSocket large image create commits provider content and replays ide
   })
 })
 
+Deno.test('WebSocket synthesized image history commits a real provider record above 42 MiB exactly once', async () => {
+  const run = new Run('ws-large-history-record', false)
+  await run.run(async () => {
+    const png = await noisePng()
+    const input: Json[] = []
+    for (let n = 0; n < 3; n++) {
+      input.push({
+        role: 'user',
+        content: [
+          { type: 'input_text', text: `History ${n}` },
+          ...Array.from({ length: 20 }, () => ({ type: 'input_image', image_url: `data:image/png;base64,${png}` })),
+        ],
+      })
+      input.push({ role: 'assistant', content: `Saw group ${n}` })
+    }
+    input.push(user('Summarize the history.'))
+    run.fake.reply({ blocks: [text('history retained')], usage: { input_tokens: 50_000 } })
+    const ws = run.tg.websocket()
+    const first = await ws.send({ ...base, input })
+    assertEquals(first.status, 'completed')
+    const item = first.response.output.at(-1)
+    assert(item.encrypted_content.length > 42 * 1024 * 1024)
+    const record = await decodeRecord(item.encrypted_content)
+    assertExists(record)
+    assertEquals(run.tg.gw.store.get(first.response.id), record)
+    const added = first.events.find((e) => e.type === 'response.output_item.added' && e.item.id === item.id)
+    const done = first.events.find((e) => e.type === 'response.output_item.done' && e.item.id === item.id)
+    assertEquals(added.item.encrypted_content, item.encrypted_content)
+    assertEquals(done.item, { type: item.type, id: item.id, summary: item.summary })
+    assertEquals(first.events.at(-1).response.output.at(-1), done.item)
+    const images = (entries: string[]) => entries.flatMap((line) => JSON.parse(line).message?.content ?? []).filter((b: Json) => b.type === 'image')
+    assertEquals(images(record.entries).length, 60)
+    const upstreamImages = run.fake.main()[0].body.messages.flatMap((m: Json) => m.content).filter((b: Json) => b.type === 'image')
+    assertEquals(upstreamImages.length, 60)
+    const nextBody = { ...base, previous_response_id: first.response.id, input: 'Describe them again.' }
+    run.fake.reply({ blocks: [text('continued')], usage: { input_tokens: 50_000 } })
+    assertEquals((await ws.send(nextBody)).status, 'completed')
+    await run.tg.evictAll()
+    run.fake.reply({ blocks: [text('rebuilt')], usage: { input_tokens: 50_000 } })
+    assertEquals((await ws.send(nextBody)).status, 'completed')
+    assertEquals(run.fake.main()[2].raw, run.fake.main()[1].raw)
+  })
+})
+
 Deno.test('WebSocket accepts a fragmented create above Deno native 64 MiB frame ceiling', async () => {
   const run = new Run('ws-fragmented-create', false)
   await run.run(async () => {
@@ -394,7 +438,7 @@ Deno.test('WebSocket writer bounds buffered bytes and outbound message size with
   assertEquals(cancelled, 1)
   const other = new SocketWriter({ ...socket, bufferedAmount: 0 } as unknown as WebSocket)
   assertEquals(other.send({ data: 'x'.repeat(WS_MAX_MESSAGE_BYTES) }), false)
-  assertEquals(events.at(-1).error.code, 'websocket_message_too_large')
+  assertEquals(events.at(-1).error.code, 'response_too_large')
 })
 
 Deno.test('WebSocket writer drain deadline closes a slow peer even after the response is terminal', async () => {
@@ -540,7 +584,7 @@ Deno.test('WebSocket an oversized initial response event does not launch Claude 
     await ws.opened
     create(ws, { input: 'do not run' })
     const event = await ws.next()
-    assertEquals(event.error.code, 'websocket_message_too_large')
+    assertEquals(event.error.code, 'response_too_large')
     await ws.closed
     await run.tg.waitEvent('kill')
     assertEquals(run.tg.events('spawn').length, 0)
@@ -616,4 +660,21 @@ Deno.test('store rejects all non-boolean values with typed 400 on HTTP and WebSo
     assertEquals(run.tg.events('spawn').length, 0)
     assertEquals(run.fake.main().length, 0)
   })
+})
+
+Deno.test('WebSocket deterministic batch overflow is a nonretryable 413 with required byte counts', () => {
+  const sent: Json[] = [], closes: number[] = []
+  const writer = new SocketWriter(
+    {
+      readyState: WebSocket.OPEN,
+      bufferedAmount: 0,
+      send: (s: string) => sent.push(JSON.parse(s)),
+      close: (code: number) => closes.push(code),
+    } as unknown as WebSocket,
+  )
+  assertEquals(writer.prepare([{ data: 'x'.repeat(65 * 1024 * 1024) }, { data: 'x'.repeat(65 * 1024 * 1024) }]), null)
+  assertEquals([sent[0].status, sent[0].error.type, sent[0].error.code], [413, 'invalid_request_error', 'response_too_large'])
+  assert(sent[0].error.message.includes('136314902'))
+  assert(sent[0].error.message.includes('134217728'))
+  assertEquals(closes, [1009])
 })

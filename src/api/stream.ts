@@ -49,7 +49,12 @@ export class ResponseState {
   /** How the gateway reached Claude Code for this response (live process, store or history rebuild). */
   gateway: Json = {}
 
-  constructor(readonly req: NormRequest) {}
+  readonly req: Omit<NormRequest, 'input'>
+
+  constructor(req: NormRequest) {
+    const { input: _, ...echo } = req
+    this.req = echo
+  }
 
   object(): Json {
     const b = this.req.body

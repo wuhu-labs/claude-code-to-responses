@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 // Provider records: the Claude Code log entries behind each response, carried opaquely in a reasoning item's
 // encrypted_content and kept in the response store. log(r) = log(r.prev) + r.entries, byte for byte.
 import type { CallAliases } from './call_ids.ts'
@@ -183,11 +184,31 @@ export function canonItem(it: InItem): unknown | null {
   }
 }
 
-export async function digestItems(items: InItem[]): Promise<string> {
-  const canon = items.map(canonItem).filter((x) => x !== null)
-  const bytes = new TextEncoder().encode(JSON.stringify(canon))
-  const h = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))
-  return Array.from(h, (b) => b.toString(16).padStart(2, '0')).join('')
+export class ItemDigest {
+  private hash = createHash('sha256').update('[')
+  private count = 0
+
+  constructor(items: InItem[]) {
+    this.append(items)
+  }
+
+  private append(items: InItem[]): void {
+    for (const item of items) {
+      const canon = canonItem(item)
+      if (canon === null) continue
+      if (this.count++) this.hash.update(',')
+      this.hash.update(JSON.stringify(canon))
+    }
+  }
+
+  finish(outputs: InItem[] = []): string {
+    this.append(outputs)
+    return this.hash.update(']').digest('hex')
+  }
+}
+
+export function digestItems(items: InItem[]): Promise<string> {
+  return Promise.resolve(new ItemDigest(items).finish())
 }
 
 export async function sha256(s: string): Promise<string> {

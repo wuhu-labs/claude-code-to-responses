@@ -107,7 +107,8 @@ reads `~/.claude`.
   | `image_too_large` | `400`: an image whose base64 payload exceeds 5,242,880 characters (5 MiB encoded, up to 3,932,160 decoded bytes), the gateway’s own per-image input cap, enforced before Claude Code’s image processing. Resize it before sending. |
   | `conversation_busy` | `409`: another response of the conversation is streaming or starting. |
   | `websocket_response_in_progress` | `409`: a second create arrived before the socket's active response ended. |
-  | `websocket_message_too_large` | `413`: an inbound message or outbound event exceeds 128 MiB; the socket closes with `1009`. |
+  | `response_too_large` | `413`: an outbound message or terminal batch exceeds its byte limit; reports required/allowed bytes, closes `1009`, and is nonretryable without changing input. |
+  | `websocket_message_too_large` | `413`: an inbound message exceeds 128 MiB; the socket closes with `1009`. |
   | `websocket_backpressure` | `429`: buffered outbound bytes exceed 128 MiB, or output makes no draining progress for 5 s; the socket closes with `1013`. |
   | `not_found`, `response_not_in_progress` | Cancel of an unknown response, or of one that is no longer streaming. |
   | `shutting_down` | `503`: the gateway is stopping. |
@@ -282,9 +283,11 @@ Application messages/events are limited to **128 MiB of UTF-8 bytes** (binary me
 Deno reassembles inbound frames before this application limit is checked; this is not a wire-level frame or
 preallocation limit. The writer never waits on a client from the Claude Code lane: it caps buffered outbound bytes
 at **128 MiB** and closes if they make no draining progress for **5 seconds**, even after a response's terminal event.
+On WebSocket only, reasoning `encrypted_content` is sent once, on `response.output_item.added`; `response.output_item.done` and the terminal response retain the same item id/type/summary without repeating the opaque bytes. Consumers retain the added item by id. HTTP/SSE is unchanged and includes opaque content in all three events.
+
 The entire final batch (provider-record events plus terminal) is serialized and checked against the message and
 buffer budgets **before success is committed**. A rejected final enqueue cancels the attempt, removes its record,
-and preserves the previous chain head for a retry. HTTP/SSE uses the same boundary: a terminal batch must be
+and preserves the previous chain head. A deterministic `response_too_large` (413, close 1009) reports required/allowed bytes and must not be retried unchanged; only transient peer backpressure is retryable. HTTP/SSE uses the same boundary: a terminal batch must be
 accepted by its stream before the response becomes a continuation point. After acceptance, a later disconnect
 retains the completed response on either transport; enqueue is not an acknowledgement that the peer read or
 parsed the bytes. Overflow before that boundary cancels active work. Fatal size/backpressure errors get one small best-effort typed error followed by

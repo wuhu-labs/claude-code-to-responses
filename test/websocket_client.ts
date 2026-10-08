@@ -42,7 +42,9 @@ export class WsClient {
       if (event.type === 'error') throw Object.assign(new Error(event.error.message), { status: event.status, ...event.error, error: event.error })
       events.push(event)
       if (['response.completed', 'response.failed', 'response.incomplete'].includes(event.type)) {
-        return { events, response: event.response, status: event.response.status }
+        const added = new Map(events.filter((e) => e.type === 'response.output_item.added').map((e) => [e.item.id, e.item]))
+        const response = { ...event.response, output: event.response.output?.map((item: Json) => ({ ...added.get(item.id), ...item })) }
+        return { events, response, status: response.status }
       }
     }
   }

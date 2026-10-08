@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer'
 // A lane is one Claude Code session (one chain of responses) and, while it lives, the one process serving it.
 // It turns Claude Code's stream into Responses events, holds MCP calls until the client's outputs come,
 // delivers notices through hooks, and records every log entry so the process can be killed and rebuilt.
@@ -10,7 +11,7 @@ import type { CallAliases } from './call_ids.ts'
 import { type LaunchSpec, logPath, MAX_RESULT_CHARS, MCP_PREFIX, mcpConfigJson, projectDir, settingsJson } from './claude/pins.ts'
 import { type Config, paths } from './config.ts'
 import { asGatewayError, type ErrorCode, GatewayError, serverError } from './errors.ts'
-import { type CallRef, digestItems, encodeRecord, encodeThinking, type ProviderRecord } from './records.ts'
+import { type CallRef, encodeRecord, encodeThinking, ItemDigest, type ProviderRecord } from './records.ts'
 import type { ResponseStore } from './store.ts'
 import {
   diagnosticMessageId,
@@ -92,8 +93,12 @@ export class Active {
     /** The response this one continues in the log; null when it starts it. */
     readonly prevId: string | null,
     /** Every input item the record covers: synthesized history, then this request's input. */
-    readonly covered: InItem[],
-  ) {}
+    covered: InItem[],
+  ) {
+    this.digest = new ItemDigest(covered)
+  }
+
+  readonly digest: ItemDigest
 }
 
 export class Lane implements BridgeTarget {
@@ -201,9 +206,18 @@ export class Lane implements BridgeTarget {
         Deno.removeSync(`${dir}/${this.sessionId}`, { recursive: true })
       } catch { /* none */ }
       const lines = [...(opts.log ?? []), ...this.pending, ...(opts.attempt ?? [])]
-      const text = lines.map((l) => l + '\n').join('')
-      Deno.writeTextFileSync(this.logFile, text, { mode: 0o600 })
-      this.logOffset = new TextEncoder().encode(text).length
+      const file = Deno.openSync(this.logFile, { write: true, create: true, truncate: true, mode: 0o600 })
+      this.logOffset = 0
+      try {
+        for (const line of lines) {
+          const bytes = new TextEncoder().encode(line + '\n')
+          let at = 0
+          while (at < bytes.length) at += file.writeSync(bytes.subarray(at))
+          this.logOffset += Buffer.byteLength(line) + 1
+        }
+      } finally {
+        file.close()
+      }
     } else {
       this.logOffset = 0
     }
@@ -869,7 +883,7 @@ export class Lane implements BridgeTarget {
       device: this.config.deviceId!,
       end,
       calls,
-      digest: await digestItems([...a.covered, ...a.outputs]),
+      digest: a.digest.finish(a.outputs),
       entries,
     }
     const item = { type: 'reasoning', id: newId('rs'), summary: [], encrypted_content: await encodeRecord(record) }

@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer'
 // OpenAI Responses WebSocket subset: one create in flight, text JSON events, no cancel message.
 import { parseRequest } from './api/request.ts'
 import { type EventSink, GatedSink, type SinkEvent } from './api/stream.ts'
@@ -32,12 +33,32 @@ export class SocketWriter {
   prepare(events: Json[]): (() => boolean) | null {
     if (this.isClosed) return null
     const texts = events.map((event) => JSON.stringify(event))
-    const sizes = texts.map((text) => new TextEncoder().encode(text).byteLength)
+    const sizes = texts.map((text) => Buffer.byteLength(text))
     if (sizes.some((size) => size > WS_MAX_MESSAGE_BYTES)) {
-      this.fail(new GatewayError(413, 'server_error', 'websocket_message_too_large', 'The outbound event exceeds the 128 MiB message limit.'), 1009)
+      this.fail(
+        new GatewayError(
+          413,
+          'invalid_request_error',
+          'response_too_large',
+          `The response event requires ${Math.max(...sizes)} bytes; the message limit is ${WS_MAX_MESSAGE_BYTES} bytes.`,
+        ),
+        1009,
+      )
       return null
     }
     const size = sizes.reduce((total, n) => total + n, 0)
+    if (size > WS_MAX_BUFFERED_BYTES) {
+      this.fail(
+        new GatewayError(
+          413,
+          'invalid_request_error',
+          'response_too_large',
+          `The response batch requires ${size} bytes; the output limit is ${WS_MAX_BUFFERED_BYTES} bytes.`,
+        ),
+        1009,
+      )
+      return null
+    }
     if (!this.hasCapacity(size)) return null
     return () => {
       if (this.isClosed || !this.hasCapacity(size)) return false
@@ -138,7 +159,19 @@ class SocketSink implements EventSink {
 
   prepare(events: SinkEvent[]): (() => boolean) | null {
     if (this.isClosed) return null
-    const send = this.writer.prepare(events.map(({ type, data }, i) => ({ type, sequence_number: this.seq + i, ...data })))
+    const send = this.writer.prepare(events.map(({ type, data }, i) => {
+      // The kernel retains reasoning from added; repeating opaque records defeats the bounded batch budget.
+      const withoutOpaque = (item: Json): Json => {
+        if (item.type !== 'reasoning') return item
+        const { encrypted_content: _, ...rest } = item
+        return rest
+      }
+      if (type === 'response.output_item.done') data = { ...data, item: withoutOpaque(data.item) }
+      if (type === 'response.completed' || type === 'response.incomplete') {
+        data = { ...data, response: { ...data.response, output: data.response.output?.map(withoutOpaque) } }
+      }
+      return { type, sequence_number: this.seq + i, ...data }
+    }))
     if (!send) return null
     return () => {
       if (this.isClosed || !send()) return false
@@ -191,11 +224,7 @@ export function upgradeResponses(req: Request, gw: Gateway): Response {
   socket.onclose = socket.onerror = () => writer.disconnect()
   socket.onmessage = (message) => {
     if (writer.isClosed) return
-    const size = typeof message.data === 'string'
-      ? new TextEncoder().encode(message.data).byteLength
-      : message.data instanceof Blob
-      ? message.data.size
-      : message.data.byteLength
+    const size = typeof message.data === 'string' ? Buffer.byteLength(message.data) : message.data instanceof Blob ? message.data.size : message.data.byteLength
     if (size > WS_MAX_MESSAGE_BYTES) {
       writer.fail(new GatewayError(413, 'invalid_request_error', 'websocket_message_too_large', 'The message exceeds the 128 MiB limit.'), 1009)
       return
