@@ -57,7 +57,7 @@ export class Run {
     if (opts.workDir) this.d.workDir = opts.workDir
   }
 
-  backend() {
+  backend(): Record<string, string> {
     return { ANTHROPIC_BASE_URL: this.fake.url, ANTHROPIC_AUTH_TOKEN: 'fake-key' }
   }
 

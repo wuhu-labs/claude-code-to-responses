@@ -414,8 +414,14 @@ Deno.test('upstream errors map to typed failures, at once: the client owns retri
       const before = run.fake.main().length
       run.fake.reply({ blocks: [text('never')], error })
       const t0 = Date.now()
-      const r = await run.send([user(`fails with ${label}`)])
-      assertEquals([r.status, r.response.error.code], ['failed', code], label)
+      if (error.status === 429) {
+        // a 429 before any output is refused as a request (test/usage_test.ts covers it on both transports)
+        const err = await run.send([user(`fails with ${label}`)]).then(() => null, (e) => e)
+        assertEquals([err?.status, err?.code], [429, code], label)
+      } else {
+        const r = await run.send([user(`fails with ${label}`)])
+        assertEquals([r.status, r.response.error.code], ['failed', code], label)
+      }
       assert(Date.now() - t0 < 5000, `${label} took ${Date.now() - t0} ms`)
       assert(run.fake.main().length - before <= 2, `${label}: ${run.fake.main().length - before} requests`)
     }

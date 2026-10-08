@@ -38,7 +38,7 @@ export function handler(gw: Gateway): (req: Request) => Promise<Response> {
     } catch (e) {
       const err = asGatewayError(e)
       if (err.status >= 500) console.error('request failed', err)
-      return Response.json(err.toJSON(), { status: err.status })
+      return Response.json(err.toJSON(), { status: err.status, headers: err.headers })
     }
   }
 }

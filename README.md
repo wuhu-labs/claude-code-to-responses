@@ -86,7 +86,11 @@ reads `~/.claude`.
   ends with `response.failed`, status `cancelled`, code `cancelled`, and is not a continuation point: the client goes
   on from the last completed response.
 - Errors use OpenAI's shape `{"error": {"message", "type", "param", "code"}}`. Before streaming they are HTTP errors;
-  once streaming they end the response with `response.failed`. Every code:
+  once streaming they end the response with `response.failed`. A response's opening events (`response.created`,
+  `response.in_progress`, and so the HTTP status and headers) are held until the model's first output, so a backend
+  429 before any output is an HTTP `429`, never a stream that fails (see **Usage limits** below). An HTTP client that
+  leaves during that wait is noticed at the first output (Deno does not report the disconnect sooner), which cancels
+  the response as any disconnect does. Every code:
 
   | Code | When |
   |---|---|
@@ -108,7 +112,9 @@ reads `~/.claude`.
   | `shutting_down` | `503`: the gateway is stopping. |
   | `cancelled` | The response was cancelled (by the cancel route or a client that went away). |
   | `context_length_exceeded` | Claude Code hit its blocking context limit; auto-compaction is off, so compaction is the client's job. |
-  | `upstream_invalid_request`, `upstream_authentication_error`, `rate_limit_exceeded`, `upstream_overloaded`, `upstream_error` | The backend answered 400, 401/403, 429, 529 or 5xx. Claude Code's own retries are off: the client's retry policy is the only one. |
+  | `usage_limit_reached` | `429`: the subscription's usage limit, with a known reset (Claude Code's `rate_limit_event` said `rejected` with `resetsAt`). `Retry-After: min(reset − now, 3600)` seconds; the error object adds `limit_type` (Claude Code's `rateLimitType`: `five_hour`, `seven_day`, `seven_day_opus`, …, or `null` if unreported) and `resets_at` (the exact reset, epoch seconds). |
+  | `upstream_invalid_request`, `upstream_authentication_error`, `rate_limit_exceeded`, `upstream_overloaded`, `upstream_error` | The backend answered 400, 401/403, 429, 529 or 5xx. Claude Code's own retries are off: the client's retry policy is the only one. A 429 without a known reset is `rate_limit_exceeded`, without `Retry-After`: Claude Code 2.1.284 passes no backend `retry-after` to the gateway (probed). |
+  | `unexpected_rate_limit_event` | Claude Code reported its usage in a shape 2.1.284 does not produce; the response fails rather than guess what a later 429 means. |
   | `upstream_stream_cut` | The model stream broke mid-message; streamed output cannot be withdrawn. |
   | `malformed_model_message`, `unexpected_tool`, `unexpected_block` | The model stopped for tool use without a tool call, called a tool that isn't a client tool, or sent a block type the subset doesn't carry. |
   | `turn_ended_without_message`, `notice_undelivered`, `record_incomplete` | Claude Code ended a turn without a model message, called tools again before staged notices could go in, or did not log what it streamed. |
@@ -128,6 +134,16 @@ reads `~/.claude`.
 - Usage: `input_tokens` is uncached + cache-read + cache-written input, `input_tokens_details.cached_tokens` is
   Anthropic's `cache_read_input_tokens`, and `usage.anthropic` holds the raw numbers, summed over the model messages of
   the response.
+- **Usage limits.** Claude Code reports the subscription's usage in a `rate_limit_event` whenever it changes, on
+  successful requests too (only with `CLAUDE_CODE_OAUTH_TOKEN`; an API key reports nothing). A backend 429 before
+  the model's first output is refused as a request: an HTTP `429` with a JSON error body (and on WebSocket the
+  typed `error` event, below), and nothing of the response is streamed or stored. With a known reset it is
+  `usage_limit_reached` with `Retry-After` capped at an hour, even for a weekly limit days away; the client retries
+  no more often than hourly and every retry goes to the backend again, since nothing is cached or answered from
+  memory. A 429 after output has streamed (a second inference inside one response) still ends it with
+  `response.failed`, its error object carrying the same `limit_type` and `resets_at`. Over HTTP/SSE the stream
+  carries only standard Responses events: usage reports (`codex.rate_limits`) go to WebSocket clients alone, since
+  an SSE stream ends with its response and the report often arrives just after (see below).
 - Each response object carries `x_gateway`: how it reached Claude Code (`new`, `live`, `store`, `history`), how many
   records a history rebuild used, how many groups it had to synthesize, and the resume path.
 
@@ -158,6 +174,23 @@ system/developer input message in a continuation.
 There is **one response in flight per connection**, including the asynchronous start/record-commit windows. A
 second create is rejected, not queued, without disturbing the first. Request/protocol errors are messages shaped
 as `{"type":"error","status":400,"error":{"message":"…","type":"invalid_request_error","param":null,"code":"…"}}`.
+A backend 429 before the response's first output is one too, carrying what the HTTP 429 carries: the status,
+the error object (with `limit_type` and `resets_at` for `usage_limit_reached`) and its headers,
+`{"type":"error","status":429,"error":{…,"code":"usage_limit_reached","limit_type":"five_hour","resets_at":1760000000},"headers":{"retry-after":"600"}}`.
+`headers` is present only when there are any. The socket stays usable; the response's `response.created` was never
+sent (opening events are held until the first output, as on HTTP).
+
+**Usage events.** Whenever Claude Code reports a `rate_limit_event` with usage windows, the socket gets
+`{"type":"codex.rate_limits","rate_limits":{"primary":{"used_percent":30,"window_minutes":300,"reset_at":1760000000},"secondary":{"used_percent":50,"window_minutes":10080,"reset_at":1760300000}}}`,
+the shape Wuhu's kernel parses (`codexSocketUsage`): the 5-hour window is `primary` (300 minutes), the weekly one
+`secondary` (10080). `used_percent` is Claude Code's utilization × 100, capped at 100 (utilization may run past the
+cap); `reset_at` is the window's reset in epoch seconds. Only windows Claude Code reported are sent, and a report
+without any window sends no event; per-model weekly buckets (`seven_day_overage_included`) have no kernel window.
+There is no `plan_type`: Claude Code 2.1.284 reports no plan. The event is outside the response's sequence (no
+`sequence_number`) and may come at any time: during a response, before its `error`, or in the idle window after
+`response.completed` (Claude Code reports usage after the model's `message_stop`, and a tool-call response
+completes there). It goes to the socket of the last response the Claude Code process served, while that socket is
+open.
 Ordinary validation errors leave the connection usable; after generation has started, model errors still arrive
 as `response.failed`, exactly as on SSE. This includes a process-start/rebuild exception after the response is
 attached: it terminates that response, kills any partially started process, discards the attempt's tail and releases
@@ -397,6 +430,18 @@ orders. They also exercise native dispatch on raw appended resume entries versus
 and pair planted user/project commands and skills with settings sources closed/open. The one-space bypass is
 asserted against the pinned binary; rerun these probes before supporting another Claude Code version.
 
+Usage reports, asserted by the `rate_limit_event …` probe (fake endpoint, a fake subscription token): a
+`rate_limit_event` comes only with `CLAUDE_CODE_OAUTH_TOKEN`, on successes too, and only when the report changes
+(per process). Its `rate_limit_info.unifiedWindows.five_hour` / `seven_day` / `seven_day_overage_included` come from
+the `anthropic-ratelimit-unified-5h-*`, `-7d-*` and `-7d_oi-*` headers (`utilization` as a fraction, `resetsAt`);
+`resetsAt` and `rateLimitType` from `-unified-reset` and `-unified-representative-claim` (a window past its warning
+threshold makes Claude Code report `allowed_warning` naming that window). A 429 with
+`-unified-status: rejected` reports `status: "rejected"` with them and ends the turn as `api_error`, status 429,
+"You've hit your session limit · resets …" (weekly: "your weekly limit", `seven_day_opus`: "your Opus limit"). Any
+other 429 reports a bare `{"status":"rejected"}` and "Server is temporarily limiting requests (not your usage
+limit)"; a backend `retry-after` reaches nothing. The report precedes the turn's `result`, after the stream's
+`message_stop`.
+
 Not pinned on purpose: `CLAUDE_CODE_RESUME_INTERRUPTED_TURN_MAX_AGE_MS` (unset means no age limit on resuming a
 held call in 2.1.284), `CLAUDE_CODE_OVERRIDE_DATE` (no effect in 2.1.284), the prompt-cache TTL variables.
 
@@ -444,6 +489,11 @@ typed error codes, and exercises a real torn Claude config. Both WebSocket (same
 successfully but exceed the aggregate terminal limit, asserts terminal-batch backpressure preflight, and checks
 SSE abort/refusal before terminal enqueue (including synchronous store rollback) versus cancellation after an
 accepted terminal. Failed attempts do not advance the store/head, and retries retain byte-identical model input.
+
+`test/usage_test.ts` checks the 429 mapping on both transports (a reset 10 minutes away, the one-hour cap for a
+weekly limit, a 429 without a reset and one with only a backend `retry-after`), that the next request reaches the
+backend again, a 429 after output, and `codex.rate_limits` against the kernel parser's contract: on a normal success,
+in the idle window after a tool-call response, with only the reported windows, none without windows, and none on SSE.
 
 `test/image_notice_test.ts` checks real image delivery against live/evicted/rebuilt holds, prefix stability within
 each run, and verbatim provider-record replay through idle eviction and lost-store rebuilds. It does not assert

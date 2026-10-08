@@ -1,6 +1,6 @@
 // OpenAI Responses WebSocket subset: one create in flight, text JSON events, no cancel message.
 import { parseRequest } from './api/request.ts'
-import type { EventSink, SinkEvent } from './api/stream.ts'
+import { type EventSink, GatedSink, type SinkEvent } from './api/stream.ts'
 import { asGatewayError, GatewayError, invalid, unsupported } from './errors.ts'
 import type { Gateway } from './gateway.ts'
 
@@ -78,8 +78,9 @@ export class SocketWriter {
     }
   }
 
+  /** The typed `error` event: the HTTP status, the error object, and the HTTP headers (`retry-after`) when any. */
   error(err: GatewayError): void {
-    this.send({ type: 'error', status: err.status, ...err.toJSON() })
+    this.send(errorEvent(err))
   }
 
   /** A fatal transport error gets one small best-effort typed event, then close. A non-reading peer cannot be
@@ -88,7 +89,7 @@ export class SocketWriter {
     if (this.stopped) return
     if (this.socket.readyState === WebSocket.OPEN) {
       try {
-        this.socket.send(JSON.stringify({ type: 'error', status: err.status, ...err.toJSON() }))
+        this.socket.send(JSON.stringify(errorEvent(err)))
         this.socket.close(code, err.code)
       } catch { /* transport already gone */ }
     }
@@ -115,6 +116,10 @@ export class SocketWriter {
     this.timer = undefined
     this.pendingSince = null
   }
+}
+
+function errorEvent(err: GatewayError): Json {
+  return { type: 'error', status: err.status, ...err.toJSON(), ...(Object.keys(err.headers).length ? { headers: err.headers } : {}) }
 }
 
 class SocketSink implements EventSink {
@@ -146,6 +151,11 @@ class SocketSink implements EventSink {
     if (this.closed) return
     this.closed = true
     this.done()
+  }
+
+  /** Out of the response's sequence, so it carries no `sequence_number`; it outlives the response with the socket. */
+  metadata(event: Json): void {
+    if (!this.writer.isClosed) this.writer.send(event)
   }
 
   cancel(): void {
@@ -206,10 +216,12 @@ export function upgradeResponses(req: Request, gw: Gateway): Response {
       if (active) throw new GatewayError(409, 'conflict_error', 'websocket_response_in_progress', 'One response is already in flight on this connection.')
       const { type: _type, ...body } = event
       const parsed = parseRequest(body, 'websocket')
-      const sink = new SocketSink(writer, () => {
-        if (active === sink) active = null
+      const inner = new SocketSink(writer, () => {
+        if (active === inner) active = null
       })
-      active = sink
+      active = inner
+      // a 429 before any output is the typed error event, not a response that failed
+      const sink = new GatedSink(inner, { refused: (err) => writer.error(err) })
       void gw.createInto(parsed, sink).catch((e) => {
         writer.error(asGatewayError(e))
         sink.close()

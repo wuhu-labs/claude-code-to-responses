@@ -1,7 +1,7 @@
 // Routes each Responses request to a lane: the live process when it sits at the previous response, otherwise a
 // process rebuilt from the response store or from the client's history and the provider records it carries.
 import type { FnTool, InItem, NormRequest, Part } from './api/request.ts'
-import { type EventSink, ResponseState, SseSink } from './api/stream.ts'
+import { type EventSink, GatedSink, ResponseState, SseSink } from './api/stream.ts'
 import { type CallAliases, matchRecordItems, remapItems } from './call_ids.ts'
 import { Bridge } from './bridge.ts'
 import {
@@ -125,10 +125,19 @@ export class Gateway {
     return this.config.workDir
   }
 
-  /** Validates and starts a response; returns its event stream. Errors before streaming are thrown. */
+  /**
+   * Validates and starts a response; returns its event stream once the model's first output (or the response's end)
+   * is coming. Errors before streaming are thrown, a backend 429 before any output among them (see GatedSink). A client
+   * that leaves while the response is held is noticed when the stream reaches it: its cancel stops the lane then.
+   * (The request's abort signal cannot say it sooner: Deno does not notice the disconnect after a body of a few KiB.)
+   */
   async create(req: NormRequest): Promise<ReadableStream<Uint8Array>> {
     const sink = new SseSink()
-    await this.createInto(req, sink)
+    let decide!: (err: GatewayError | null) => void
+    const decision = new Promise<GatewayError | null>((resolve) => decide = resolve)
+    await this.createInto(req, new GatedSink(sink, { opened: () => decide(null), refused: (err) => decide(err) }))
+    const err = await decision
+    if (err) throw err
     return sink.stream
   }
 

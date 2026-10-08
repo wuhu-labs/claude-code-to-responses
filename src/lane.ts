@@ -12,6 +12,7 @@ import { type Config, paths } from './config.ts'
 import { asGatewayError, type ErrorCode, GatewayError, serverError } from './errors.ts'
 import { type CallRef, digestItems, encodeRecord, encodeThinking, type ProviderRecord } from './records.ts'
 import type { ResponseStore } from './store.ts'
+import { codexRateLimits, parseRateLimitEvent, rateLimitError, type RateLimitInfo, RateLimitShapeError, REQUEST_LEVEL_429 } from './usage.ts'
 
 // deno-lint-ignore no-explicit-any
 type Json = any
@@ -112,6 +113,10 @@ export class Lane implements BridgeTarget {
   private mirrored = new Map<string, Set<number>>()
   private timer: ReturnType<typeof setTimeout> | undefined
   private runDir = ''
+  /** This process's latest `rate_limit_event` (Claude Code reports only changes, so it stands until the next). */
+  rateLimit: RateLimitInfo | null = null
+  /** Where `codex.rate_limits` goes: the last attached response's transport, kept for the idle window after it. */
+  private quota: ((event: Json) => void) | null = null
 
   constructor(
     readonly sessionId: string,
@@ -216,6 +221,7 @@ export class Lane implements BridgeTarget {
     }
     this.bridge.register(this.epoch, this)
     const epoch = this.epoch
+    this.rateLimit = null
     this.turnOpen = opts.interruptedTurn
     // the interrupted-turn resume starts the active response's turn by itself
     if (opts.interruptedTurn && this.active) this.active.ownsTurn = true
@@ -372,6 +378,8 @@ export class Lane implements BridgeTarget {
     // anything Claude Code wrote while the lane sat at rest belongs before this attempt
     if (this.proc && !this.dead) this.readLog()
     this.pendingAtAttach = this.pending.length
+    const sink = a.sink
+    this.quota = sink.metadata ? (event) => sink.metadata!(event) : null
     a.sink.onCancel = () => {
       if (this.active !== a || a.state.status !== 'in_progress') return
       this.events.note('client_disconnect', { session: this.sessionId, response: a.state.id })
@@ -547,7 +555,33 @@ export class Lane implements BridgeTarget {
         this.fail(serverError('unexpected_control_request', `Claude Code asked the host: ${JSON.stringify(f.request ?? {}).slice(0, 300)}`))
         void this.kill('control_request')
         break
+      case 'rate_limit_event':
+        this.onRateLimit(f)
+        break
     }
+  }
+
+  /**
+   * Claude Code's usage report: on every change, a normal success included (see src/usage.ts). It decides what a later
+   * 429 is, and goes to a WebSocket client as `codex.rate_limits`. A shape 2.1.284 does not produce fails the active
+   * response; at rest it is noted, and the lane forgets what it knew rather than keep a report it cannot trust.
+   */
+  private onRateLimit(f: Frame): void {
+    let info: RateLimitInfo
+    try {
+      info = parseRateLimitEvent(f)
+    } catch (e) {
+      if (!(e instanceof RateLimitShapeError)) throw e
+      this.rateLimit = null
+      const detail = `${e.message}: ${JSON.stringify(f.rate_limit_info ?? null).slice(0, 300)}`
+      this.events.note('unexpected_rate_limit_event', { session: this.sessionId, message: detail })
+      this.fail(serverError('unexpected_rate_limit_event', `Claude Code reported its usage in a shape 2.1.284 does not produce (${detail}).`))
+      return
+    }
+    this.rateLimit = info
+    this.events.note('rate_limit', { session: this.sessionId, status: info.status, type: info.rateLimitType, resets_at: info.resetsAt })
+    const event = codexRateLimits(info)
+    if (event) this.quota?.(event)
   }
 
   private mirror(e: Json): void {
@@ -566,7 +600,7 @@ export class Lane implements BridgeTarget {
     const a = this.active
     // a result can only end the active response's own turn, never the previous one's
     if (!a || a.finished || !a.ownsTurn) return
-    if (f.is_error) return this.fail(resultError(f))
+    if (f.is_error) return this.fail(resultError(f, this.rateLimit))
     if (!a.msg?.stopped) {
       return this.fail(serverError('turn_ended_without_message', `Claude Code ended its turn without a model message: ${String(f.result ?? '').slice(0, 300)}`))
     }
@@ -586,6 +620,8 @@ export class Lane implements BridgeTarget {
         return this.fail(serverError('upstream_stream_cut', 'The model stream was cut short and Claude Code retried; the partial output cannot be withdrawn.'))
       }
       this.continuing = false
+      // the first output is coming: a response held for a possible refusal starts streaming
+      a.sink.open?.()
       // the response goes on with a new model message: the wait for the last one's record is over
       clearTimeout(a.mirrorTimer)
       const u = ev.message?.usage ?? {}
@@ -852,7 +888,8 @@ export class Lane implements BridgeTarget {
     a.state.status = 'failed'
     a.state.error = err.toResponseError()
     a.state.usage = a.usage
-    a.sink.send('response.failed', { response: a.state.object() })
+    // a 429 before any output is refused as a request (an HTTP 429, the WebSocket error event): nothing was sent
+    if (!(REQUEST_LEVEL_429.has(err.code) && a.sink.refuse?.(err))) a.sink.send('response.failed', { response: a.state.object() })
     a.sink.close()
     this.events.note('failed', { session: this.sessionId, response: a.state.id, code: err.code, message: err.message.slice(0, 500) })
     void this.kill(`failed: ${err.code}`)
@@ -880,7 +917,7 @@ export { MAX_RESULT_CHARS }
  * `terminal_reason: "api_error"`, `api_error_status: <HTTP status>` and `result: "API Error: …"`; the context limit
  * with `terminal_reason: "blocking_limit"` and "Prompt is too long". The probe checks both shapes per release.
  */
-function resultError(f: Frame): GatewayError {
+function resultError(f: Frame, rateLimit: RateLimitInfo | null): GatewayError {
   const text = String(f.result ?? f.errors?.join?.('; ') ?? 'Claude Code reported an error')
   // the local blocking limit, or the backend refusing the prompt as too long ("prompt is too long: N tokens > M maximum")
   if (f.terminal_reason === 'blocking_limit' || /prompt is too long/i.test(text)) {
@@ -888,7 +925,7 @@ function resultError(f: Frame): GatewayError {
   }
   const status = typeof f.api_error_status === 'number' ? f.api_error_status : null
   if (f.terminal_reason === 'api_error' && status !== null) {
-    if (status === 429) return new GatewayError(429, 'server_error', 'rate_limit_exceeded', text)
+    if (status === 429) return rateLimitError(text, rateLimit)
     if (status === 401 || status === 403) return new GatewayError(status, 'server_error', 'upstream_authentication_error', text)
     if (status === 529) return new GatewayError(503, 'server_error', 'upstream_overloaded', text)
     if (status >= 400 && status < 500) return new GatewayError(400, 'invalid_request_error', 'upstream_invalid_request', text)

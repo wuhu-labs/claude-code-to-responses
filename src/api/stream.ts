@@ -1,4 +1,5 @@
 // The response object and its server-sent events, in OpenAI's Responses streaming shape.
+import type { GatewayError } from '../errors.ts'
 import type { NormRequest } from './request.ts'
 
 // deno-lint-ignore no-explicit-any
@@ -96,6 +97,13 @@ export interface EventSink {
    * reports transport acceptance, not peer consumption. No asynchronous work may separate prepare/enqueue. */
   prepare(events: SinkEvent[]): (() => boolean) | null
   close(): void
+  /** The model's first output is coming: a gated sink sends what it held (see GatedSink). */
+  open?(): void
+  /** Refuses the response as a whole, before any of it was sent (see GatedSink); false once it is open. */
+  refuse?(err: GatewayError): boolean
+  /** Sends an event outside the response's sequence (`codex.rate_limits`), even after the response ended, for as long
+   * as the transport lives. Only the WebSocket has one. */
+  metadata?(event: Json): void
 }
 
 /** Writes SSE events to a ReadableStream the HTTP layer returns. */
@@ -156,5 +164,91 @@ export class SseSink implements EventSink {
     try {
       this.ctrl.close()
     } catch { /* already closed */ }
+  }
+}
+
+const TERMINAL = new Set(['response.completed', 'response.failed', 'response.incomplete'])
+
+export interface GateHooks {
+  /** The held events went out: the response is streaming. */
+  opened?(): void
+  /** The response was refused before any of it went out; the gate is closed. */
+  refused(err: GatewayError): void
+}
+
+/**
+ * Holds a response's opening events (`response.created`, `response.in_progress`) until the model's first output, so
+ * a response the backend refuses before any output (a 429) can be refused as a request: a real HTTP 429 with
+ * `Retry-After`, or the WebSocket `error` event. Held events are checked against the transport as they come, exactly
+ * as if they had been sent; a terminal event before the first output sends them with it, in one batch.
+ */
+export class GatedSink implements EventSink {
+  onCancel: (() => void) | null = null
+  /** Null once open. */
+  private held: SinkEvent[] | null = []
+  private refusedWith: GatewayError | null = null
+
+  constructor(private readonly inner: EventSink, private readonly hooks: GateHooks) {
+    inner.onCancel = () => this.onCancel?.()
+  }
+
+  get isClosed(): boolean {
+    return this.refusedWith !== null || this.inner.isClosed
+  }
+
+  get isOpen(): boolean {
+    return this.held === null
+  }
+
+  send(type: string, data: Json): void {
+    this.prepare([{ type, data }])?.()
+  }
+
+  prepare(events: SinkEvent[]): (() => boolean) | null {
+    if (this.isClosed) return null
+    if (this.held === null) return this.inner.prepare(events)
+    const send = this.inner.prepare([...this.held, ...events])
+    if (!send) return null
+    if (!events.some((e) => TERMINAL.has(e.type))) {
+      return () => {
+        if (this.isClosed || this.held === null) return false
+        this.held.push(...events)
+        return true
+      }
+    }
+    return () => {
+      if (this.isClosed || this.held === null || !send()) return false
+      this.release()
+      return true
+    }
+  }
+
+  open(): void {
+    if (this.isClosed || this.held === null) return
+    // a refused send means the transport is gone, and its cancel reaches the lane
+    if (this.inner.prepare(this.held)?.()) this.release()
+  }
+
+  refuse(err: GatewayError): boolean {
+    if (this.isClosed || this.held === null) return false
+    this.refusedWith = err
+    this.held = null
+    this.hooks.refused(err)
+    return true
+  }
+
+  close(): void {
+    // a response the lane ends without a terminal event (a cancelled emission) still sends what it held
+    this.open()
+    this.inner.close()
+  }
+
+  metadata(event: Json): void {
+    this.inner.metadata?.(event)
+  }
+
+  private release(): void {
+    this.held = null
+    this.hooks.opened?.()
   }
 }

@@ -29,7 +29,9 @@ export const ERROR_CODES = [
   'context_length_exceeded',
   'upstream_invalid_request',
   'upstream_authentication_error',
+  'usage_limit_reached',
   'rate_limit_exceeded',
+  'unexpected_rate_limit_event',
   'upstream_overloaded',
   'upstream_error',
   'upstream_stream_cut',
@@ -48,25 +50,37 @@ export const ERROR_CODES = [
 ] as const
 export type ErrorCode = typeof ERROR_CODES[number]
 
+export interface GatewayErrorOptions {
+  /** More fields of the error object, after the standard ones (e.g. `limit_type`, `resets_at`). */
+  extra?: Record<string, unknown>
+  /** HTTP response headers (e.g. `retry-after`); the WebSocket `error` event carries them as `headers`. */
+  headers?: Record<string, string>
+}
+
 export class GatewayError extends Error {
+  readonly extra: Record<string, unknown>
+  readonly headers: Record<string, string>
   constructor(
     readonly status: number,
     readonly type: ErrorType,
     readonly code: ErrorCode,
     message: string,
     readonly param: string | null = null,
+    opts: GatewayErrorOptions = {},
   ) {
     super(message)
     this.name = 'GatewayError'
+    this.extra = opts.extra ?? {}
+    this.headers = opts.headers ?? {}
   }
 
   toJSON() {
-    return { error: { message: this.message, type: this.type, param: this.param, code: this.code } }
+    return { error: { message: this.message, type: this.type, param: this.param, code: this.code, ...this.extra } }
   }
 
   /** The `error` object of a failed response (`response.failed`). */
   toResponseError() {
-    return { code: this.code, message: this.message }
+    return { code: this.code, message: this.message, ...this.extra }
   }
 }
 

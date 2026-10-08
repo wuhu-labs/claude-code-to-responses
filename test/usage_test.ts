@@ -1,0 +1,381 @@
+// Subscription usage: a backend 429 that says when the limit resets, and `codex.rate_limits` on the WebSocket.
+// Claude Code reports usage (`rate_limit_event`) only with a subscription token, so these runs use a fake OAuth token
+// against the fake endpoint (probe/probe_test.ts pins what 2.1.284 makes of each response).
+import { assert, assertEquals, assertThrows } from '@std/assert'
+import {
+  codexRateLimits,
+  MAX_RETRY_AFTER_SECONDS,
+  parseRateLimitEvent,
+  rateLimitError,
+  type RateLimitInfo,
+  RateLimitShapeError,
+  retryAfterSeconds,
+} from '../src/usage.ts'
+import { call, type Json, type Reply, text } from './fake.ts'
+import { user } from './harness.ts'
+import { INSTRUCTIONS, MODEL, Run, TOOLS } from './scenario.ts'
+import type { WsClient } from './websocket_client.ts'
+
+const base = { model: MODEL, instructions: INSTRUCTIONS, tools: TOOLS }
+const now = () => Math.floor(Date.now() / 1000)
+const unified = (h: Record<string, string>) => Object.fromEntries(Object.entries(h).map(([k, v]) => [`anthropic-ratelimit-unified-${k}`, v]))
+const LIMITED = { status: 429, type: 'rate_limit_error', message: "This request would exceed your account's rate limit. Please try again later." }
+
+/** Runs with a subscription token: the only backend Claude Code reports usage for. */
+class UsageRun extends Run {
+  override backend(): Record<string, string> {
+    return { ANTHROPIC_BASE_URL: this.fake.url, CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-fake-usage-test' }
+  }
+}
+
+/**
+ * `codexSocketUsage` from Wuhu's kernel (SpaceServer/Sources/ProviderUsage.swift), as its contract reads: a window
+ * needs `window_minutes` an Int > 0, `used_percent` a Double in 0...100 and `reset_at` epoch seconds; `plan_type` is an
+ * optional String. Strict here: a window the kernel would drop is a failure, not an omission.
+ */
+function kernelParse(event: Json): { primary?: Json; secondary?: Json; plan?: string } {
+  assertEquals(event.type, 'codex.rate_limits')
+  const rl = event.rate_limits
+  assert(typeof rl === 'object' && rl !== null, 'rate_limits is an object')
+  const out: { primary?: Json; secondary?: Json; plan?: string } = {}
+  for (const name of ['primary', 'secondary'] as const) {
+    const w = rl[name]
+    if (w === undefined) continue
+    assert(Number.isInteger(w.window_minutes) && w.window_minutes > 0, `${name}.window_minutes ${w.window_minutes}`)
+    assert(
+      typeof w.used_percent === 'number' && Number.isFinite(w.used_percent) && w.used_percent >= 0 && w.used_percent <= 100,
+      `${name}.used_percent ${w.used_percent}`,
+    )
+    assert(typeof w.reset_at === 'number' && Number.isFinite(w.reset_at), `${name}.reset_at ${w.reset_at}`)
+    out[name] = w
+  }
+  if (event.plan_type !== undefined) {
+    assertEquals(typeof event.plan_type, 'string')
+    out.plan = event.plan_type
+  }
+  return out
+}
+
+// ---- units -------------------------------------------------------------------------------------------
+
+Deno.test('rate_limit_event: the shapes 2.1.284 produces parse; anything else is a RateLimitShapeError', () => {
+  assertEquals(parseRateLimitEvent({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed', isUsingOverage: false } }), {
+    status: 'allowed',
+    resetsAt: null,
+    rateLimitType: null,
+    fiveHour: null,
+    sevenDay: null,
+  })
+  const full = parseRateLimitEvent({
+    type: 'rate_limit_event',
+    rate_limit_info: {
+      status: 'rejected',
+      resetsAt: 1760000000,
+      rateLimitType: 'seven_day_opus',
+      isUsingOverage: false,
+      unifiedWindows: {
+        five_hour: { utilization: 0.25, resetsAt: 1759990000 },
+        seven_day: { utilization: 1.07, resetsAt: 1760000000 },
+        seven_day_overage_included: { utilization: 0.6, resetsAt: 1760000000 },
+      },
+    },
+  })
+  assertEquals(full, {
+    status: 'rejected',
+    resetsAt: 1760000000,
+    rateLimitType: 'seven_day_opus',
+    fiveHour: { utilization: 0.25, resetsAt: 1759990000 },
+    sevenDay: { utilization: 1.07, resetsAt: 1760000000 },
+  })
+  for (
+    const info of [
+      undefined,
+      [],
+      { status: 'throttled' },
+      { status: 'rejected', resetsAt: '1760000000' },
+      { status: 'rejected', resetsAt: 1.5 },
+      { status: 'rejected', rateLimitType: 'monthly' },
+      { status: 'allowed', unifiedWindows: [] },
+      { status: 'allowed', unifiedWindows: { five_hour: { utilization: '0.2', resetsAt: 1 } } },
+      { status: 'allowed', unifiedWindows: { five_hour: { utilization: -0.1, resetsAt: 1 } } },
+      { status: 'allowed', unifiedWindows: { seven_day: { utilization: 0.1 } } },
+      { status: 'allowed', unifiedWindows: { seven_day_overage_included: null } },
+    ]
+  ) {
+    assertThrows(() => parseRateLimitEvent({ type: 'rate_limit_event', rate_limit_info: info }), RateLimitShapeError, undefined, JSON.stringify(info))
+  }
+})
+
+Deno.test('codex.rate_limits: five_hour is primary (300), seven_day secondary (10080); unreported windows are omitted', () => {
+  const info = (w: Partial<RateLimitInfo>): RateLimitInfo => ({ status: 'allowed', resetsAt: null, rateLimitType: null, fiveHour: null, sevenDay: null, ...w })
+  assertEquals(codexRateLimits(info({})), null)
+  const both = codexRateLimits(info({ fiveHour: { utilization: 0.25, resetsAt: 1759990000 }, sevenDay: { utilization: 1.07, resetsAt: 1760000000 } }))
+  assertEquals(both, {
+    type: 'codex.rate_limits',
+    rate_limits: {
+      primary: { used_percent: 25, window_minutes: 300, reset_at: 1759990000 },
+      // used past its cap: full, within the kernel's 0...100
+      secondary: { used_percent: 100, window_minutes: 10080, reset_at: 1760000000 },
+    },
+  })
+  const p = kernelParse(both)
+  assertEquals([p.primary?.window_minutes, p.secondary?.window_minutes, p.plan], [300, 10080, undefined])
+  const five = codexRateLimits(info({ fiveHour: { utilization: 0, resetsAt: 1759990000 } }))
+  assertEquals(Object.keys(kernelParse(five)), ['primary'])
+  assertEquals(five.rate_limits.secondary, undefined)
+  const seven = codexRateLimits(info({ sevenDay: { utilization: 0.5, resetsAt: 1760000000 } }))
+  assertEquals(Object.keys(kernelParse(seven)), ['secondary'])
+  assertEquals(seven.rate_limits.primary, undefined)
+})
+
+Deno.test('the 429 mapping: a reported reset is usage_limit_reached with a capped Retry-After; none stays rate_limit_exceeded', () => {
+  const t = 1_760_000_000_000
+  assertEquals(retryAfterSeconds(1_760_000_600, t), 600)
+  assertEquals(retryAfterSeconds(1_760_000_000.2, t), 1) // rounded up: never early
+  assertEquals(retryAfterSeconds(1_759_999_000, t), 0)
+  assertEquals(retryAfterSeconds(1_760_604_800, t), MAX_RETRY_AFTER_SECONDS)
+  const rejected = (w: Partial<RateLimitInfo>): RateLimitInfo => ({
+    status: 'rejected',
+    resetsAt: null,
+    rateLimitType: 'five_hour',
+    fiveHour: null,
+    sevenDay: null,
+    ...w,
+  })
+  const e = rateLimitError("You've hit your session limit", rejected({ resetsAt: 1_760_000_600 }), t)
+  assertEquals([e.status, e.code, e.headers], [429, 'usage_limit_reached', { 'retry-after': '600' }])
+  const body: Json = e.toJSON().error
+  assertEquals([body.limit_type, body.resets_at], ['five_hour', 1_760_000_600])
+  assertEquals(rateLimitError('x', rejected({ resetsAt: 1_760_604_800, rateLimitType: 'seven_day' }), t).headers, { 'retry-after': '3600' })
+  for (const latest of [null, rejected({}), { ...rejected({ resetsAt: 1_760_000_600 }), status: 'allowed' as const }]) {
+    const r = rateLimitError('API Error: Server is temporarily limiting requests', latest, t)
+    assertEquals([r.status, r.code, r.headers, Object.keys(r.toJSON().error)], [429, 'rate_limit_exceeded', {}, ['message', 'type', 'param', 'code']])
+  }
+})
+
+// ---- the gateway -------------------------------------------------------------------------------------
+
+async function sse(run: Run, input: string): Promise<{ status: number; headers: Headers; body: Json; events: Json[] }> {
+  const res = await fetch(`${run.tg.url}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ ...base, input, stream: true }),
+  })
+  if (!res.headers.get('content-type')?.startsWith('text/event-stream')) return { status: res.status, headers: res.headers, body: await res.json(), events: [] }
+  const events = (await res.text()).split('\n').filter((l) => l.startsWith('data: ')).map((l) => JSON.parse(l.slice(6)))
+  return { status: res.status, headers: res.headers, body: null, events }
+}
+
+/** One create on the socket: every event up to the terminal one or the error event. */
+async function wsCreate(ws: WsClient, input: string): Promise<Json[]> {
+  await ws.opened
+  ws.socket.send(JSON.stringify({ type: 'response.create', ...base, input }))
+  const events: Json[] = []
+  while (true) {
+    const ev = await ws.next()
+    events.push(ev)
+    if (['error', 'response.completed', 'response.failed', 'response.incomplete'].includes(ev.type)) return events
+  }
+}
+
+const limit = (reset: number, claim: string, windows: Record<string, string> = {}): Reply => ({
+  blocks: [text('never')],
+  error: LIMITED,
+  headers: unified({ status: 'rejected', reset: String(reset), 'representative-claim': claim, ...windows }),
+})
+
+for (const transport of ['sse', 'websocket'] as const) {
+  Deno.test(`${transport}: a usage limit with a reset is 429 usage_limit_reached, Retry-After to the reset, the type and reset in the body`, async () => {
+    const run = new UsageRun(`usage-limit-${transport}`, false)
+    await run.run(async () => {
+      const reset = now() + 600
+      run.fake.reply(limit(reset, 'five_hour', { '5h-utilization': '1', '5h-reset': String(reset) }))
+      let status: number, retryAfter: string | null, error: Json, events: Json[] = []
+      const ws = transport === 'websocket' ? run.tg.websocket() : null
+      if (!ws) {
+        const r = await sse(run, 'over the limit')
+        ;[status, retryAfter, error] = [r.status, r.headers.get('retry-after'), r.body.error]
+      } else {
+        events = await wsCreate(ws, 'over the limit')
+        const e = events.at(-1)
+        assertEquals(e.type, 'error')
+        ;[status, retryAfter, error] = [e.status, e.headers['retry-after'], e.error]
+      }
+      assertEquals(status, 429)
+      const seconds = Number(retryAfter)
+      assert(seconds >= 595 && seconds <= 600, `Retry-After ${retryAfter}`)
+      assertEquals([error.code, error.type, error.limit_type, error.resets_at], ['usage_limit_reached', 'server_error', 'five_hour', reset])
+      assert(error.message.includes("You've hit your session limit"), error.message)
+      if (transport === 'websocket') {
+        // refused as a request: nothing of the response went out, only the usage report before the error
+        assertEquals(events.map((e) => e.type), ['codex.rate_limits', 'error'])
+        assertEquals(kernelParse(events[0]).primary, { used_percent: 100, window_minutes: 300, reset_at: reset })
+      }
+      // nothing is answered from memory: the next request goes to the backend, and works once it does (on the same socket)
+      run.fake.reply({ blocks: [text('back')] })
+      const next = ws ? (await wsCreate(ws, 'again')).at(-1) : (await sse(run, 'again')).events.at(-1)
+      assertEquals(next.type, 'response.completed')
+      assertEquals(run.fake.main().length, 2)
+    })
+  })
+
+  Deno.test(`${transport}: Retry-After is capped at an hour (a weekly limit days away)`, async () => {
+    const run = new UsageRun(`usage-cap-${transport}`, false)
+    await run.run(async () => {
+      const reset = now() + 4 * 86400
+      run.fake.reply(limit(reset, 'seven_day', { '7d-utilization': '1', '7d-reset': String(reset) }))
+      if (transport === 'sse') {
+        const r = await sse(run, 'weekly')
+        assertEquals([r.status, r.headers.get('retry-after'), r.body.error.code, r.body.error.limit_type, r.body.error.resets_at], [
+          429,
+          '3600',
+          'usage_limit_reached',
+          'seven_day',
+          reset,
+        ])
+      } else {
+        const e = (await wsCreate(run.tg.websocket(), 'weekly')).at(-1)
+        assertEquals([e.type, e.status, e.headers, e.error.code, e.error.limit_type, e.error.resets_at], [
+          'error',
+          429,
+          { 'retry-after': '3600' },
+          'usage_limit_reached',
+          'seven_day',
+          reset,
+        ])
+      }
+    })
+  })
+
+  Deno.test(`${transport}: a 429 without a reset stays rate_limit_exceeded, without Retry-After (Claude Code drops the backend's)`, async () => {
+    const run = new UsageRun(`usage-no-reset-${transport}`, false)
+    await run.run(async () => {
+      const replies: Reply[] = [
+        { blocks: [text('never')], error: LIMITED, headers: unified({ status: 'rejected', 'representative-claim': 'five_hour' }) },
+        { blocks: [text('never')], error: LIMITED, headers: { 'retry-after': '37' } },
+      ]
+      for (const reply of replies) {
+        run.fake.reply(reply)
+        if (transport === 'sse') {
+          const r = await sse(run, 'limited')
+          assertEquals([r.status, r.headers.get('retry-after'), r.body.error.code, r.body.error.limit_type], [429, null, 'rate_limit_exceeded', undefined])
+        } else {
+          const e = (await wsCreate(run.tg.websocket(), 'limited')).at(-1)
+          assertEquals([e.type, e.status, e.headers, e.error.code, e.error.limit_type], ['error', 429, undefined, 'rate_limit_exceeded', undefined])
+        }
+      }
+    })
+  })
+}
+
+Deno.test('websocket: codex.rate_limits on a normal success, in the shape the kernel parses; only reported windows', async () => {
+  const run = new UsageRun('usage-event-ws', false)
+  await run.run(async () => {
+    const r5 = now() + 3 * 3600, r7 = now() + 4 * 86400
+    const ws = run.tg.websocket()
+    run.fake.reply({
+      blocks: [text('one')],
+      headers: unified({ status: 'allowed', '5h-utilization': '0.3', '5h-reset': String(r5), '7d-utilization': '0.5', '7d-reset': String(r7) }),
+    })
+    const one = await wsCreate(ws, 'one')
+    assertEquals(one.at(-1).type, 'response.completed')
+    const usage = one.filter((e) => e.type === 'codex.rate_limits')
+    assertEquals(usage.length, 1)
+    assertEquals(usage[0], {
+      type: 'codex.rate_limits',
+      rate_limits: { primary: { used_percent: 30, window_minutes: 300, reset_at: r5 }, secondary: { used_percent: 50, window_minutes: 10080, reset_at: r7 } },
+    })
+    kernelParse(usage[0])
+    // outside the response's sequence
+    assertEquals(usage[0].sequence_number, undefined)
+
+    // only the weekly window reported: no primary
+    run.fake.reply({ blocks: [text('two')], headers: unified({ status: 'allowed', '7d-utilization': '0.6', '7d-reset': String(r7) }) })
+    const two = (await wsCreate(ws, 'two')).filter((e) => e.type === 'codex.rate_limits')
+    assertEquals(two.map((e) => e.rate_limits), [{ secondary: { used_percent: 60, window_minutes: 10080, reset_at: r7 } }])
+
+    // a report without windows (no unified headers) sends nothing: never an invented window
+    run.fake.reply({ blocks: [text('three')] })
+    const before = run.tg.events('rate_limit').length
+    const three = await wsCreate(ws, 'three')
+    assertEquals(three.filter((e) => e.type === 'codex.rate_limits'), [])
+    assertEquals(run.tg.events('rate_limit').length, before + 1)
+    assertEquals(run.tg.events('rate_limit').at(-1)?.data.status, 'allowed')
+  })
+})
+
+Deno.test('websocket: a report after a tool-call response completed reaches the socket in the idle window', async () => {
+  const run = new UsageRun('usage-event-idle', false)
+  await run.run(async () => {
+    const r5 = now() + 3600
+    const ws = run.tg.websocket()
+    // the response ends at the model's message_stop; Claude Code reports usage just after it
+    run.fake.reply({
+      blocks: [call('toolu_idle', 'echo', { text: 'x' })],
+      headers: unified({ status: 'allowed', '5h-utilization': '0.42', '5h-reset': String(r5) }),
+    })
+    const events = await wsCreate(ws, 'call a tool')
+    assertEquals(events.at(-1).type, 'response.completed')
+    const usage = events.find((e) => e.type === 'codex.rate_limits') ?? await ws.next()
+    assertEquals(kernelParse(usage).primary, { used_percent: 42, window_minutes: 300, reset_at: r5 })
+  })
+})
+
+Deno.test('sse: the stream carries only standard Responses events, no codex.rate_limits', async () => {
+  const run = new UsageRun('usage-event-sse', false)
+  await run.run(async () => {
+    const r5 = now() + 3600
+    run.fake.reply({ blocks: [text('one')], headers: unified({ status: 'allowed', '5h-utilization': '0.3', '5h-reset': String(r5) }) })
+    const r = await sse(run, 'one')
+    assertEquals(r.events.at(-1).type, 'response.completed')
+    assertEquals(r.events.filter((e) => !e.type.startsWith('response.')), [])
+    assertEquals(run.tg.events('rate_limit').length, 1)
+  })
+})
+
+Deno.test('a 429 after output has streamed stays a failed response, with the usage fields in its error', async () => {
+  const run = new UsageRun('usage-after-output', false)
+  await run.run(async () => {
+    const reset = now() + 900
+    // the second call names a tool the client never defined, so the notice waits for the end-of-turn hook and the
+    // response makes a second inference after its first output (as in matrix_test.ts)
+    run.fake.reply(
+      { blocks: [call('toolu_k', 'echo', { text: 'k' }), call('toolu_u', 'nonexistent', {})] },
+      { blocks: [text('first part')] },
+      limit(reset, 'five_hour'),
+    )
+    await run.send([user('T1')])
+    const r = await run.send([
+      { type: 'function_call_output', call_id: 'toolu_k', output: 'K' },
+      { type: 'function_call_output', call_id: 'toolu_u', output: 'unknown tool' },
+      user('NOTICE-STOP'),
+    ])
+    assertEquals(r.status, 'failed')
+    assertEquals(r.events[0].type, 'response.created')
+    assert(r.events.some((e) => e.type === 'response.output_text.delta'))
+    assertEquals([r.response.error.code, r.response.error.limit_type, r.response.error.resets_at], ['usage_limit_reached', 'five_hour', reset])
+  })
+})
+
+Deno.test('sse: a client that leaves while its response is held is noticed at the first output, which cancels it', async () => {
+  const run = new UsageRun('usage-held-abort', false)
+  await run.run(async () => {
+    run.fake.reply({ blocks: [text('too late')], delayMs: 1500 })
+    const ac = new AbortController()
+    const res = fetch(`${run.tg.url}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...base, input: 'slow', stream: true }),
+      signal: ac.signal,
+    }).catch((e) => e)
+    await run.tg.waitEvent('request')
+    while (run.fake.main().length === 0) await new Promise((r) => setTimeout(r, 20))
+    ac.abort()
+    assert((await res) instanceof Error)
+    await run.tg.waitEvent('client_disconnect')
+    assertEquals(run.tg.events('completed').length, 0)
+    // the conversation is free again
+    run.fake.reply({ blocks: [text('fine')] })
+    assertEquals((await sse(run, 'again')).events.at(-1).type, 'response.completed')
+  })
+})
