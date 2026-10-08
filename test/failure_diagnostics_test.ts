@@ -288,3 +288,122 @@ for (const transport of ['sse', 'websocket'] as const) {
     })
   })
 }
+
+for (const transport of ['sse', 'websocket'] as const) {
+  Deno.test(`${transport}: ENOSPC after a partial append reports failure, rolls back and recovered writes are valid JSONL`, async () => {
+    const run = new Run(`failure-diag-partial-${transport}`, false, { transport })
+    await run.run(async () => {
+      const badReply = () => run.fake.reply({ blocks: [{ type: 'tool_use', id: 'toolu_bad', name: 'private/tool', input: {} }] })
+      badReply()
+      const first = await run.send([user('go')])
+      await run.tg.waitEvent('kill', (d) => d.session === first.response.x_gateway.session)
+      const path = run.tg.gw.failures.path, baseline = Deno.readTextFileSync(path)
+      const open = Deno.openSync, error = console.error, journal: string[] = []
+      let writes = 0
+      // Inject a real 40-byte prefix write before the ENOSPC throw, only into the diagnostic append fd.
+      Deno.openSync = (name, options) => {
+        const file = open(name, options)
+        if (name === path && options?.append) {
+          const write = file.writeSync.bind(file)
+          file.writeSync = (bytes) => {
+            if (++writes === 1) return write(bytes.subarray(0, 40))
+            throw new Error('ENOSPC: no space left on device (injected)')
+          }
+        }
+        return file
+      }
+      console.error = (...args: unknown[]) => {
+        journal.push(args.join(' '))
+        error(...args)
+      }
+      try {
+        badReply()
+        const failed = await run.send([user('go')])
+        await run.tg.waitEvent('kill', (d) => d.session === failed.response.x_gateway.session)
+        assertEquals(writes, 2)
+        assertEquals(failed.response.error.reason, 'name_charset')
+        assertEquals(failed.response.error.diagnostic_error, 'failure_diagnostics_write_failed')
+        assertEquals(Deno.readTextFileSync(path), baseline, 'incomplete append was rolled back without damaging earlier records')
+        assertEquals(journal.length, 1)
+        const diagnostic = JSON.parse(journal[0].slice('failure '.length))
+        assertEquals([diagnostic.response_id, diagnostic.diagnostic_error], [failed.response.id, 'failure_diagnostics_write_failed'])
+        Deno.openSync = open
+        badReply()
+        const recovered = await run.send([user('go')])
+        await run.tg.waitEvent('kill', (d) => d.session === recovered.response.x_gateway.session)
+        assertEquals(recovered.response.error.diagnostic_error, undefined)
+        const records = Deno.readTextFileSync(path).trimEnd().split('\n').map((line) => JSON.parse(line))
+        assertEquals(records.map((r) => r.response_id), [first.response.id, recovered.response.id])
+        assertEquals(journal.length, 2, 'the earlier persistence failure remains in the journal')
+      } finally {
+        Deno.openSync = open
+        console.error = error
+      }
+    })
+  })
+}
+
+Deno.test('failure diagnostics: append recovers an unterminated suffix, including across scan chunks and after rotation', () => {
+  const root = Deno.makeTempDirSync()
+  try {
+    const log = new FailureLog(root)
+    const record: FailureDiagnostic = {
+      time: '2026-10-08T06:43:52.000Z',
+      response_id: 'resp_safe',
+      previous_response_id: null,
+      claude_session_id: 'session_safe',
+      message_id: 'msg_safe',
+      code: 'malformed_model_message',
+      reason: 'name_charset',
+      block_index: 0,
+      failed_field: 'name',
+      field: shape('private/tool'),
+      tool: toolSummary('private/tool'),
+      input: shape({}),
+    }
+    log.append(record)
+    const baseline = Deno.readTextFileSync(log.path)
+    // This also covers a crash or a failed truncate rollback without trusting a process-local flag.
+    Deno.writeTextFileSync(log.path, 'x'.repeat(9000), { append: true })
+    new FailureLog(root).append({ ...record, response_id: 'resp_recovered' })
+    assertEquals(Deno.readTextFileSync(log.path).trimEnd().split('\n').map((line) => JSON.parse(line).response_id), ['resp_safe', 'resp_recovered'])
+    Deno.writeTextFileSync(log.path, 'x'.repeat(9000))
+    log.append(record)
+    assertEquals(Deno.readTextFileSync(log.path), baseline, 'an incomplete first record is removed')
+    const old = baseline.repeat(Math.floor(FAILURE_LOG_MAX_BYTES / baseline.length))
+    Deno.writeTextFileSync(log.path, old)
+    const open = Deno.openSync
+    Deno.openSync = (path, options) => {
+      const file = open(path, options)
+      if (path === log.path && options?.append) {
+        const write = file.writeSync.bind(file)
+        let partial = false
+        file.writeSync = (bytes) => {
+          if (!partial) {
+            partial = true
+            return write(bytes.subarray(0, 40))
+          }
+          throw new Error('ENOSPC: no space left on device (injected)')
+        }
+      }
+      return file
+    }
+    try {
+      let failed = false
+      try {
+        log.append(record)
+      } catch {
+        failed = true
+      }
+      assert(failed)
+      assertEquals(Deno.readTextFileSync(log.path), '', 'rollback after rotation truncates to zero, not the old archive size')
+      assertEquals(Deno.readTextFileSync(`${log.path}.1`), old)
+    } finally {
+      Deno.openSync = open
+    }
+    log.append(record)
+    assertEquals(JSON.parse(Deno.readTextFileSync(log.path)), record)
+  } finally {
+    Deno.removeSync(root, { recursive: true })
+  }
+})

@@ -160,18 +160,24 @@ export class FailureLog {
 
   append(record: FailureDiagnostic): void {
     const line = new TextEncoder().encode(JSON.stringify(record) + '\n')
-    let size = 0
-    try {
-      size = Deno.statSync(this.path).size
-    } catch (e) {
-      if (!(e instanceof Deno.errors.NotFound)) throw e
+    let size = this.completeSize()
+    if (size + line.length > FAILURE_LOG_MAX_BYTES) {
+      Deno.renameSync(this.path, `${this.path}.1`)
+      size = 0
     }
-    if (size + line.length > FAILURE_LOG_MAX_BYTES) Deno.renameSync(this.path, `${this.path}.1`)
     const file = Deno.openSync(this.path, { create: true, append: true, mode: 0o600 })
     try {
       let written = 0
       while (written < line.length) written += file.writeSync(line.subarray(written))
       file.syncSync()
+    } catch (error) {
+      // A short write followed by ENOSPC must not poison the next JSONL record. Keep the original failure
+      // visible even if rollback itself fails; completeSize() repairs any unterminated suffix next time.
+      try {
+        file.truncateSync(size)
+        file.syncSync()
+      } catch { /* storage is still broken; the next append repairs its boundary before writing */ }
+      throw error
     } finally {
       file.close()
     }
@@ -181,6 +187,49 @@ export class FailureLog {
       dir.syncSync()
     } finally {
       dir.close()
+    }
+  }
+
+  /** Retain complete records after interrupted writes/crashes, using a bounded backwards scan. */
+  private completeSize(): number {
+    let file: Deno.FsFile
+    try {
+      file = Deno.openSync(this.path, { read: true, write: true })
+    } catch (error) {
+      if (error instanceof Deno.errors.NotFound) return 0
+      throw error
+    }
+    try {
+      const size = file.statSync().size
+      let end = size
+      while (end > 0) {
+        const start = Math.max(0, end - 4096)
+        const chunk = new Uint8Array(end - start)
+        file.seekSync(start, Deno.SeekMode.Start)
+        let read = 0
+        while (read < chunk.length) {
+          const count = file.readSync(chunk.subarray(read))
+          if (!count) throw new Error('failure diagnostics changed while recovering an incomplete record')
+          read += count
+        }
+        const newline = chunk.lastIndexOf(10)
+        if (newline >= 0) {
+          const complete = start + newline + 1
+          if (complete < size) {
+            file.truncateSync(complete)
+            file.syncSync()
+          }
+          return complete
+        }
+        end = start
+      }
+      if (size > 0) {
+        file.truncateSync(0)
+        file.syncSync()
+      }
+      return 0
+    } finally {
+      file.close()
     }
   }
 }

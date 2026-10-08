@@ -188,7 +188,10 @@ are not continuation points; a client can retry against its last completed respo
 Every active response failure appends one sanitized JSON line to `<state-dir>/failures.jsonl` **before** its terminal failure event is emitted or the child
 is killed. The append and directory metadata are synchronously fsynced. The log survives failed-attempt tail exclusion, resume overwrites and gateway
 restarts. Before an append would exceed 1 MiB, the active file replaces `failures.jsonl.1`; at most two 1 MiB files are retained, both mode `0600` on creation.
-The gateway also writes `failure <same JSON>` to stderr (captured by the service's journal).
+The gateway also writes `failure <same JSON>` to stderr (captured by the service's journal). A failed append is
+rolled back to the pre-write size. Before each append, any unterminated suffix left by an interrupted write/crash
+or a failed rollback is truncated to the last complete newline, so recovered writes cannot be glued to a partial record.
+The earlier persistence failure remains explicit on its wire error and journal line.
 
 Records contain UTC `time`, `response_id`, `previous_response_id`, `claude_session_id`, `message_id`, error `code` and `reason`, `block_index`, `failed_field`,
 the failed field's `field` shape, `tool` metadata and `input` shape. Unavailable fields are `null`; non-malformed failures carry only correlation ids and their

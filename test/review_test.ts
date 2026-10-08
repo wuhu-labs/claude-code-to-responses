@@ -325,10 +325,15 @@ Deno.test('an end-of-turn continuation may stream longer than the record timeout
 Deno.test('a model message that stops for tool use without calling one fails the response; the chain goes on', async () => {
   const run = new Run('zero-blocks', false, { recordTimeoutMs: 3000 })
   await run.run(async () => {
-    run.fake.reply({ blocks: [text('one')] }, { blocks: [], stop: 'tool_use' }, { blocks: [text('fine')] })
+    run.fake.reply({ blocks: [text('one')] }, { blocks: [], stop: 'tool_use' })
     await run.turn('one')
+    const lane = [...run.tg.gw.lanes.values()][0]
     const r = await run.send([user('two')])
-    assertEquals([r.status, r.response.error.code], ['failed', 'malformed_model_message'])
+    assertEquals([r.status, r.response.error.code, r.response.error.reason], ['failed', 'malformed_model_message', 'tool_use_without_tool'])
+    // Claude Code can issue its native empty-tool recovery before the gateway observes stdout and fsyncs
+    // the failure. Do not let that rejected child consume the fixture intended for the client's retry.
+    await lane.gone
+    run.fake.reply({ blocks: [text('fine')] })
     const r2 = await run.send([user('two again')])
     assertEquals(r2.status, 'completed')
     assertEquals(run.drv.text(r2), 'fine')
