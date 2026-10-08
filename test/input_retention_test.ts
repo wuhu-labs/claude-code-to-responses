@@ -1,7 +1,7 @@
 import { assertEquals } from '@std/assert'
 import { parseRequest } from '../src/api/request.ts'
 import { ResponseState } from '../src/api/stream.ts'
-import { canonItem, digestItems, ItemDigest, sha256 } from '../src/records.ts'
+import { canonItem, digestItems, encodeThinking, ItemDigest, sha256, THINKING_PREFIX } from '../src/records.ts'
 
 Deno.test('normalized and response echo state do not retain the original input body', () => {
   const req = parseRequest(
@@ -25,4 +25,12 @@ Deno.test('incremental covered-item digest remains byte-compatible with legacy c
   const old = await sha256(JSON.stringify(all.map(canonItem).filter((v) => v !== null)))
   assertEquals(await digestItems(all), old)
   assertEquals(new ItemDigest(input).finish(outputs), old)
+})
+
+Deno.test('native base64 encoding preserves the legacy opaque thinking bytes', () => {
+  const value = { thinking: 'Unicode 🌍 and lone surrogate \ud800', signature: 'binary-ish \u0000 \uffff '.repeat(10_000) }
+  const bytes = new TextEncoder().encode(JSON.stringify(value))
+  let binary = ''
+  for (const byte of bytes) binary += String.fromCharCode(byte)
+  assertEquals(encodeThinking(value), THINKING_PREFIX + btoa(binary))
 })

@@ -1,3 +1,4 @@
+import { lines } from './lines.ts'
 // One Claude Code child process: stream-json in and out, killed with SIGKILL.
 import { launchArgs, launchEnv, type LaunchSpec } from './pins.ts'
 
@@ -73,22 +74,6 @@ export class ClaudeProcess {
       this.stderrTail = (this.stderrTail + line + '\n').slice(-8192)
     }
   }
-}
-
-async function* lines(stream: ReadableStream<Uint8Array>) {
-  const dec = new TextDecoder()
-  let buf = ''
-  for await (const chunk of stream) {
-    buf += dec.decode(chunk, { stream: true })
-    let i
-    while ((i = buf.indexOf('\n')) >= 0) {
-      const l = buf.slice(0, i)
-      buf = buf.slice(i + 1)
-      if (l) yield l
-    }
-  }
-  buf += dec.decode()
-  if (buf) yield buf
 }
 
 /** One identity for configured executables, registries and process inspection, including symlink aliases. */

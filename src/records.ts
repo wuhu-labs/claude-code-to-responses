@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer'
 import { checkReplay, type ReplayLine } from './replay.ts'
 import { createHash } from 'node:crypto'
 // Provider records: the Claude Code log entries behind each response, carried opaquely in a reasoning item's
@@ -59,9 +60,7 @@ async function gunzip(bytes: Uint8Array<ArrayBuffer>): Promise<Uint8Array> {
   return new Uint8Array(await new Response(s).arrayBuffer())
 }
 function b64(bytes: Uint8Array): string {
-  let s = ''
-  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
-  return btoa(s)
+  return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('base64')
 }
 function unb64(s: string): Uint8Array<ArrayBuffer> {
   const bin = atob(s)

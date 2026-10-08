@@ -1,3 +1,4 @@
+import { rawSocket, readRawFrame, writeAll } from './raw_websocket.ts'
 import { replayLog } from '../src/replay.ts'
 import { assert, assertEquals, assertExists, assertRejects } from '@std/assert'
 import { SocketWriter, WS_DRAIN_TIMEOUT_MS, WS_MAX_BUFFERED_BYTES, WS_MAX_MESSAGE_BYTES } from '../src/websocket.ts'
@@ -340,28 +341,6 @@ Deno.test('WebSocket oversized inbound text yields typed 413 and closes with 100
 
 // A raw peer is required for true network backpressure: the JS WebSocket API always reads the network,
 // even when its owner has no message listener. Read only the upgrade, then never consume another byte.
-async function rawSocket(url: string, token?: string): Promise<Deno.TcpConn> {
-  const u = new URL(url)
-  const conn = await Deno.connect({ hostname: u.hostname, port: Number(u.port) })
-  const request =
-    `GET /v1/responses HTTP/1.1\r\nHost: ${u.host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n${
-      token ? `Authorization: Bearer ${token}\r\n` : ''
-    }\r\n`
-  await writeAll(conn, new TextEncoder().encode(request))
-  let header = ''
-  const buf = new Uint8Array(4096)
-  while (!header.includes('\r\n\r\n')) {
-    const n = await conn.read(buf)
-    if (n === null) throw new Error('upgrade EOF')
-    header += new TextDecoder().decode(buf.subarray(0, n))
-  }
-  assert(header.startsWith('HTTP/1.1 101'), header)
-  return conn
-}
-async function writeAll(conn: Deno.TcpConn, bytes: Uint8Array): Promise<void> {
-  let at = 0
-  while (at < bytes.length) at += await conn.write(bytes.subarray(at))
-}
 // Deno's native socket rejects individual frames >=64 MiB, independently of the application's message cap.
 async function oversizedFragments(conn: Deno.TcpConn, opcode: number): Promise<void> {
   const chunk = new Uint8Array(1024 * 1024).fill(120)
@@ -375,24 +354,6 @@ async function oversizedFragments(conn: Deno.TcpConn, opcode: number): Promise<v
   }
   await writeAll(conn, new Uint8Array([0x80, 0x81, 0, 0, 0, 0, 120]))
 }
-async function readRawFrame(conn: Deno.TcpConn): Promise<{ opcode: number; payload: Uint8Array }> {
-  const read = async (count: number) => {
-    const bytes = new Uint8Array(count)
-    let at = 0
-    while (at < count) {
-      const n = await conn.read(bytes.subarray(at))
-      if (n === null) throw new Error('frame EOF')
-      at += n
-    }
-    return bytes
-  }
-  const header = await read(2)
-  let length = header[1] & 127
-  if (length === 126) length = new DataView((await read(2)).buffer).getUint16(0)
-  if (length === 127) length = Number(new DataView((await read(8)).buffer).getBigUint64(0))
-  return { opcode: header[0] & 15, payload: await read(length) }
-}
-
 async function rawCreate(conn: Deno.TcpConn, body: Json): Promise<void> {
   const text = new TextEncoder().encode(JSON.stringify({ type: 'response.create', ...base, ...body }))
   assert(text.length < 65536)
@@ -689,39 +650,45 @@ Deno.test('WebSocket real native tool framing produces a record above 42 MiB wit
       blocks: [text('done')],
       usage: { input_tokens: 50_000 },
     })
-    const conn = await rawSocket(run.tg.url)
-    const events: Json[] = []
+    const dir = Deno.makeTempDirSync({ prefix: 'cc2r-large-peer-' })
+    const file = `${dir}/opaque`
+    const peer = new Deno.Command(Deno.execPath(), {
+      args: [
+        'run',
+        '-A',
+        new URL('./raw_websocket_peer.ts', import.meta.url).pathname,
+        run.tg.url,
+        JSON.stringify({ type: 'response.create', ...base, input: 'Think.' }),
+        file,
+      ],
+      stdout: 'piped',
+      stderr: 'piped',
+    }).spawn()
+    let opaque: string, result: Json
     try {
-      await rawCreate(conn, { input: 'Think.' })
-      while (true) {
-        const frame = await readRawFrame(conn)
-        if (frame.opcode === 9) {
-          await writeAll(conn, new Uint8Array([0x8a, 0x80 | frame.payload.length, 0, 0, 0, 0, ...frame.payload]))
-          continue
-        }
-        assertEquals(frame.opcode, 1)
-        const event = JSON.parse(new TextDecoder().decode(frame.payload))
-        assert(event.type !== 'error', JSON.stringify(event))
-        events.push(event)
-        if (event.type === 'response.completed' || event.type === 'response.failed') break
-      }
+      const output = await peer.output()
+      assertEquals(output.code, 0, new TextDecoder().decode(output.stderr))
+      result = JSON.parse(new TextDecoder().decode(output.stdout))
+      opaque = Deno.readTextFileSync(file)
     } finally {
-      conn.close()
+      try {
+        peer.kill('SIGTERM')
+      } catch { /* already exited */ }
+      Deno.removeSync(dir, { recursive: true })
     }
-    const response = events.at(-1).response
-    assertEquals(response.status, 'completed')
-    const item = events.findLast((e) => e.type === 'response.output_item.added').item
+    assertEquals(result.status, 'completed')
+    const item = { encrypted_content: opaque! }
     assert(item.encrypted_content.length > 42 * 1024 * 1024)
     const record = await decodeRecord(item.encrypted_content)
     assertExists(record)
-    assertEquals(run.tg.gw.store.get(response.id), record)
+    assertEquals(run.tg.gw.store.get(result.id), record)
     const saved = record.entries.flatMap((l) => JSON.parse(l).message?.content ?? []).find((b: Json) => b.type === 'tool_use')
     assertEquals(saved.input.signature, signature)
-    const added = events.find((e) => e.type === 'response.output_item.added' && e.item.id === item.id)
-    const done = events.find((e) => e.type === 'response.output_item.done' && e.item.id === item.id)
-    assertEquals(added.item.encrypted_content, item.encrypted_content)
-    assertEquals(done.item.encrypted_content, undefined)
-    assertEquals(events.at(-1).response.output.at(-1).encrypted_content, undefined)
+    assertEquals(result.recordBytes, opaque!.length)
+    assertEquals(result.addedId, result.doneId)
+    assertEquals(result.addedId, result.terminalId)
+    assertEquals(result.doneOpaque, false)
+    assertEquals(result.terminalOpaque, false)
     assertEquals(record.nativeCalls, ['toolu_native_record'])
   })
 })
