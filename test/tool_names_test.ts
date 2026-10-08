@@ -191,3 +191,46 @@ scenarioTest('duplicate native ids are deduped on write and legacy duplicate rec
     assertPrefix(run.fake.main()[3], run.fake.main()[4])
   })
 })
+
+// Code emits input:{} at block start even when its eventual arguments are null. Inject the malformed
+// stream frame at the lane boundary so these tests reach the HEADER guards, not argument validation.
+for (
+  const [label, patch] of [
+    ['empty id', { id: '' }],
+    ['invalid id characters', { id: 'toolu bad' }],
+    ['overlong id', { id: 'x'.repeat(129) }],
+    ['empty name', { name: '' }],
+    ['invalid name characters', { name: 'bad.name' }],
+    ['overlong name', { name: 'x'.repeat(65) }],
+    ['null input', { input: null }],
+  ] as const
+) {
+  for (const name of ['mcp__fn__echo', 'echo']) {
+    Deno.test(`malformed tool_use header: ${label} fails before client/native dispatch (${name})`, async () => {
+      const run = new Run(`malformed-header-${label}-${name}`, false)
+      await run.run(async () => {
+        run.fake.reply({ blocks: [text('ready')] }, { blocks: [bare('toolu_header', name)] })
+        const parent = await run.send([user('warm up')])
+        const lane = [...run.tg.gw.lanes.values()][0]
+        const frames = lane as unknown as { streamEvent(ev: Json): void }
+        const streamEvent = frames.streamEvent.bind(lane)
+        let injected = false
+        frames.streamEvent = (ev) => {
+          if (ev.type === 'content_block_start' && ev.content_block?.type === 'tool_use') {
+            injected = true
+            ev = { ...ev, content_block: { ...ev.content_block, ...patch } }
+          }
+          streamEvent(ev)
+        }
+        const failed = await run.send([user('bad header')])
+        assert(injected, 'the malformed header reached the lane')
+        assertEquals([failed.status, failed.response.error?.code], ['failed', 'malformed_model_message'])
+        assertStringIncludes(failed.response.error.message, 'malformed tool_use block')
+        assertEquals(run.drv.calls(failed), [])
+        assertEquals(run.tg.events('hold'), [])
+        assert(!run.tg.gw.store.has(failed.response.id), 'no malformed record was committed')
+        assert(run.tg.gw.store.has(parent.response.id), 'the valid parent remains a continuation point')
+      })
+    })
+  }
+}
