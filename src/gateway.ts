@@ -22,6 +22,7 @@ import { asGatewayError, GatewayError, invalid, previousResponseNotFound } from 
 import { Active, type ChainSpec, type Head, Lane, MAX_RESULT_CHARS, outputChars } from './lane.ts'
 import { type CallRef, decodeRecord, decodeThinking, type ProviderRecord, RecordError, sha256, THINKING_PREFIX } from './records.ts'
 import { ResponseStore } from './store.ts'
+import { type FailureDiagnostic, FailureLog } from './failures.ts'
 
 // deno-lint-ignore no-explicit-any
 type Json = any
@@ -45,6 +46,7 @@ type Delivery =
 
 export class Gateway {
   readonly store: ResponseStore
+  readonly failures: FailureLog
   readonly bridge: Bridge
   readonly lanes = new Map<string, Lane>()
   readonly events: GatewayEvent[] = []
@@ -52,6 +54,7 @@ export class Gateway {
 
   private constructor(readonly config: Config) {
     this.store = new ResponseStore(config.stateDir)
+    this.failures = new FailureLog(config.stateDir)
     this.bridge = new Bridge(config.bridgePort)
   }
 
@@ -105,6 +108,16 @@ export class Gateway {
   }
 
   private laneEvents = {
+    failure: (record: FailureDiagnostic) => {
+      // journald captures stderr in the service; never forward raw error messages or response output.
+      try {
+        this.failures.append(record)
+      } catch (error) {
+        console.error(`failure ${JSON.stringify({ ...record, diagnostic_error: 'failure_diagnostics_write_failed' })}`)
+        throw error
+      }
+      console.error(`failure ${JSON.stringify(record)}`)
+    },
     note: (kind: string, data: Json) => this.note(kind, data),
     dead: (lane: Lane) => {
       if (this.lanes.get(lane.sessionId) === lane) this.lanes.delete(lane.sessionId)

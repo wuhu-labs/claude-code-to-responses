@@ -12,6 +12,16 @@ import { type Config, paths } from './config.ts'
 import { asGatewayError, type ErrorCode, GatewayError, serverError } from './errors.ts'
 import { type CallRef, digestItems, encodeRecord, encodeThinking, type ProviderRecord } from './records.ts'
 import type { ResponseStore } from './store.ts'
+import {
+  diagnosticMessageId,
+  type FailureDiagnostic,
+  MalformedModelError,
+  toolArgumentsError,
+  toolHeaderError,
+  toolStopError,
+  type ToolSummary,
+  toolSummary,
+} from './failures.ts'
 import { codexRateLimits, parseRateLimitEvent, rateLimitError, type RateLimitInfo, RateLimitShapeError, REQUEST_LEVEL_429 } from './usage.ts'
 
 // deno-lint-ignore no-explicit-any
@@ -33,6 +43,8 @@ export interface Head {
 }
 
 export interface LaneEvents {
+  /** Persist sanitized diagnostics synchronously before failure emits or the child is killed. */
+  failure(record: FailureDiagnostic): void
   /** The gateway's log of lifecycle events, for tests and diagnostics. */
   note(kind: string, data: Json): void
   /** The lane stops serving requests (its process is being killed). */
@@ -42,6 +54,7 @@ export interface LaneEvents {
 }
 
 interface BlockState {
+  tool?: ToolSummary
   type: string
   outputIndex: number
   item: Json
@@ -291,8 +304,11 @@ export class Lane implements BridgeTarget {
   kill(reason: string): Promise<void> {
     if (!this.killing) {
       this.dead = true
-      this.killing = this.teardown(reason)
+      // Install the promise before teardown: failing an active response there calls kill() reentrantly.
+      const { promise, resolve, reject } = Promise.withResolvers<void>()
+      this.killing = promise
       this.events.dead(this)
+      void this.teardown(reason).then(resolve, reject)
     }
     return this.killing
   }
@@ -313,14 +329,14 @@ export class Lane implements BridgeTarget {
     for (const [, ws] of this.knownWaiters) for (const w of ws) w()
     this.knownWaiters.clear()
     this.wakeTurn()
-    const proc = this.proc
-    if (proc) await proc.kill()
-    this.events.note('kill', { session: this.sessionId, pid: proc?.pid, reason })
-    // a response still open when its process goes always ends, even one caught between finishing and completing
+    // Planned eviction/shutdown of an active response must record its failure before killing too.
     if (this.active && this.active.state.status === 'in_progress') {
       this.active.finished = false
       this.fail(serverError('claude_code_killed', `Claude Code was killed (${reason}).`))
     }
+    const proc = this.proc
+    if (proc) await proc.kill()
+    this.events.note('kill', { session: this.sessionId, pid: proc?.pid, reason })
     try {
       Deno.removeSync(this.runDir, { recursive: true })
     } catch { /* gone */ }
@@ -654,19 +670,14 @@ export class Lane implements BridgeTarget {
         } else if (cb.type === 'redacted_thinking') {
           item = { type: 'reasoning', id: newId('rs'), summary: [], encrypted_content: encodeThinking({ redacted: cb.data }) }
         } else if (cb.type === 'tool_use') {
-          if (
-            typeof cb.id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(cb.id) ||
-            typeof cb.name !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(cb.name) ||
-            cb.input === null || typeof cb.input !== 'object' || Array.isArray(cb.input)
-          ) {
-            return this.fail(serverError('malformed_model_message', 'The model sent a malformed tool_use block.'))
-          }
+          const headerError = toolHeaderError(cb, ev.index)
+          if (headerError) return this.fail(headerError)
           const name = cb.name.startsWith(MCP_PREFIX) ? cb.name.slice(MCP_PREFIX.length) : null
           if (name === null || !this.chain.tools.some((t) => t.name === name)) {
             // Even a known bare client name is unavailable to Claude Code: only its MCP name can execute.
             // Keep this block for mirror/argument validation, but let Code answer and infer again natively.
             if (!a.nativeCalls.includes(cb.id)) a.nativeCalls.push(cb.id)
-            msg.blocks.set(ev.index, { type: cb.type, outputIndex: -1, item: null, buf: '', signature: '', done: false })
+            msg.blocks.set(ev.index, { type: cb.type, outputIndex: -1, item: null, buf: '', signature: '', done: false, tool: toolSummary(cb.name) })
             return
           }
           item = { type: 'function_call', id: newId('fc'), call_id: cb.id, name, arguments: '', status: 'in_progress' }
@@ -675,7 +686,15 @@ export class Lane implements BridgeTarget {
           return this.fail(serverError('unexpected_block', `Unsupported content block '${cb.type}' from the model.`))
         }
         a.state.output.push(item)
-        msg.blocks.set(ev.index, { type: cb.type, outputIndex, item, buf: '', signature: '', done: false })
+        msg.blocks.set(ev.index, {
+          type: cb.type,
+          outputIndex,
+          item,
+          buf: '',
+          signature: '',
+          done: false,
+          ...(cb.type === 'tool_use' ? { tool: toolSummary(cb.name) } : {}),
+        })
         sink.send('response.output_item.added', { output_index: outputIndex, item: structuredClone(item) })
         if (cb.type === 'text') {
           sink.send('response.content_part.added', {
@@ -715,13 +734,8 @@ export class Lane implements BridgeTarget {
         b.done = true
         const it = b.item
         if (b.type === 'tool_use') {
-          let args: Json
-          try {
-            args = JSON.parse(b.buf.trim() ? b.buf : '{}')
-          } catch { /* typed below */ }
-          if (args === null || typeof args !== 'object' || Array.isArray(args)) {
-            return this.fail(serverError('malformed_model_message', 'The model sent tool_use arguments that are not a JSON object.'))
-          }
+          const argsError = toolArgumentsError(b.buf, ev.index, b.tool!)
+          if (argsError) return this.fail(argsError)
         }
         if (it === null) return
         if (b.type === 'text') {
@@ -788,7 +802,7 @@ export class Lane implements BridgeTarget {
     const toolStop = msg.stopReason === 'tool_use'
     const calls = toolStop && callBlocks.length > 0
     if (toolStop && (toolBlocks.length === 0 || !m)) {
-      return this.fail(serverError('malformed_model_message', 'The model stopped for tool use without calling a tool.'))
+      return this.fail(toolStopError())
     }
     if (toolStop && !calls) return // native tool errors continue this response, not a client tool round
     if (!calls && (this.staged || this.continuing)) return // notices go in at the end-of-turn hook; inference goes on
@@ -913,6 +927,31 @@ export class Lane implements BridgeTarget {
     const a = this.active
     // `finished` includes record preparation. Failures can still win until the response commits.
     if (!a || a.state.status !== 'in_progress') return
+    const malformed = err instanceof MalformedModelError ? err : null
+    const diagnostic: FailureDiagnostic = {
+      time: new Date().toISOString(),
+      response_id: a.state.id,
+      previous_response_id: a.prevId,
+      claude_session_id: this.sessionId,
+      message_id: diagnosticMessageId(a.msg?.id),
+      code: err.code,
+      reason: malformed?.reason ?? null,
+      block_index: malformed?.details.block_index ?? null,
+      failed_field: malformed?.details.failed_field ?? null,
+      field: malformed?.details.field ?? null,
+      tool: malformed?.details.tool ?? null,
+      input: malformed?.details.input ?? null,
+    }
+    try {
+      this.events.failure(diagnostic)
+    } catch {
+      // Never strand a response or detour on a diagnostics I/O failure. The journal reports the write failure;
+      // the wire retains the original typed model failure and explicitly marks the missing durable diagnostic.
+      err = new GatewayError(err.status, err.type, err.code, err.message, err.param, {
+        extra: { ...err.extra, diagnostic_error: 'failure_diagnostics_write_failed' },
+        headers: err.headers,
+      })
+    }
     a.finished = true
     clearTimeout(a.mirrorTimer)
     this.active = null

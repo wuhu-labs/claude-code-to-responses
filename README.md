@@ -20,7 +20,7 @@ CLAUDE_CODE_OAUTH_TOKEN=… deno run -A src/main.ts \
 |---|---|---|
 | `--listen host:port` | `127.0.0.1:18330` | Responses API address. Off loopback the gateway refuses to start without `--auth-token-env`. |
 | `--auth-token-env VAR` | none | Clients must send `Authorization: Bearer $VAR` (`401 invalid_api_key` otherwise). The token is read from the environment, never from argv. |
-| `--state-dir` | required | Response store (`responses/`, `tails/`), the gateway's Claude Code config folder and scratch home (`claude/config`, `claude/home`), its device id (`device-id`), per-process files (`run/`). |
+| `--state-dir` | required | Response store (`responses/`, `tails/`), the gateway's Claude Code config folder and scratch home (`claude/config`, `claude/home`), its device id (`device-id`), per-process files (`run/`), sanitized failure diagnostics (`failures.jsonl`, one rotated archive `failures.jsonl.1`). |
 | `--work-dir` | `/tmp/claude-code-to-responses` | The one working folder of every session. Keep it the same absolute path on every machine; it must be outside any git repository (checked at startup). Claude Code reports its real path (`/private/tmp/…` on macOS). |
 | `--device-id` | generated once into `<state-dir>/device-id` | The Claude Code device id every session sends in `metadata.user_id` (also `CLAUDE_CODE_TO_RESPONSES_DEVICE_ID`). 64 lowercase hex digits, or a startup error. Give the same id to every gateway that should share a backend cache. |
 | `--claude` | required | The Claude Code 2.1.284 binary. |
@@ -151,6 +151,61 @@ reads `~/.claude`.
   an SSE stream ends with its response and the report often arrives just after (see below).
 - Each response object carries `x_gateway`: how it reached Claude Code (`new`, `live`, `store`, `history`), how many
   records a history rebuild used, how many groups it had to synthesize, and the resume path.
+
+## Malformed model failures and durable diagnostics
+
+`malformed_model_message` stays the top-level error code. The separate optional `response.error.reason` string identifies the first failed validation,
+identically on HTTP/SSE and WebSocket. It does **not** replace `code`:
+
+```json
+{
+  "type": "response.failed",
+  "response": {
+    "status": "failed",
+    "error": { "code": "malformed_model_message", "message": "The model sent a malformed tool_use block.", "reason": "name_charset" }
+  }
+}
+```
+
+(The example omits other response fields.) Reasons:
+
+| Reason                       | Failed field / condition                                                       |
+| ---------------------------- | ------------------------------------------------------------------------------ |
+| `id_missing`, `name_missing` | The `tool_use` header omitted that field.                                      |
+| `id_type`, `name_type`       | The field is not a string (including `null`).                                  |
+| `id_length`, `name_length`   | Empty or longer than 128 / 64 UTF-16 code units respectively.                  |
+| `id_charset`, `name_charset` | Characters outside `[A-Za-z0-9_-]`.                                            |
+| `input_missing`              | The header omitted `input`.                                                    |
+| `input_not_object`           | Header `input` is null, an array, or any other non-object JSON type.           |
+| `arguments_invalid_json`     | Streamed tool arguments cannot be parsed as JSON.                              |
+| `arguments_not_object`       | Streamed arguments parse to null, an array, or any other non-object JSON type. |
+| `tool_use_without_tool`      | The message stops for tool use without a tool block.                           |
+
+Validation is unchanged: id first, then name, then header input; the argument stream is checked at block stop, including hidden/native tool calls. Empty or
+whitespace-only argument streams still mean `{}`. Nothing rewrites names, fabricates results, regenerates output, or falls back to another path. Failed attempts
+are not continuation points; a client can retry against its last completed response.
+
+Every active response failure appends one sanitized JSON line to `<state-dir>/failures.jsonl` **before** its terminal failure event is emitted or the child
+is killed. The append and directory metadata are synchronously fsynced. The log survives failed-attempt tail exclusion, resume overwrites and gateway
+restarts. Before an append would exceed 1 MiB, the active file replaces `failures.jsonl.1`; at most two 1 MiB files are retained, both mode `0600` on creation.
+The gateway also writes `failure <same JSON>` to stderr (captured by the service's journal).
+
+Records contain UTC `time`, `response_id`, `previous_response_id`, `claude_session_id`, `message_id`, error `code` and `reason`, `block_index`, `failed_field`,
+the failed field's `field` shape, `tool` metadata and `input` shape. Unavailable fields are `null`; non-malformed failures carry only correlation ids and their
+typed code, never their error message. Model message ids must match `[A-Za-z0-9_-]{1,128}`, otherwise `message_id` is null. Shapes contain JSON `type`
+(`missing` for absent/unparseable), `length` (string UTF-16 code units or array elements; otherwise null) and `key_count` (top-level object keys only, otherwise
+null). No keys or values are retained. For argument failures, `field` describes the raw argument string and `input` describes the parsed JSON shape (or
+`missing` on parse failure). For header failures, `input` describes the header's input, usually the initial `{}`. A string tool name is retained only if its
+charset **and** 1–64 length checks pass. Otherwise only its type, length, and the first 16 hex digits of SHA-256 over its UTF-8 bytes are retained; non-string
+names have no hash or value. Never argument values, text/thinking, prompts, raw model frames, tool ids, credentials, or backend error messages.
+
+If storage/fsync fails, the journal line adds `diagnostic_error: "failure_diagnostics_write_failed"`, as does the wire error (retaining the original `code` and
+`reason`). The failure still terminates and kills its lane; a missing durable record is explicit, not a silent detour or a stranded response. Repair the state
+storage before continuing.
+
+`test/failure_diagnostics_test.ts` drives every malformed failure site with raw frames, asserts persistence before terminal emission and kill, checks value-free
+metadata, validation boundaries, rotation and file permissions. Real pinned-Claude tests on both transports check file + journal before child kill,
+byte-identical retry from the last completed response, retained diagnostics after resume/restart, and explicit storage failure.
 
 ## WebSocket mode
 

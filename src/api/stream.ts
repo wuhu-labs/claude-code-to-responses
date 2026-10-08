@@ -44,7 +44,7 @@ export class ResponseState {
   status: Status = 'in_progress'
   output: Json[] = []
   usage: UsageTotals | null = null
-  error: { code: string; message: string } | null = null
+  error: ReturnType<GatewayError['toResponseError']> | null = null
   incomplete: { reason: string } | null = null
   /** How the gateway reached Claude Code for this response (live process, store or history rebuild). */
   gateway: Json = {}
