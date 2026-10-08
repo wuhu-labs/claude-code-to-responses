@@ -1,3 +1,4 @@
+import { replayLog } from '../src/replay.ts'
 import { assert, assertEquals, assertExists, assertRejects } from '@std/assert'
 import { SocketWriter, WS_DRAIN_TIMEOUT_MS, WS_MAX_BUFFERED_BYTES, WS_MAX_MESSAGE_BYTES } from '../src/websocket.ts'
 import { decodeRecord } from '../src/records.ts'
@@ -82,7 +83,8 @@ Deno.test('WebSocket large image create commits provider content and replays ide
     const record = await decodeRecord(first.response.output.at(-1).encrypted_content)
     assertExists(record)
     assertEquals(run.tg.gw.store.get(first.response.id), record)
-    const savedImages = record.entries.flatMap((entry) => JSON.parse(entry).message?.content ?? []).filter((b: Json) => b.type === 'image')
+    assert(record.entries.every((line) => !line.includes('"type":"image"')))
+    const savedImages = replayLog(record, run.tg.gw.store).flatMap((entry) => JSON.parse(entry).message?.content ?? []).filter((b: Json) => b.type === 'image')
     assertEquals(savedImages, actualImages.map(({ cache_control: _, ...image }: Json) => image))
     const nextBody = { ...base, previous_response_id: first.response.id, input: 'Describe the same images.' }
     run.fake.reply({ blocks: [text('live continuation')], usage: { input_tokens: 50_000 } })
@@ -99,7 +101,7 @@ Deno.test('WebSocket large image create commits provider content and replays ide
   })
 })
 
-Deno.test('WebSocket synthesized image history commits a real provider record above 42 MiB exactly once', async () => {
+Deno.test('WebSocket synthesized image history commits a slim record and replays exact upstream bytes', async () => {
   const run = new Run('ws-large-history-record', false)
   await run.run(async () => {
     const png = await noisePng()
@@ -120,7 +122,7 @@ Deno.test('WebSocket synthesized image history commits a real provider record ab
     const first = await ws.send({ ...base, input })
     assertEquals(first.status, 'completed')
     const item = first.response.output.at(-1)
-    assert(item.encrypted_content.length > 42 * 1024 * 1024)
+    assert(item.encrypted_content.length < 32 * 1024)
     const record = await decodeRecord(item.encrypted_content)
     assertExists(record)
     assertEquals(run.tg.gw.store.get(first.response.id), record)
@@ -130,7 +132,7 @@ Deno.test('WebSocket synthesized image history commits a real provider record ab
     assertEquals(done.item, { type: item.type, id: item.id, summary: item.summary })
     assertEquals(first.events.at(-1).response.output.at(-1), done.item)
     const images = (entries: string[]) => entries.flatMap((line) => JSON.parse(line).message?.content ?? []).filter((b: Json) => b.type === 'image')
-    assertEquals(images(record.entries).length, 60)
+    assertEquals(images(replayLog(record, run.tg.gw.store)).length, 60)
     const upstreamImages = run.fake.main()[0].body.messages.flatMap((m: Json) => m.content).filter((b: Json) => b.type === 'image')
     assertEquals(upstreamImages.length, 60)
     const nextBody = { ...base, previous_response_id: first.response.id, input: 'Describe them again.' }
@@ -677,4 +679,49 @@ Deno.test('WebSocket deterministic batch overflow is a nonretryable 413 with req
   assert(sent[0].error.message.includes('136314902'))
   assert(sent[0].error.message.includes('134217728'))
   assertEquals(closes, [1009])
+})
+
+Deno.test('WebSocket real native tool framing produces a record above 42 MiB without deterministic backpressure', async () => {
+  const run = new Run('ws-large-own-record', false)
+  await run.run(async () => {
+    const signature = (await noisePng()).repeat(55)
+    run.fake.reply({ blocks: [call('toolu_native_record', 'not_offered', { signature })], usage: { input_tokens: 50_000 } }, {
+      blocks: [text('done')],
+      usage: { input_tokens: 50_000 },
+    })
+    const conn = await rawSocket(run.tg.url)
+    const events: Json[] = []
+    try {
+      await rawCreate(conn, { input: 'Think.' })
+      while (true) {
+        const frame = await readRawFrame(conn)
+        if (frame.opcode === 9) {
+          await writeAll(conn, new Uint8Array([0x8a, 0x80 | frame.payload.length, 0, 0, 0, 0, ...frame.payload]))
+          continue
+        }
+        assertEquals(frame.opcode, 1)
+        const event = JSON.parse(new TextDecoder().decode(frame.payload))
+        assert(event.type !== 'error', JSON.stringify(event))
+        events.push(event)
+        if (event.type === 'response.completed' || event.type === 'response.failed') break
+      }
+    } finally {
+      conn.close()
+    }
+    const response = events.at(-1).response
+    assertEquals(response.status, 'completed')
+    const item = events.findLast((e) => e.type === 'response.output_item.added').item
+    assert(item.encrypted_content.length > 42 * 1024 * 1024)
+    const record = await decodeRecord(item.encrypted_content)
+    assertExists(record)
+    assertEquals(run.tg.gw.store.get(response.id), record)
+    const saved = record.entries.flatMap((l) => JSON.parse(l).message?.content ?? []).find((b: Json) => b.type === 'tool_use')
+    assertEquals(saved.input.signature, signature)
+    const added = events.find((e) => e.type === 'response.output_item.added' && e.item.id === item.id)
+    const done = events.find((e) => e.type === 'response.output_item.done' && e.item.id === item.id)
+    assertEquals(added.item.encrypted_content, item.encrypted_content)
+    assertEquals(done.item.encrypted_content, undefined)
+    assertEquals(events.at(-1).response.output.at(-1).encrypted_content, undefined)
+    assertEquals(record.nativeCalls, ['toolu_native_record'])
+  })
 })

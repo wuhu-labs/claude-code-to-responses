@@ -1,6 +1,7 @@
+import { checkReplay, type ReplayLine } from './replay.ts'
 import { createHash } from 'node:crypto'
 // Provider records: the Claude Code log entries behind each response, carried opaquely in a reasoning item's
-// encrypted_content and kept in the response store. log(r) = log(r.prev) + r.entries, byte for byte.
+// encrypted_content and kept in the response store. Replay templates plus sidecars reconstruct input log lines.
 import type { CallAliases } from './call_ids.ts'
 import type { InItem, Part } from './api/request.ts'
 
@@ -39,6 +40,8 @@ export interface ProviderRecord {
   digest: string
   /** Log lines Claude Code (or the gateway, for rebuilt history and the interrupted-turn resume) wrote since `prev`, verbatim. */
   entries: string[]
+  /** Payload-free log templates, interleaved with entries; inputs live in content-addressed sidecars. */
+  replay?: ReplayLine[]
 }
 
 export interface ThinkingRecord {
@@ -142,6 +145,7 @@ export function checkRecord(r: any): void {
     }
   }
   if (!Array.isArray(r.entries)) fail('bad entries')
+  if (r.replay !== undefined) checkReplay(r.replay, r.entries.length)
   for (const e of r.entries) {
     if (typeof e !== 'string' || e.includes('\n') || e.includes('\r')) fail('bad entry')
     let o: unknown

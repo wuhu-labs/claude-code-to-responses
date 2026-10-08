@@ -1,3 +1,4 @@
+import { replayLog } from './replay.ts'
 // Routes each Responses request to a lane: the live process when it sits at the previous response, otherwise a
 // process rebuilt from the response store or from the client's history and the provider records it carries.
 import type { InItem, NormRequest, Part } from './api/request.ts'
@@ -191,7 +192,7 @@ export class Gateway {
   }
 
   private start(state: ResponseState, plan: Plan, sink: EventSink): void {
-    const active = new Active(state, sink, plan.prevId, plan.covered)
+    const active = new Active(state, sink, plan.prevId, plan.covered, new Set(plan.spawn?.attempt ?? []))
     const lane = plan.lane
     try {
       lane.attach(active)
@@ -276,7 +277,7 @@ export class Gateway {
     lane = new Lane(rec.session, this.workDir(rec.session), chain, head, this.config, this.bridge, this.store, this.laneEvents)
     lane.callAliases = rec.callAliases ?? []
     this.addLane(lane)
-    const log = records.flatMap((r) => r.entries)
+    const log = records.flatMap((r) => replayLog(r, this.store))
     lane.pending = this.store.tail(prev)
     const spawn = this.resumePlan(lane, log, head, delivery)
     state.gateway = { path: 'store', session: rec.session, records: records.length, resume: spawn.interruptedTurn ? 'interrupted_turn' : 'stdin' }
@@ -341,6 +342,7 @@ export class Gateway {
     }
     // the longest run of groups whose records chain onto each other and match the items
     const used: ProviderRecord[] = []
+    const regenerated = new Map<string, string[]>()
     let pendingGroups: Group[] = []
     let synth: Group[] = []
     let headId: string | null = null
@@ -370,6 +372,7 @@ export class Gateway {
       // unless a later record covers it
       if (!fits) continue
       aliases = matched!
+      regenerated.set(r.id, replayLog(r, this.store, remapItems(pendingGroups.flatMap((g) => [...g.inputs, ...g.outputs]), aliases)))
       used.push(r)
       headId = r.id
       session = r.session
@@ -415,7 +418,7 @@ export class Gateway {
     }
 
     // the records, then what Claude Code wrote after the last of them (if this gateway kept it)
-    const log = used.flatMap((r) => r.entries)
+    const log = used.flatMap((r) => regenerated.get(r.id)!)
     const tailLines = headId ? this.store.tail(headId) : []
     const workDir = this.workDir(sessionId)
     const ctx = contextOf([...log, ...tailLines], sessionId, workDir)

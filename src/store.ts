@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 // The response store: response id -> provider record, one JSON file per response under <state>/responses.
 // It survives gateway restarts; a request with a known previous_response_id rebuilds Claude Code's log from it.
 import type { ProviderRecord } from './records.ts'
@@ -5,11 +6,57 @@ import type { ProviderRecord } from './records.ts'
 export class ResponseStore {
   readonly dir: string
   readonly tailDir: string
+  readonly payloadDir: string
+  readonly aliasDir: string
   constructor(stateDir: string) {
     this.dir = `${stateDir}/responses`
     this.tailDir = `${stateDir}/tails`
+    this.payloadDir = `${stateDir}/payloads`
+    this.aliasDir = `${stateDir}/payload-aliases`
+    Deno.mkdirSync(this.payloadDir, { recursive: true, mode: 0o700 })
+    Deno.mkdirSync(this.aliasDir, { recursive: true, mode: 0o700 })
     Deno.mkdirSync(this.dir, { recursive: true, mode: 0o700 })
     Deno.mkdirSync(this.tailDir, { recursive: true, mode: 0o700 })
+  }
+
+  getPayload(hash: string): any | undefined {
+    if (!/^[0-9a-f]{64}$/.test(hash)) throw new Error('bad payload hash')
+    try {
+      let actual = hash
+      try {
+        actual = Deno.readTextFileSync(`${this.aliasDir}/${hash}`)
+      } catch (error) {
+        if (!(error instanceof Deno.errors.NotFound)) throw error
+      }
+      if (!/^[0-9a-f]{64}$/.test(actual)) throw new Error('bad payload alias')
+      const text = Deno.readTextFileSync(`${this.payloadDir}/${actual}`)
+      if (createHash('sha256').update(text).digest('hex') !== actual) throw new Error('payload sidecar hash mismatch')
+      return JSON.parse(text)
+    } catch (error) {
+      if (error instanceof Deno.errors.NotFound) return undefined
+      throw error
+    }
+  }
+
+  putPayload(value: any): string {
+    const text = JSON.stringify(value)
+    const hash = createHash('sha256').update(text).digest('hex')
+    const path = `${this.payloadDir}/${hash}`
+    try {
+      Deno.statSync(path)
+    } catch (error) {
+      if (!(error instanceof Deno.errors.NotFound)) throw error
+      Deno.writeTextFileSync(`${path}.tmp`, text, { mode: 0o600 })
+      Deno.renameSync(`${path}.tmp`, path)
+    }
+    return hash
+  }
+
+  aliasPayload(old: string, actual: string): void {
+    if (![old, actual].every((hash) => /^[0-9a-f]{64}$/.test(hash))) throw new Error('bad payload hash')
+    const path = `${this.aliasDir}/${old}`
+    Deno.writeTextFileSync(`${path}.tmp`, actual, { mode: 0o600 })
+    Deno.renameSync(`${path}.tmp`, path)
   }
 
   /** Log lines Claude Code wrote after a response's record and before its process went away. */

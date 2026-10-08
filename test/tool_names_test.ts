@@ -1,3 +1,4 @@
+import { replayLog } from '../src/replay.ts'
 // Claude Code owns unknown-tool recovery; the gateway only holds declared MCP calls.
 import { assert, assertEquals, assertStringIncludes } from '@std/assert'
 import { decodeRecord, encodeRecord } from '../src/records.ts'
@@ -27,8 +28,8 @@ scenarioTest('a bare client name recovers natively, then its prefixed retry is h
     assertEquals(run.fake.main().length, 2, 'the real tool is held, not inferred past')
     const rec = (await recordOf(held))!
     assertEquals(rec.nativeCalls, ['toolu_bare'])
-    assertStringIncludes(rec.entries.join('\n'), '"name":"send_message"')
-    assertStringIncludes(rec.entries.join('\n'), 'No such tool available: send_message')
+    assertStringIncludes(replayLog(rec, run.tg.gw.store).join('\n'), '"name":"send_message"')
+    assertStringIncludes(replayLog(rec, run.tg.gw.store).join('\n'), 'No such tool available: send_message')
     const finished = await run.send([output('toolu_retry', 'CLIENT-DELIVERED')])
     assertEquals(run.drv.text(finished), 'delivered')
     const delivered = results(run.fake.main()[2].body)

@@ -1,3 +1,4 @@
+import { ReplayIndex, replayLog } from './replay.ts'
 import { Buffer } from 'node:buffer'
 // A lane is one Claude Code session (one chain of responses) and, while it lives, the one process serving it.
 // It turns Claude Code's stream into Responses events, holds MCP calls until the client's outputs come,
@@ -94,11 +95,14 @@ export class Active {
     readonly prevId: string | null,
     /** Every input item the record covers: synthesized history, then this request's input. */
     covered: InItem[],
+    readonly generated: Set<string> = new Set(),
   ) {
+    this.replay = new ReplayIndex(covered)
     this.digest = new ItemDigest(covered)
   }
 
   readonly digest: ItemDigest
+  readonly replay: ReplayIndex
 }
 
 export class Lane implements BridgeTarget {
@@ -377,7 +381,7 @@ export class Lane implements BridgeTarget {
     try {
       disk = Deno.readTextFileSync(this.logFile).split('\n').filter((l) => l !== '')
     } catch { /* checked below */ }
-    const want = [...chain.flatMap((r) => r.entries), ...tail]
+    const want = [...chain.flatMap((r) => replayLog(r, this.store)), ...tail]
     const i = want.findIndex((l, i) => disk[i] !== l)
     if (i >= 0 || (atRest && disk.length !== want.length)) {
       const at = i >= 0 ? i : want.length
@@ -871,6 +875,13 @@ export class Lane implements BridgeTarget {
    */
   private async complete(a: Active, end: 'turn' | 'calls', calls: CallRef[], cut: number, stopReason: string): Promise<void> {
     const entries = this.pending.slice(0, cut)
+    let compact
+    try {
+      compact = a.replay.compact(entries, a.generated, this.store)
+    } catch (error) {
+      this.fail(asGatewayError(error))
+      return
+    }
     const record: ProviderRecord = {
       v: 1,
       id: a.state.id,
@@ -884,7 +895,8 @@ export class Lane implements BridgeTarget {
       end,
       calls,
       digest: a.digest.finish(a.outputs),
-      entries,
+      entries: compact.entries,
+      ...(compact.replay.length ? { replay: compact.replay } : {}),
     }
     const item = { type: 'reasoning', id: newId('rs'), summary: [], encrypted_content: await encodeRecord(record) }
     await this.beforeCommit?.()

@@ -1,3 +1,4 @@
+import { recordLogTemplates } from './replay.ts'
 import type { InItem } from './api/request.ts'
 import { digestItems, type ProviderRecord } from './records.ts'
 
@@ -20,8 +21,8 @@ export async function matchRecordItems(items: InItem[], record: ProviderRecord, 
   const calls = items.filter((it) => it.kind === 'function_call')
   const original: string[] = []
   const native = new Set(record.nativeCalls ?? [])
-  for (const line of record.entries) {
-    const entry = JSON.parse(line)
+  for (const line of recordLogTemplates(record)) {
+    const entry = JSON.parse(line.text)
     if (entry.type !== 'assistant' || !Array.isArray(entry.message?.content)) continue
     for (const block of entry.message.content) {
       if (block.type === 'tool_use' && typeof block.id === 'string' && !native.has(block.id)) original.push(block.id)

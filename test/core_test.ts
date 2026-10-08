@@ -1,3 +1,4 @@
+import { replayLog } from '../src/replay.ts'
 import { scenarioTest } from './scenario.ts'
 // Gateway core on the fake endpoint: held calls, message_stop, notices, records, usage, eviction and restart bytes.
 import { assert, assertEquals, assertExists, assertStringIncludes } from '@std/assert'
@@ -100,7 +101,7 @@ scenarioTest('a provider record is every log entry since the previous response, 
     const lane = [...run.tg.gw.lanes.values()][0]
     await lane.kill('test')
     const disk = Deno.readTextFileSync(lane.logFile).split('\n').filter(Boolean)
-    const joined = recs.flatMap((r) => r!.entries)
+    const joined = recs.flatMap((r) => replayLog(r!, run.tg.gw.store))
     assertEquals(disk, joined)
     assertEquals(run.tg.gw.store.tail(r3.response.id), [])
     assert(recs[2]!.entries.some((e) => e.includes('stop_hook_summary')), 'the turn end is in its response record')
@@ -203,7 +204,7 @@ scenarioTest("chains running in parallel share one Claude config folder without 
       const lane = lanes.find((l) => l.head?.responseId === d.prevId)!
       const recs = run.tg.gw.store.chain(d.prevId!)!
       const disk = Deno.readTextFileSync(lane.logFile).split('\n').filter(Boolean)
-      assertEquals(disk, [...recs.flatMap((r) => r.entries), ...run.tg.gw.store.tail(d.prevId!)], `chain ${i}`)
+      assertEquals(disk, [...recs.flatMap((r) => replayLog(r, run.tg.gw.store)), ...run.tg.gw.store.tail(d.prevId!)], `chain ${i}`)
     }
     JSON.parse(Deno.readTextFileSync(`${config}/.claude.json`))
     assertEquals(run.tg.events('verify_error').length, 0)

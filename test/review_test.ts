@@ -1,3 +1,4 @@
+import { replayLog } from '../src/replay.ts'
 // Regression tests for the M1 review findings.
 import { assert, assertEquals, assertRejects, assertStringIncludes, assertThrows } from '@std/assert'
 import { decodeRecord, encodeRecord } from '../src/records.ts'
@@ -159,7 +160,7 @@ Deno.test('what Claude Code writes after a response is kept as its tail and carr
     const lane2 = [...run.tg.gw.lanes.values()][0]
     await lane2.kill('test')
     const rec1 = (await decodeRecord(r1.response.output.at(-1).encrypted_content))!
-    assertEquals(Deno.readTextFileSync(lane2.logFile).split('\n').filter(Boolean), [...rec1.entries, ...rec2.entries])
+    assertEquals(Deno.readTextFileSync(lane2.logFile).split('\n').filter(Boolean), [...replayLog(rec1, run.tg.gw.store), ...replayLog(rec2, run.tg.gw.store)])
   })
 })
 
@@ -495,7 +496,7 @@ Deno.test('a line Claude Code writes only to disk reaches the next record, throu
       const live = [...run.tg.gw.lanes.values()][0]
       await live.kill('test')
       const rec1 = (await decodeRecord(r1.response.output.at(-1).encrypted_content))!
-      assertEquals(Deno.readTextFileSync(live.logFile).split('\n').filter(Boolean), [...rec1.entries, ...rec2.entries])
+      assertEquals(Deno.readTextFileSync(live.logFile).split('\n').filter(Boolean), [...replayLog(rec1, run.tg.gw.store), ...replayLog(rec2, run.tg.gw.store)])
       assertEquals(run.tg.events('verify_error').length, 0)
     })
   }

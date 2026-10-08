@@ -1,3 +1,4 @@
+import { replayLog } from '../src/replay.ts'
 // Image notices must evict even a live hold, then survive every record-based rebuild without losing image bytes.
 import { assert, assertEquals, assertExists } from '@std/assert'
 import { MAX_IMAGE_BASE64_CHARS } from '../src/api/request.ts'
@@ -55,7 +56,7 @@ for (const path of ['live', 'evicted', 'history'] as const) {
       }
       const rec = await decodeRecord(r.response.output.at(-1).encrypted_content)
       assertExists(rec)
-      const noticeEntries = rec.entries.filter((e) => e.includes('NOTICE before image'))
+      const noticeEntries = replayLog(rec, run.tg.gw.store).filter((e) => e.includes('NOTICE before image'))
       assertEquals(noticeEntries.length, 1)
       assertEquals(JSON.parse(noticeEntries[0]).message.content, tail[1].content.slice(2, 6))
       await run.disrupt('idle')
@@ -72,7 +73,7 @@ for (const path of ['live', 'evicted', 'history'] as const) {
       assertOneUserId(requests)
       // The exact appended log line remains in the store after the lost-state recovery.
       const chain = run.tg.gw.store.chain(rebuilt.response.id)!
-      assert(chain.flatMap((r) => r.entries).includes(noticeEntries[0]))
+      assert(chain.flatMap((r) => replayLog(r, run.tg.gw.store)).includes(noticeEntries[0]))
     })
   })
 }
@@ -221,7 +222,7 @@ for (const [path, size] of [['live', 'small'], ['evicted', 'small'], ['lost-stor
       }
       const record = await decodeRecord(completed.response.output.at(-1).encrypted_content)
       assertExists(record)
-      const imageResults = record.entries.flatMap((entry) => JSON.parse(entry).message?.content ?? [])
+      const imageResults = replayLog(record, run.tg.gw.store).flatMap((entry) => JSON.parse(entry).message?.content ?? [])
         .filter((b: Json) => b.type === 'tool_result' && b.tool_use_id === 'toolu_outputimg')
       assertEquals(imageResults.length, 1)
       assertEquals(imageResults[0].content, result.content, 'saved tool result includes any native MCP source label')
@@ -239,8 +240,13 @@ for (const [path, size] of [['live', 'small'], ['evicted', 'small'], ['lost-stor
       const recovered = run.fake.main()[3]
       const rebuiltResult = recovered.body.messages.flatMap((m: Json) => m.content)
         .find((b: Json) => b.type === 'tool_result' && b.tool_use_id === 'toolu_outputimg')
-      assertEquals(rebuiltResult.content, result.content, 'verbatim provider-record replay retains old label and real image bytes')
-      assertPrefix(sameConfig, recovered)
+      const regenerated = result.content.map((part: Json) =>
+        part.type === 'image' && size === 'large' && path === 'live'
+          ? { ...part, source: { type: 'base64', media_type: 'image/png', data: imageBlock.source.data } }
+          : part
+      )
+      assertEquals(rebuiltResult.content, regenerated, 'full loss retains labels and regenerates native image payloads from original input')
+      if (!(size === 'large' && path === 'live')) assertPrefix(sameConfig, recovered)
       assertOneUserId(run.fake.main())
     })
   })

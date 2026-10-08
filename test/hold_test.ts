@@ -1,3 +1,4 @@
+import { replayLog } from '../src/replay.ts'
 import { scenarioTest } from './scenario.ts'
 // Eviction during a held call: the interrupted-turn resume with the gateway-written user text.
 import { assert, assertEquals, assertExists } from '@std/assert'
@@ -62,7 +63,7 @@ for (const withNotice of [true, false]) {
       assertEquals(resumed.response.x_gateway.resume, 'interrupted_turn')
       const rec = await decodeRecord(resumed.response.output.at(-1).encrypted_content)
       assertExists(rec)
-      assert(rec.entries.some((e) => e.includes(withNotice ? 'NOTICE during the hold' : RESUME_LINE)))
+      assert(replayLog(rec, run.tg.gw.store).some((e) => e.includes(withNotice ? 'NOTICE during the hold' : RESUME_LINE)))
       assertPrefix(afterHold, h3)
       assertPrefix(h3, h4)
       assertEquals(run.drv.results.at(-1)!.response.x_gateway.path, 'history')
