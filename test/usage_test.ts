@@ -400,6 +400,34 @@ for (const transport of ['sse', 'websocket'] as const) {
   }
 }
 
+for (const transport of ['sse', 'websocket'] as const) {
+  Deno.test(`${transport}: a bare 429 after output fails with status 429 and empty retry headers`, async () => {
+    const run = new UsageRun(`bare-429-after-output-${transport}`, false, { transport })
+    await run.run(async () => {
+      // With no unified reset headers, Code reports a bare rejection, not a known subscription reset.
+      run.fake.reply(
+        { blocks: [call('toolu_k', 'echo', { text: 'k' })] },
+        { blocks: [text('first part')] },
+        { blocks: [], error: LIMITED },
+      )
+      await run.send([user('T1')])
+      const lane = [...run.tg.gw.lanes.values()][0]
+      const hook = lane.hook.bind(lane)
+      lane.hook = (body) => body.hook_event_name === 'Stop' ? hook(body) : {}
+      const r = await run.send([{ type: 'function_call_output', call_id: 'toolu_k', output: 'K' }, user('NOTICE-STOP')])
+      assertEquals(r.status, 'failed')
+      assert(r.events.some((e) => e.type === 'response.output_text.delta'))
+      assertEquals(r.events.at(-1).type, 'response.failed', 'already-streamed output cannot become a request-level error')
+      const error = r.events.at(-1).response.error
+      assertEquals(error, { code: 'rate_limit_exceeded', message: error.message, status: 429, headers: {} })
+      assertEquals(error.headers['retry-after'], undefined)
+      assertEquals(error.limit_type, undefined)
+      assertEquals(error.resets_at, undefined)
+      assertEquals(run.fake.main().length, 3)
+    })
+  })
+}
+
 Deno.test('sse: a client that leaves while its response is held is noticed at the first output, which cancels it', async () => {
   const run = new UsageRun('usage-held-abort', false)
   await run.run(async () => {
