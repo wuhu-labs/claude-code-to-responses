@@ -1,5 +1,7 @@
-import { assert, assertEquals, assertRejects } from '@std/assert'
+import { assert, assertEquals, assertExists, assertRejects } from '@std/assert'
 import { SocketWriter, WS_DRAIN_TIMEOUT_MS, WS_MAX_BUFFERED_BYTES, WS_MAX_MESSAGE_BYTES } from '../src/websocket.ts'
+import { decodeRecord } from '../src/records.ts'
+import { noisePng } from './images.ts'
 import { call, type Json, text } from './fake.ts'
 import { assertPrefix, output, sameRequest, send, user } from './harness.ts'
 import { INSTRUCTIONS, MODEL, Run, TOOLS } from './scenario.ts'
@@ -51,6 +53,49 @@ Deno.test('WebSocket accepts a create above the former 16 MiB cap without droppi
     }
     const reply = await run.tg.websocket().send({ ...base, input })
     assertEquals(reply.status, 'completed')
+  })
+})
+
+Deno.test('WebSocket large image create commits provider content and replays identical upstream bytes after eviction', async () => {
+  const run = new Run('ws-large-image-rebuild', false)
+  await run.run(async () => {
+    const png = await noisePng()
+    const images = Array.from({ length: 22 }, () => ({ type: 'input_image', image_url: `data:image/png;base64,${png}` }))
+    const body = { ...base, input: [{ role: 'user', content: [{ type: 'input_text', text: 'Inspect all 22 images.' }, ...images] }] }
+    const bytes = new TextEncoder().encode(JSON.stringify({ type: 'response.create', ...body })).length
+    assert(bytes > 16 * 1024 * 1024 && bytes < WS_MAX_MESSAGE_BYTES)
+    const ws = run.tg.websocket()
+    run.fake.reply({ blocks: [text('saw all images')], usage: { input_tokens: 50_000 } })
+    const first = await ws.send(body)
+    assertEquals(first.status, 'completed', JSON.stringify(first.response.error))
+    assertEquals(run.tg.events('spawn').length, 1)
+    const upstream = run.fake.main()[0].body.messages[0].content
+    assertEquals(upstream.find((b: Json) => b.type === 'text').text, 'Inspect all 22 images.')
+    const actualImages = upstream.filter((b: Json) => b.type === 'image')
+    assertEquals(actualImages.length, images.length)
+    for (const image of actualImages) {
+      // Pinned Claude Code may natively re-encode PNGs; assert the saved provider bytes, not the input encoding.
+      assert(['image/png', 'image/jpeg'].includes(image.source.media_type))
+      assert(image.source.data.startsWith(image.source.media_type === 'image/jpeg' ? '/9j/' : 'iVBOR'))
+      assert(atob(image.source.data).length > 100_000)
+    }
+    const record = await decodeRecord(first.response.output.at(-1).encrypted_content)
+    assertExists(record)
+    assertEquals(run.tg.gw.store.get(first.response.id), record)
+    const savedImages = record.entries.flatMap((entry) => JSON.parse(entry).message?.content ?? []).filter((b: Json) => b.type === 'image')
+    assertEquals(savedImages, actualImages.map(({ cache_control: _, ...image }: Json) => image))
+    const nextBody = { ...base, previous_response_id: first.response.id, input: 'Describe the same images.' }
+    run.fake.reply({ blocks: [text('live continuation')], usage: { input_tokens: 50_000 } })
+    const live = await ws.send(nextBody)
+    assertEquals([live.status, live.response.x_gateway.path], ['completed', 'live'])
+    await run.tg.evictAll()
+    assertEquals(run.tg.gw.lanes.size, 0)
+    run.fake.reply({ blocks: [text('rebuilt continuation')], usage: { input_tokens: 50_000 } })
+    const rebuilt = await ws.send(nextBody)
+    assertEquals([rebuilt.status, rebuilt.response.x_gateway.path], ['completed', 'store'])
+    assertEquals(run.tg.events('spawn').length, 2)
+    assertEquals(run.fake.main().length, 3)
+    assertEquals(run.fake.main()[2].raw, run.fake.main()[1].raw, 'eviction/rebuild preserves the entire upstream request byte for byte')
   })
 })
 
