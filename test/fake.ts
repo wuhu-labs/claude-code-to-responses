@@ -28,6 +28,8 @@ export interface Reply {
   gapMs?: number
   /** ms to wait before answering at all (a slow first byte) */
   delayMs?: number
+  /** Extra response headers (e.g. `anthropic-ratelimit-unified-*`, `retry-after`), on an error and a success alike. */
+  headers?: Record<string, string>
 }
 
 export class FakeAnthropic {
@@ -103,7 +105,7 @@ export class FakeAnthropic {
       const status = r.error.inStream ? 529 : r.error.status
       return Response.json({ type: 'error', error: { type: r.error.type, message: r.error.message } }, {
         status,
-        headers: { 'request-id': `req_fake_${ex.n}` },
+        headers: { 'request-id': `req_fake_${ex.n}`, ...r.headers },
       })
     }
     const usage = {
@@ -123,7 +125,7 @@ export class FakeAnthropic {
       stop_sequence: null,
       usage,
     }
-    if (!body.stream) return Response.json(message)
+    if (!body.stream) return Response.json(message, { headers: { ...r.headers } })
     const events = r.error?.inStream
       ? [sseEvents(message)[0], `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: r.error.type, message: r.error.message } })}\n\n`]
       : sseEvents(message)
@@ -138,7 +140,7 @@ export class FakeAnthropic {
         c.close()
       },
     })
-    return new Response(stream, { headers: { 'content-type': 'text/event-stream' } })
+    return new Response(stream, { headers: { 'content-type': 'text/event-stream', ...r.headers } })
   }
 }
 

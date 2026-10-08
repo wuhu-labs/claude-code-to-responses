@@ -751,3 +751,121 @@ probe('CLAUDE_CODE_MAX_OUTPUT_TOKENS changes upstream max_tokens (paired: unset)
   assertEquals(high, 8192)
   assertNotEquals(normal, low)
 })
+
+// ---- usage reports (src/usage.ts, test/usage_test.ts) ----------------------------------------------------------------
+
+const SUBSCRIPTION = { ANTHROPIC_AUTH_TOKEN: undefined, CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-probe-fake' }
+const unified = (h: Record<string, string>) => Object.fromEntries(Object.entries(h).map(([k, v]) => [`anthropic-ratelimit-unified-${k}`, v]))
+const rateLimits = (frames: Json[]) => frames.filter((f) => f.type === 'rate_limit_event').map((f) => f.rate_limit_info)
+const LIMIT_429 = { status: 429, type: 'rate_limit_error', message: "This request would exceed your account's rate limit. Please try again later." }
+
+probe(
+  'rate_limit_event: a subscription token reports usage on successes, from the unified headers, on change only (paired: an API key reports none)',
+  async (p, fake) => {
+    const now = Math.floor(Date.now() / 1000), r5 = now + 3 * 3600, r7 = now + 4 * 86400
+    const windows = unified({
+      status: 'allowed',
+      '5h-utilization': '0.3',
+      '5h-reset': String(r5),
+      '7d-utilization': '1.07',
+      '7d-reset': String(r7),
+      '7d_oi-utilization': '0.6',
+      '7d_oi-reset': String(r7),
+    })
+    fake.reply(
+      { blocks: [text('one')] },
+      { blocks: [call('toolu_rl', 'echo', { text: 'x' })], headers: windows },
+      { blocks: [text('two')], headers: windows },
+      {
+        blocks: [text('three')],
+        headers: unified({ status: 'allowed', '7d-utilization': '0.2', '7d-reset': String(r7) }),
+      },
+    )
+    const t = new ProbeTarget(['echo'])
+    const r = p.launch({ name: 'rl-ok', fake, target: t, env: SUBSCRIPTION })
+    let from = 0
+    const turn = async (s: string) => {
+      const res = await r.turn(s)
+      assertEquals(res.subtype, 'success', s)
+      const got = rateLimits(r.frames.slice(from))
+      from = r.frames.length
+      return got
+    }
+    // no unified headers: a report without windows
+    assertEquals(await turn('one'), [{ status: 'allowed', isUsingOverage: false }])
+    // the windows (utilization a fraction, past 1 when over the cap); the report comes after message_stop, before the result
+    const reports = await turn('two')
+    assertEquals(reports.length, 1)
+    // a window past its warning threshold makes Claude Code itself report allowed_warning, naming that window
+    assertEquals([reports[0].status, reports[0].rateLimitType, reports[0].resetsAt, reports[0].utilization], ['allowed_warning', 'seven_day', r7, 1.07])
+    assertEquals(reports[0].unifiedWindows, {
+      five_hour: { utilization: 0.3, resetsAt: r5 },
+      seven_day: { utilization: 1.07, resetsAt: r7 },
+      seven_day_overage_included: { utilization: 0.6, resetsAt: r7 },
+    })
+    const types = r.frames.map((f) => f.type === 'stream_event' ? f.event.type : f.type)
+    const at = types.indexOf('rate_limit_event', types.indexOf('message_stop'))
+    assert(at > types.indexOf('message_stop') && at < types.indexOf('result', types.indexOf('message_stop')), types.join(' '))
+    // the same headers again (the tool round's second request): no report
+    assertEquals(rateLimits(r.frames.slice(from)), [])
+    // only the weekly window reported: only it is in the report
+    assertEquals((await turn('three')).map((i: Json) => i.unifiedWindows), [{ seven_day: { utilization: 0.2, resetsAt: r7 } }])
+    // with an API key (the test backend) Claude Code reports nothing, whatever the headers
+    fake.reply({ blocks: [text('key')], headers: windows })
+    const k = p.launch({ name: 'rl-key', fake, target: new ProbeTarget() })
+    assertEquals((await k.turn('key')).subtype, 'success')
+    assertEquals(rateLimits(k.frames), [])
+  },
+)
+
+probe(
+  'rate_limit_event on a 429: a usage limit reports rejected with resetsAt and rateLimitType; any other 429 a bare rejected, retry-after dropped',
+  async (p, fake) => {
+    const now = Math.floor(Date.now() / 1000), r5 = now + 3600, r7 = now + 4 * 86400
+    const cases: { name: string; headers: Record<string, string>; info: Json; result: RegExp }[] = [
+      {
+        name: 'session',
+        headers: unified({ status: 'rejected', reset: String(r5), 'representative-claim': 'five_hour', '5h-utilization': '1', '5h-reset': String(r5) }),
+        info: { status: 'rejected', resetsAt: r5, rateLimitType: 'five_hour', unifiedWindows: { five_hour: { utilization: 1, resetsAt: r5 } } },
+        result: /^You've hit your session limit · resets /,
+      },
+      {
+        name: 'weekly',
+        headers: unified({ status: 'rejected', reset: String(r7), 'representative-claim': 'seven_day', '7d-utilization': '1', '7d-reset': String(r7) }),
+        info: { status: 'rejected', resetsAt: r7, rateLimitType: 'seven_day', unifiedWindows: { seven_day: { utilization: 1, resetsAt: r7 } } },
+        result: /^You've hit your weekly limit · resets /,
+      },
+      {
+        name: 'opus',
+        headers: unified({ status: 'rejected', reset: String(r7), 'representative-claim': 'seven_day_opus', '7d-utilization': '0.8', '7d-reset': String(r7) }),
+        info: { status: 'rejected', resetsAt: r7, rateLimitType: 'seven_day_opus', unifiedWindows: { seven_day: { utilization: 0.8, resetsAt: r7 } } },
+        result: /^You've hit your Opus limit · resets /,
+      },
+      {
+        name: 'no-reset',
+        headers: { ...unified({ status: 'rejected', 'representative-claim': 'five_hour' }), 'retry-after': '98765' },
+        info: { status: 'rejected', rateLimitType: 'five_hour' },
+        result: /^You've hit your session limit$/,
+      },
+      {
+        name: 'bare',
+        headers: { 'retry-after': '98765' },
+        info: { status: 'rejected' },
+        result: /^API Error: Server is temporarily limiting requests \(not your usage limit\)/,
+      },
+    ]
+    for (const c of cases) {
+      fake.reply({ blocks: [text('never')], error: LIMIT_429, headers: c.headers })
+      const r = p.launch({ name: `rl-${c.name}`, fake, target: new ProbeTarget(), env: SUBSCRIPTION })
+      const res = await r.turn('x')
+      assertEquals([res.is_error, res.terminal_reason, res.api_error_status], [true, 'api_error', 429], c.name)
+      assert(c.result.test(res.result), `${c.name}: ${res.result}`)
+      const infos = rateLimits(r.frames)
+      assertEquals(infos.length, 1, c.name)
+      const { isUsingOverage: _o, overageStatus: _s, overageDisabledReason: _d, ...info } = infos[0]
+      assertEquals(info, c.info, c.name)
+      // nothing in stream-json carries the backend's retry-after
+      assert(!/retry.?after|\b98765\b/i.test(JSON.stringify(r.frames)), `${c.name}: retry-after reached stream-json`)
+    }
+  },
+)
