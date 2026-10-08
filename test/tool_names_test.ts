@@ -2,7 +2,8 @@
 import { assert, assertEquals, assertStringIncludes } from '@std/assert'
 import { decodeRecord } from '../src/records.ts'
 import { call, type Json, text } from './fake.ts'
-import { assertOneUserId, assertPrefix, output, user } from './harness.ts'
+import { assertOneUserId, assertPrefix, assertSameRequests, output, user } from './harness.ts'
+import { committedCallId } from './kernel_shapes.ts'
 import { Run, scenarioTest } from './scenario.ts'
 
 const bare = (id: string, name: string, input: Json = {}) => ({ type: 'tool_use' as const, id, name, input })
@@ -106,5 +107,59 @@ for (const name of ['mcp__fn__echo', 'echo', 'not_available']) {
       const r = await run.send([user('go')])
       assertEquals([r.status, r.response.error?.code], ['failed', 'malformed_model_message'])
     })
+  })
+}
+
+for (const synthCall of [false, true]) {
+  scenarioTest(`a synthesized ${synthCall ? 'tool round' : 'text group'} preserves unanswered native calls from a reused record`, async () => {
+    const seen: { run: Run; request: Json }[] = []
+    for (const rebuild of [false, true]) {
+      const run = new Run(`synth-native-${synthCall}-${rebuild}`, false)
+      await run.run(async () => {
+        run.fake.reply({ blocks: [call('toolu_client', 'echo', { text: 'first' }), bare('toolu_native', 'echo', { text: 'second' })] })
+        const held = await run.send([user('run both')])
+        assertEquals(run.drv.calls(held).map((c) => c.call_id), ['toolu_client'])
+        await run.tg.waitEvent('hold')
+        const completion = synthCall
+          ? { type: 'function_call', call_id: 'toolu_synth', name: 'read', arguments: '{"name":"doc"}' }
+          : { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'offline completion' }] }
+        if (rebuild) {
+          await run.disrupt('restart-lost-store')
+          // Preserve the held response's record, but synthesize the following response with no provider record.
+          run.drv.history.push(output('toolu_client', 'FIRST-OUTPUT'), completion)
+        } else {
+          run.fake.reply({ blocks: synthCall ? [call('toolu_synth', 'read', { name: 'doc' })] : [text('offline completion')] })
+          const live = await run.send([output('toolu_client', 'FIRST-OUTPUT')])
+          assertEquals(live.status, 'completed')
+        }
+        run.fake.reply({ blocks: [text('next')] })
+        const next = synthCall ? [output('toolu_synth', 'DOC')] : [user('next')]
+        const r = rebuild ? await run.drv.send(next, 'history') : await run.send(next)
+        assertEquals(r.status, 'completed', JSON.stringify(r.response.error))
+        if (rebuild) {
+          assertEquals(r.response.x_gateway.records, 1)
+          assertEquals(r.response.x_gateway.synthesized_groups, 1)
+        }
+        const request = run.fake.main().at(-1)!
+        const rs = results(request.body)
+        assertEquals(rs.filter((b: Json) => b.tool_use_id === 'toolu_native').length, 1)
+        assertStringIncludes(rs.find((b: Json) => b.tool_use_id === 'toolu_native').content, 'No such tool available: echo')
+        assertStringIncludes(JSON.stringify(rs.find((b: Json) => b.tool_use_id === 'toolu_client')), 'FIRST-OUTPUT')
+        if (synthCall) {
+          assertStringIncludes(JSON.stringify(rs.find((b: Json) => b.tool_use_id === 'toolu_synth' || b.tool_use_id === committedCallId('toolu_synth'))), 'DOC')
+        }
+        seen.push({ run, request })
+      })
+    }
+    // Interrupted-turn delivery adds its documented resume line only in the synthesized tool-round case.
+    if (!synthCall) assertSameRequests([seen[0].request], [seen[1].request], seen[0].run.normalize, seen[1].run.normalize)
+    else {
+      const normalized = (body: Json) =>
+        results(body).map(({ cache_control: _c, ...b }: Json) => ({
+          ...b,
+          tool_use_id: b.tool_use_id === committedCallId('toolu_synth') ? 'toolu_synth' : b.tool_use_id,
+        }))
+      assertEquals(normalized(seen[0].request.body), normalized(seen[1].request.body))
+    }
   })
 }
