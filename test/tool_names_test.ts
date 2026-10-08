@@ -1,6 +1,6 @@
 // Claude Code owns unknown-tool recovery; the gateway only holds declared MCP calls.
 import { assert, assertEquals, assertStringIncludes } from '@std/assert'
-import { decodeRecord } from '../src/records.ts'
+import { decodeRecord, encodeRecord } from '../src/records.ts'
 import { call, type Json, text } from './fake.ts'
 import { assertOneUserId, assertPrefix, assertSameRequests, output, user } from './harness.ts'
 import { committedCallId } from './kernel_shapes.ts'
@@ -163,3 +163,31 @@ for (const synthCall of [false, true]) {
     }
   })
 }
+
+scenarioTest('duplicate native ids are deduped on write and legacy duplicate records still continue and rebuild', async () => {
+  const run = new Run('duplicate-native', false)
+  await run.run(async () => {
+    run.fake.reply(
+      { blocks: [bare('toolu_duplicate', 'echo')] },
+      { blocks: [bare('toolu_duplicate', 'echo')] },
+      { blocks: [text('recovered')] },
+    )
+    const first = await run.send([user('go')])
+    assertEquals(first.status, 'completed', JSON.stringify(first.response.error))
+    const rec = (await recordOf(first))!
+    assertEquals(rec.nativeCalls, ['toolu_duplicate'])
+    assertEquals(rec.entries.flatMap((l) => JSON.parse(l).message?.content ?? []).filter((b: Json) => b.type === 'tool_use').length, 2)
+    const legacy = { ...first.response.output.at(-1), encrypted_content: await encodeRecord({ ...rec, nativeCalls: ['toolu_duplicate', 'toolu_duplicate'] }) }
+    assertEquals((await decodeRecord(legacy.encrypted_content))!.nativeCalls, ['toolu_duplicate', 'toolu_duplicate'])
+    run.drv.history[run.drv.history.length - 1] = legacy
+    run.fake.reply({ blocks: [text('continued')] })
+    const continued = await run.send([legacy, user('next')]) // echo an already-written pre-fix record with the warm continuation
+    assertEquals(continued.status, 'completed', JSON.stringify(continued.response.error))
+    await run.disrupt('restart-lost-store')
+    run.fake.reply({ blocks: [text('rebuilt')] })
+    const rebuilt = await run.send([user('next again')])
+    assertEquals(rebuilt.response.x_gateway.records, 2)
+    assertEquals(rebuilt.response.x_gateway.synthesized_groups, 0)
+    assertPrefix(run.fake.main()[3], run.fake.main()[4])
+  })
+})
