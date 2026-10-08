@@ -416,8 +416,8 @@ Deno.test('upstream errors map to typed failures, at once: the client owns retri
       ['400', { status: 400, type: 'invalid_request_error', message: 'bad request' }, 'upstream_invalid_request'],
       ['401', { status: 401, type: 'authentication_error', message: 'invalid x-api-key' }, 'upstream_authentication_error'],
       ['429', { status: 429, type: 'rate_limit_error', message: 'slow down' }, 'rate_limit_exceeded'],
-      ['500', { status: 500, type: 'api_error', message: 'boom' }, 'upstream_error'],
-      ['529', { status: 529, type: 'overloaded_error', message: 'Overloaded' }, 'upstream_overloaded'],
+      ['500', { status: 500, type: 'api_error', message: 'boom' }, 'server_error'],
+      ['529', { status: 529, type: 'overloaded_error', message: 'Overloaded' }, 'server_error'],
       ['overloaded mid-stream', { status: 200, type: 'overloaded_error', message: 'Overloaded', inStream: true }, 'upstream_stream_cut'],
     ]
     for (const [label, error, code] of cases) {
