@@ -19,11 +19,12 @@ export function remapItems(items: InItem[], aliases: CallAliases): InItem[] {
 export async function matchRecordItems(items: InItem[], record: ProviderRecord, aliases: CallAliases): Promise<CallAliases | null> {
   const calls = items.filter((it) => it.kind === 'function_call')
   const original: string[] = []
+  const native = new Set(record.nativeCalls ?? [])
   for (const line of record.entries) {
     const entry = JSON.parse(line)
     if (entry.type !== 'assistant' || !Array.isArray(entry.message?.content)) continue
     for (const block of entry.message.content) {
-      if (block.type === 'tool_use' && typeof block.id === 'string') original.push(block.id)
+      if (block.type === 'tool_use' && typeof block.id === 'string' && !native.has(block.id)) original.push(block.id)
     }
   }
   if (calls.length !== original.length) return null

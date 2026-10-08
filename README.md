@@ -110,7 +110,7 @@ reads `~/.claude`.
   | `context_length_exceeded` | Claude Code hit its blocking context limit; auto-compaction is off, so compaction is the client's job. |
   | `upstream_invalid_request`, `upstream_authentication_error`, `rate_limit_exceeded`, `upstream_overloaded`, `upstream_error` | The backend answered 400, 401/403, 429, 529 or 5xx. Claude Code's own retries are off: the client's retry policy is the only one. |
   | `upstream_stream_cut` | The model stream broke mid-message; streamed output cannot be withdrawn. |
-  | `malformed_model_message`, `unexpected_tool`, `unexpected_block` | The model stopped for tool use without a tool call, called a tool that isn't a client tool, or sent a block type the subset doesn't carry. |
+  | `malformed_model_message`, `unexpected_block` | The model stopped for tool use without a tool call, sent a malformed tool-use id/name or non-object arguments, or sent a block type the subset doesn't carry. |
   | `turn_ended_without_message`, `notice_undelivered`, `record_incomplete` | Claude Code ended a turn without a model message, called tools again before staged notices could go in, or did not log what it streamed. |
   | `unexpected_control_request` | Claude Code asked the host something (a permission prompt) it should never need. |
   | `claude_code_exited`, `claude_code_killed`, `claude_code_stdin`, `claude_code_error` | The process exited, was killed, could not be written to, or ended the turn with an error of its own. |
@@ -264,8 +264,7 @@ calls by id, in whatever order Claude Code makes them.
 
 **Notices.** `message` items sent alongside outputs are notices. A blank text-only one (empty or whitespace) is
 treated as absent; an image-only notice is not blank. Text-only notices are staged before any result is released
-and go in through the PostToolUse hook of the response's last call. If that hook never runs (Claude Code answered the call
-itself, e.g. an unknown tool), they go in at the end-of-turn Stop hook, and the inference that follows is part of the
+and go in through the PostToolUse hook of the response's last call. If that hook never runs, they go in at the end-of-turn Stop hook, and the inference that follows is part of the
 same response. With no held calls, new `message` items go in through stdin as one user turn.
 
 A notice containing images cannot go through a text-only hook. After validating the complete request, the gateway
@@ -290,11 +289,23 @@ outputs are not command input and are unchanged. Synthesized user history uses t
 records keep the actual transformed log bytes, so evictions and lost-store rebuilds do not add another space.
 `--setting-sources ""` separately prevents user/project commands and skills from loading.
 
-**Undefined tools.** A model call of a tool the request doesn't define is answered by Claude Code itself, with its
-`<tool_use_error>Error: No such tool available: …` result. The client still receives the `function_call` and must
-send an output; the model never sees that output. A rebuild after an eviction during such a hold keeps Claude Code's
-own entry, so the model sees the same thing on every path. Completed calls in a history keep the client's outputs,
-whatever tools the request offers.
+**Native unknown-tool recovery.** Only a declared client tool called by its exact MCP name (`mcp__fn__<name>`)
+is surfaced as a `function_call` and held for the client's output. Every other well-formed name—including a bare
+client name such as `send_message`, an undefined bare name, and an undefined MCP-prefixed name—is hidden from the
+client and answered by Claude Code 2.1.284 itself with
+`<tool_use_error>Error: No such tool available: …</tool_use_error>` (`is_error: true`). The gateway does not fail
+or end that response: Claude Code infers again in the same response. A later correctly prefixed client call is
+held and released normally. The model can instead finish with text; retrying with the correct name is the model's
+choice, not guaranteed or forced by the gateway. A bare name can therefore cost an extra model step. No upstream
+traffic or logged tool names are rewritten, and malformed tool-use blocks/arguments still fail with a typed error.
+
+Records retain Claude Code's actual log bytes, including every hidden call and native error; their optional
+`nativeCalls` metadata excludes only those ids from client call-id matching on a full-history rebuild. Older
+records without that metadata remain supported. In a mixed message, eviction may occur while a real client call is
+held but before Claude Code has answered a later hidden call. The interrupted-turn resume preserves any existing
+native result and appends the pinned native error for an unanswered hidden call using its actual logged name and
+model call order. `unknownToolEntry` implements this necessary resume case; it is not a live fallback. Completed
+client calls in synthesized history still keep the client's outputs, whatever tools the request offers.
 
 **Provider records.** A response's record is every line Claude Code wrote to its session log since the previous
 response, read verbatim from the log file, so `log(response) = log(previous) + record`. `--session-mirror` tells the
@@ -390,6 +401,12 @@ results sends actual base64 PNG image blocks (correct media type and unchanged p
 results in the same user turn, retains the prior request’s prefix and leaves the appended log bytes unchanged.
 The large-image probe shows that Claude Code can resize/re-encode appended images, even over its nominal API
 limit; the gateway caps input before that processing, rather than relying on it as a fallback.
+
+The unknown-name probe sends a bare declared client name, an undefined bare name and an undefined MCP name
+with `--tools ""` and only the gateway MCP server. All three get Code's native error tool result and continue to
+another model message without any MCP invocation. `test/tool_names_test.ts` checks native recovery, a correctly
+prefixed retry held/released normally, mixed bare/prefixed blocks in either order, malformed arguments, and
+lost-store replay over SSE, WebSocket and kernel-shaped UUID histories.
 
 The slash probes cover string versus content-block stdin input, `/compact`, `/cost`, `/context`, `/foo`, leading
 whitespace/newlines and non-initial slashes, token punctuation/arguments, multiple text blocks and both image

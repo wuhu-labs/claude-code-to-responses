@@ -454,18 +454,36 @@ export class Gateway {
 /**
  * Tool results for a log that stops at tool calls, in call order: the client's output for each; a call the log already
  * answers gets nothing more. `tools` is given only for outstanding calls Claude Code itself made in this chain: one of a
- * tool the chain doesn't define gets Claude Code's own error, as on the live path. Completed calls from a history
+ * tool the chain doesn't define gets Claude Code's own error, as on the live path (including hidden native calls). Completed calls from a history
  * (`tools` null) always keep the client's outputs: a tool missing from this request changes nothing about them.
  */
 function resultEntries(ctx: LogContext, log: string[], calls: CallRef[], outputs: Map<string, Part[]>, tools: FnTool[] | null): string[] {
   const names = tools ? new Set(tools.map((t) => t.name)) : null
   const out: string[] = []
-  for (const c of calls) {
+  // A native error after a held MCP call may not have run yet when the process was evicted. Reproduce Code's
+  // pinned answer using the ACTUAL logged name, in model call order, without inventing a client output for it.
+  const native = new Map<string, string>()
+  const order: string[] = []
+  if (names !== null) {
+    for (const line of log) {
+      const e = JSON.parse(line)
+      if (e.type !== 'assistant' || !Array.isArray(e.message?.content)) continue
+      for (const b of e.message.content) {
+        if (b.type !== 'tool_use') continue
+        order.push(b.id)
+        if (!b.name.startsWith(MCP_PREFIX) || !names.has(b.name.slice(MCP_PREFIX.length))) native.set(b.id, b.name)
+      }
+    }
+  }
+  const byId = new Map(calls.map((c) => [c.id, c]))
+  for (const id of [...new Set([...order, ...byId.keys()])]) {
+    const c = byId.get(id)
+    if (!c && !native.has(id)) continue
     const all = [...log, ...out]
-    if (hasToolResult(all, c.id)) continue
-    const entry = names === null || names.has(c.name)
-      ? toolResultEntry(ctx, c.id, outputs.get(c.id)!, assistantUuidFor(all, c.id))
-      : unknownToolEntry(ctx, c.id, MCP_PREFIX + c.name, assistantUuidFor(all, c.id))
+    if (hasToolResult(all, id)) continue
+    const entry = native.has(id)
+      ? unknownToolEntry(ctx, id, native.get(id)!, assistantUuidFor(all, id))
+      : toolResultEntry(ctx, id, outputs.get(id)!, assistantUuidFor(all, id))
     out.push(JSON.stringify(entry))
   }
   return out

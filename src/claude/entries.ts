@@ -85,7 +85,7 @@ export function toolResultEntry(ctx: LogContext, callId: string, parts: Part[], 
 
 /**
  * Claude Code's own answer to a call of a tool it doesn't have, as 2.1.284 logs it the moment the call streams in.
- * The client's output for such a call never reaches the model, on the live path or after a rebuild.
+ * Used only when eviction leaves a native call unanswered after a held client call; preserve its actual name.
  */
 export function unknownToolEntry(ctx: LogContext, callId: string, mcpName: string, assistantUuid: string | null): Json {
   const error = `Error: No such tool available: ${mcpName}`
