@@ -5,6 +5,7 @@ import type { FnTool, InItem, Part } from './api/request.ts'
 import { type EventSink, newId, type ResponseState, usageObject, type UsageTotals } from './api/stream.ts'
 import { type Bridge, type BridgeTarget, McpCallError, StaleEpoch } from './bridge.ts'
 import { userContentBlocks } from './claude/entries.ts'
+import { isNoResponseFrame, resultError } from './claude/failure.ts'
 import { ClaudeProcess, executableIdentity, type Frame } from './claude/process.ts'
 import type { CallAliases } from './call_ids.ts'
 import { type LaunchSpec, logPath, MAX_RESULT_CHARS, MCP_PREFIX, mcpConfigJson, projectDir, settingsJson } from './claude/pins.ts'
@@ -22,7 +23,7 @@ import {
   type ToolSummary,
   toolSummary,
 } from './failures.ts'
-import { codexRateLimits, parseRateLimitEvent, rateLimitError, type RateLimitInfo, RateLimitShapeError, REQUEST_LEVEL_429 } from './usage.ts'
+import { codexRateLimits, parseRateLimitEvent, type RateLimitInfo, RateLimitShapeError, REQUEST_LEVEL_429 } from './usage.ts'
 
 // deno-lint-ignore no-explicit-any
 type Json = any
@@ -84,6 +85,7 @@ export class Active {
   ownsTurn = false
   /** The turn's result arrived. */
   turnEnded = false
+  noResponse = false
   /** Its record is being cut from the log. */
   finishing = false
   constructor(
@@ -560,6 +562,9 @@ export class Lane implements BridgeTarget {
   private onFrame(f: Frame): void {
     if (this.dead) return
     switch (f.type) {
+      case 'assistant':
+        if (this.active?.ownsTurn && isNoResponseFrame(f)) this.active.noResponse = true
+        break
       case 'transcript_mirror':
         for (const e of f.entries ?? []) this.mirror(e)
         break
@@ -618,7 +623,7 @@ export class Lane implements BridgeTarget {
     const a = this.active
     // a result can only end the active response's own turn, never the previous one's
     if (!a || a.finished || !a.ownsTurn) return
-    if (f.is_error) return this.fail(resultError(f, this.rateLimit))
+    if (f.is_error) return this.fail(resultError(f, this.rateLimit, a.noResponse))
     if (!a.msg?.stopped) {
       return this.fail(serverError('turn_ended_without_message', `Claude Code ended its turn without a model message: ${String(f.result ?? '').slice(0, 300)}`))
     }
@@ -981,25 +986,3 @@ export function outputChars(parts: Part[]): number {
   return parts.reduce((n, p) => n + (p.type === 'text' ? p.text.length : 0), 0)
 }
 export { MAX_RESULT_CHARS }
-
-/**
- * Maps the error result of a turn. Measured on 2.1.284: an upstream error ends the turn with
- * `terminal_reason: "api_error"`, `api_error_status: <HTTP status>` and `result: "API Error: …"`; the context limit
- * with `terminal_reason: "blocking_limit"` and "Prompt is too long". The probe checks both shapes per release.
- */
-function resultError(f: Frame, rateLimit: RateLimitInfo | null): GatewayError {
-  const text = String(f.result ?? f.errors?.join?.('; ') ?? 'Claude Code reported an error')
-  // the local blocking limit, or the backend refusing the prompt as too long ("prompt is too long: N tokens > M maximum")
-  if (f.terminal_reason === 'blocking_limit' || /prompt is too long/i.test(text)) {
-    return new GatewayError(400, 'invalid_request_error', 'context_length_exceeded', `The context is too long for the model: ${text}`)
-  }
-  const status = typeof f.api_error_status === 'number' ? f.api_error_status : null
-  if (f.terminal_reason === 'api_error' && status !== null) {
-    if (status === 429) return rateLimitError(text, rateLimit)
-    if (status === 401 || status === 403) return new GatewayError(status, 'server_error', 'upstream_authentication_error', text)
-    if (status === 529) return new GatewayError(503, 'server_error', 'upstream_overloaded', text)
-    if (status >= 400 && status < 500) return new GatewayError(400, 'invalid_request_error', 'upstream_invalid_request', text)
-    return new GatewayError(502, 'server_error', 'upstream_error', text)
-  }
-  return serverError('claude_code_error', `Claude Code ended the turn with an error (${f.terminal_reason ?? 'unknown'}): ${text}`)
-}
