@@ -146,6 +146,14 @@ Deno.test('the 429 mapping: a reported reset is usage_limit_reached with a cappe
   assertEquals([e.status, e.code, e.headers], [429, 'usage_limit_reached', { 'retry-after': '600' }])
   const body: Json = e.toJSON().error
   assertEquals([body.limit_type, body.resets_at], ['five_hour', 1_760_000_600])
+  assertEquals<Json>(e.toResponseError(), {
+    code: 'usage_limit_reached',
+    message: e.message,
+    limit_type: 'five_hour',
+    resets_at: 1_760_000_600,
+    status: 429,
+    headers: { 'retry-after': '600' },
+  })
   assertEquals(rateLimitError('x', rejected({ resetsAt: 1_760_604_800, rateLimitType: 'seven_day' }), t).headers, { 'retry-after': '3600' })
   for (const latest of [null, rejected({}), { ...rejected({ resetsAt: 1_760_000_600 }), status: 'allowed' as const }]) {
     const r = rateLimitError('API Error: Server is temporarily limiting requests', latest, t)
@@ -354,24 +362,43 @@ for (const transport of ['sse', 'websocket'] as const) {
   })
 }
 
-Deno.test('a 429 after output has streamed stays a failed response, with the usage fields in its error', async () => {
-  const run = new UsageRun('usage-after-output', false)
-  await run.run(async () => {
-    const reset = now() + 900
-    // post-tool hooks are skipped, so the notice goes in at the end-of-turn hook and the response makes a second
-    // inference after its first output (as in matrix_test.ts)
-    run.fake.reply({ blocks: [call('toolu_k', 'echo', { text: 'k' })] }, { blocks: [text('first part')] }, limit(reset, 'five_hour'))
-    await run.send([user('T1')])
-    const lane = [...run.tg.gw.lanes.values()][0]
-    const hook = lane.hook.bind(lane)
-    lane.hook = (body) => body.hook_event_name === 'Stop' ? hook(body) : {}
-    const r = await run.send([{ type: 'function_call_output', call_id: 'toolu_k', output: 'K' }, user('NOTICE-STOP')])
-    assertEquals(r.status, 'failed')
-    assertEquals(r.events[0].type, 'response.created')
-    assert(r.events.some((e) => e.type === 'response.output_text.delta'))
-    assertEquals([r.response.error.code, r.response.error.limit_type, r.response.error.resets_at], ['usage_limit_reached', 'five_hour', reset])
-  })
-})
+for (const transport of ['sse', 'websocket'] as const) {
+  for (const weekly of [false, true]) {
+    Deno.test(`${transport}: a ${weekly ? 'weekly' : 'session'} limit after output carries the kernel's status and capped retry header in response.failed`, async () => {
+      const run = new UsageRun(`usage-after-output-${transport}-${weekly}`, false, { transport })
+      await run.run(async () => {
+        const reset = now() + (weekly ? 604800 : 900)
+        const claim = weekly ? 'seven_day' : 'five_hour'
+        // Skipped post-tool hooks deliver the notice at Stop, causing another inference after text streamed.
+        run.fake.reply({ blocks: [call('toolu_k', 'echo', { text: 'k' })] }, { blocks: [text('first part')] }, limit(reset, claim))
+        await run.send([user('T1')])
+        const lane = [...run.tg.gw.lanes.values()][0]
+        const hook = lane.hook.bind(lane)
+        lane.hook = (body) => body.hook_event_name === 'Stop' ? hook(body) : {}
+        // Capture the already-computed error: the pre-output refusal sends exactly these HTTP headers.
+        const fail = lane.fail.bind(lane)
+        let expected: Json
+        lane.fail = (error) => {
+          expected = { status: error.status, headers: error.headers }
+          fail(error)
+        }
+        const r = await run.send([{ type: 'function_call_output', call_id: 'toolu_k', output: 'K' }, user('NOTICE-STOP')])
+        assertEquals(r.status, 'failed')
+        assertEquals(r.events.find((e) => e.type.startsWith('response.'))?.type, 'response.created')
+        assert(r.events.some((e) => e.type === 'response.output_text.delta'))
+        const terminal = r.events.at(-1)
+        assertEquals(terminal.type, 'response.failed', 'not a request-level error after output')
+        const error = terminal.response.error // exact location the kernel's ResponsesWebSocketEvents reads
+        assertEquals([error.code, error.limit_type, error.resets_at], ['usage_limit_reached', claim, reset])
+        assertEquals({ status: error.status, headers: error.headers }, expected)
+        assertEquals(error.status, 429)
+        assertEquals(typeof error.headers['retry-after'], 'string')
+        if (weekly) assertEquals(error.headers, { 'retry-after': '3600' })
+        else assert(Number(error.headers['retry-after']) > 0 && Number(error.headers['retry-after']) <= 900)
+      })
+    })
+  }
+}
 
 Deno.test('sse: a client that leaves while its response is held is noticed at the first output, which cancels it', async () => {
   const run = new UsageRun('usage-held-abort', false)

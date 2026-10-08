@@ -142,7 +142,9 @@ reads `~/.claude`.
   `usage_limit_reached` with `Retry-After` capped at an hour, even for a weekly limit days away; the client retries
   no more often than hourly and every retry goes to the backend again, since nothing is cached or answered from
   memory. A 429 after output has streamed (a second inference inside one response) still ends it with
-  `response.failed`, its error object carrying the same `limit_type` and `resets_at`. Over HTTP/SSE the stream
+  `response.failed`, with `response.error.status: 429`, `response.error.headers["retry-after"]` holding the same
+  capped seconds string as a pre-output 429, and the same `limit_type` and `resets_at`. This shape is identical on
+  SSE and WebSocket, so the kernel can classify the failure and read its wait even after output. Over HTTP/SSE the stream
   carries only standard Responses events: usage reports (`codex.rate_limits`) go to WebSocket clients alone, since
   an SSE stream ends with its response and the report often arrives just after (see below).
 - Each response object carries `x_gateway`: how it reached Claude Code (`new`, `live`, `store`, `history`), how many

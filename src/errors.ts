@@ -79,7 +79,9 @@ export class GatewayError extends Error {
 
   /** The `error` object of a failed response (`response.failed`). */
   toResponseError() {
-    return { code: this.code, message: this.message, ...this.extra }
+    // After output, a request-level 429 can only travel inside response.failed. Preserve the same
+    // status and retry metadata there so streaming consumers can classify it and honor Retry-After.
+    return { code: this.code, message: this.message, ...this.extra, ...(this.status === 429 ? { status: this.status, headers: this.headers } : {}) }
   }
 }
 
