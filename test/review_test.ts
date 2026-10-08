@@ -312,7 +312,11 @@ Deno.test('an end-of-turn continuation may stream longer than the record timeout
       { blocks: [text('second'), text(' part'), text(' streams slowly')], gapMs: 600 },
     )
     await run.send([user('T1')])
-    const r = await run.send([output('toolu_k', 'K'), output('toolu_u', 'unknown tool'), user('NOTICE-STOP')])
+    // Exercise the Stop fallback independently of undefined-tool surfacing: Code may skip a post-tool hook.
+    const lane = [...run.tg.gw.lanes.values()][0]
+    const hook = lane.hook.bind(lane)
+    lane.hook = (body) => body.hook_event_name === 'Stop' ? hook(body) : {}
+    const r = await run.send([output('toolu_k', 'K'), user('NOTICE-STOP')])
     assertEquals(r.status, 'completed', JSON.stringify(r.response.error))
     assertEquals(run.drv.text(r), 'first partsecond part streams slowly')
   })
@@ -442,7 +446,7 @@ for (const unknownFirst of [false, true]) {
         await run.send([user('go')])
         await run.tg.waitEvent('hold')
         if (evict) await run.disrupt('hold')
-        const r = await run.send([output('toolu_k', 'K'), output('toolu_u', 'the client had no such tool')])
+        const r = await run.send([output('toolu_k', 'K')])
         assertEquals(r.status, 'completed')
         if (evict) assertEquals(r.response.x_gateway.resume, 'interrupted_turn')
         const msgs = run.fake.main()[1].body.messages
@@ -652,7 +656,11 @@ Deno.test('the record timeout never covers the end-of-turn hook round trip or a 
       { blocks: [text(' and the rest')], delayMs: 2000 },
     )
     await run.send([user('T1')])
-    const r = await run.send([output('toolu_k', 'K'), output('toolu_u', 'unknown tool'), user('NOTICE-STOP')])
+    // Exercise the Stop fallback independently of undefined-tool surfacing: Code may skip a post-tool hook.
+    const lane = [...run.tg.gw.lanes.values()][0]
+    const hook = lane.hook.bind(lane)
+    lane.hook = (body) => body.hook_event_name === 'Stop' ? hook(body) : {}
+    const r = await run.send([output('toolu_k', 'K'), user('NOTICE-STOP')])
     assertEquals(r.status, 'completed', JSON.stringify(r.response.error))
     assertEquals(run.drv.text(r), 'first part and the rest')
   })

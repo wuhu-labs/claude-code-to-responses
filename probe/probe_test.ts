@@ -109,6 +109,30 @@ probe('--tools "": no native tools, no Skill tool (paired with --tools default)'
   assert(native.includes('Read') && native.length > 2, native.join(','))
 })
 
+probe('2.1.284: bare and unknown tool names receive native errors and continue with only MCP tools', async (p, fake) => {
+  const t = new ProbeTarget(['send_message'])
+  const r = p.launch({ name: 'unknown-names', fake, target: t })
+  fake.reply({
+    blocks: [
+      { type: 'tool_use', id: 'toolu_bare', name: 'send_message', input: { text: 'x' } },
+      { type: 'tool_use', id: 'toolu_unknown', name: 'not_available', input: {} },
+      call('toolu_unknown_mcp', 'not_available', {}),
+    ],
+  }, { blocks: [text('continued')] })
+  const result = await r.turn('go')
+  assertEquals(result.result, 'continued')
+  assertEquals(toolNames(fake.main()[0].body), ['mcp__fn__send_message'])
+  assertEquals(t.calls, [])
+  const results = fake.main()[1].body.messages.flatMap((m: Json) => Array.isArray(m.content) ? m.content : []).filter((b: Json) => b.type === 'tool_result')
+  assertEquals(results.map((b: Json) => [b.tool_use_id, b.is_error, b.content]), [
+    ['toolu_bare', true, '<tool_use_error>Error: No such tool available: send_message</tool_use_error>'],
+    ['toolu_unknown', true, '<tool_use_error>Error: No such tool available: not_available</tool_use_error>'],
+    ['toolu_unknown_mcp', true, '<tool_use_error>Error: No such tool available: mcp__fn__not_available</tool_use_error>'],
+  ])
+  await r.kill()
+  for (const b of results) assert(r.log().some((l) => l.includes(b.tool_use_id) && l.includes('tool_result') && l.includes('No such tool available')))
+})
+
 probe('--setting-sources "": planted user and project settings (Stop hooks) are ignored (paired: dropping the flag runs them)', async (p, fake) => {
   const userMarker = `${p.root}/user-hook-ran`, projectMarker = `${p.root}/project-hook-ran`
   const work = `${p.root}/work/planted-settings`

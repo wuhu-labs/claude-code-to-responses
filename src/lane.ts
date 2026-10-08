@@ -62,6 +62,8 @@ export class Active {
   msg: MsgState | null = null
   finished = false
   usage: UsageTotals = { input: 0, cacheRead: 0, cacheCreation: 0, output: 0 }
+  /** Calls Claude Code answers natively, not client-visible function calls. */
+  nativeCalls: string[] = []
   /** Output items as the client will replay them, for the record digest. */
   outputs: InItem[] = []
   mirrorTimer: ReturnType<typeof setTimeout> | undefined
@@ -654,9 +656,22 @@ export class Lane implements BridgeTarget {
         } else if (cb.type === 'redacted_thinking') {
           item = { type: 'reasoning', id: newId('rs'), summary: [], encrypted_content: encodeThinking({ redacted: cb.data }) }
         } else if (cb.type === 'tool_use') {
-          const name = String(cb.name ?? '')
-          if (!name.startsWith(MCP_PREFIX)) return this.fail(serverError('unexpected_tool', `The model called '${name}', which is not a client tool.`))
-          item = { type: 'function_call', id: newId('fc'), call_id: cb.id, name: name.slice(MCP_PREFIX.length), arguments: '', status: 'in_progress' }
+          if (
+            typeof cb.id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(cb.id) ||
+            typeof cb.name !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(cb.name) ||
+            cb.input === null || typeof cb.input !== 'object' || Array.isArray(cb.input)
+          ) {
+            return this.fail(serverError('malformed_model_message', 'The model sent a malformed tool_use block.'))
+          }
+          const name = cb.name.startsWith(MCP_PREFIX) ? cb.name.slice(MCP_PREFIX.length) : null
+          if (name === null || !this.chain.tools.some((t) => t.name === name)) {
+            // Even a known bare client name is unavailable to Claude Code: only its MCP name can execute.
+            // Keep this block for mirror/argument validation, but let Code answer and infer again natively.
+            a.nativeCalls.push(cb.id)
+            msg.blocks.set(ev.index, { type: cb.type, outputIndex: -1, item: null, buf: '', signature: '', done: false })
+            return
+          }
+          item = { type: 'function_call', id: newId('fc'), call_id: cb.id, name, arguments: '', status: 'in_progress' }
           this.learn(cb.id)
         } else {
           return this.fail(serverError('unexpected_block', `Unsupported content block '${cb.type}' from the model.`))
@@ -678,6 +693,10 @@ export class Lane implements BridgeTarget {
         const b = msg.blocks.get(ev.index)
         if (!b) return
         const d = ev.delta ?? {}
+        if (b.item === null) {
+          if (d.type === 'input_json_delta') b.buf += d.partial_json
+          return
+        }
         if (d.type === 'text_delta') {
           b.buf += d.text
           sink.send('response.output_text.delta', { item_id: b.item.id, output_index: b.outputIndex, content_index: 0, delta: d.text, logprobs: [] })
@@ -697,6 +716,16 @@ export class Lane implements BridgeTarget {
         if (!b || b.done) return
         b.done = true
         const it = b.item
+        if (b.type === 'tool_use') {
+          let args: Json
+          try {
+            args = JSON.parse(b.buf.trim() ? b.buf : '{}')
+          } catch { /* typed below */ }
+          if (args === null || typeof args !== 'object' || Array.isArray(args)) {
+            return this.fail(serverError('malformed_model_message', 'The model sent tool_use arguments that are not a JSON object.'))
+          }
+        }
+        if (it === null) return
         if (b.type === 'text') {
           const part = { type: 'output_text', text: b.buf, annotations: [], logprobs: [] }
           sink.send('response.output_text.done', { item_id: it.id, output_index: b.outputIndex, content_index: 0, text: b.buf, logprobs: [] })
@@ -756,11 +785,14 @@ export class Lane implements BridgeTarget {
     for (const i of msg.blocks.keys()) if (!m?.has(i)) return
     // every block is logged: the wait the record timer guards is over (the turn's end may legitimately take longer)
     clearTimeout(a.mirrorTimer)
-    const calls = msg.stopReason === 'tool_use'
-    const callBlocks = [...msg.blocks.values()].filter((b) => b.type === 'tool_use')
-    if (calls && (callBlocks.length === 0 || !m)) {
+    const toolBlocks = [...msg.blocks.values()].filter((b) => b.type === 'tool_use')
+    const callBlocks = toolBlocks.filter((b) => b.item !== null)
+    const toolStop = msg.stopReason === 'tool_use'
+    const calls = toolStop && callBlocks.length > 0
+    if (toolStop && (toolBlocks.length === 0 || !m)) {
       return this.fail(serverError('malformed_model_message', 'The model stopped for tool use without calling a tool.'))
     }
+    if (toolStop && !calls) return // native tool errors continue this response, not a client tool round
     if (!calls && (this.staged || this.continuing)) return // notices go in at the end-of-turn hook; inference goes on
     if (!calls && !a.turnEnded) return
     if (calls && this.staged) return this.fail(serverError('notice_undelivered', 'The model called tools again before the notices could be delivered.'))
@@ -820,6 +852,7 @@ export class Lane implements BridgeTarget {
       chain: this.chain.key,
       instructions: this.chain.instructions,
       callAliases: this.callAliases,
+      ...(a.nativeCalls.length ? { nativeCalls: a.nativeCalls } : {}),
       session: this.sessionId,
       device: this.config.deviceId!,
       end,

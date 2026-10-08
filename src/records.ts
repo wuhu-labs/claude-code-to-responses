@@ -25,6 +25,8 @@ export interface ProviderRecord {
   instructions?: string
   /** Client call ids bound to the original provider ids; every pair is one-to-one. */
   callAliases?: CallAliases
+  /** Tool ids answered natively by Claude Code and omitted from Responses output (older records lack this). */
+  nativeCalls?: string[]
   /** Claude Code session id. */
   session: string
   /** The chain's Claude Code device id (its config folder's userID): with the session id, metadata.user_id. */
@@ -124,6 +126,11 @@ export function checkRecord(r: any): void {
       providers.add(pair[1])
     }
   }
+  if (
+    r.nativeCalls !== undefined && (!Array.isArray(r.nativeCalls) ||
+      r.nativeCalls.some((id: unknown) => typeof id !== 'string' || !CALL_ID.test(id)) ||
+      new Set(r.nativeCalls).size !== r.nativeCalls.length)
+  ) fail('bad native calls')
   if (typeof r.digest !== 'string' || !HEX64.test(r.digest)) fail('bad digest')
   if (typeof r.session !== 'string' || !SESSION_ID.test(r.session)) fail('bad session')
   if (typeof r.device !== 'string' || !DEVICE_ID.test(r.device)) fail('bad device')

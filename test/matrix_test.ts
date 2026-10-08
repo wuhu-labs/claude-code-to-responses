@@ -114,17 +114,17 @@ scenarioTest('notices at a turn start go in through stdin as one user turn', asy
 scenarioTest('a notice delivered at the end-of-turn hook continues inference within the same response', async () => {
   const run = new Run('stophook', false)
   await run.run(async () => {
-    // the second call names a tool the client never defined: Claude Code answers it itself, so no hook of the
-    // last call ever runs, and the notice waits for the end-of-turn hook
+    // The second call is hidden and answered natively; explicitly skip post-tool hooks below to exercise
+    // notice delivery through the end-of-turn fallback.
     run.fake.reply({ blocks: [call('toolu_k', 'echo', { text: 'k' }), call('toolu_u', 'nonexistent', {})] }, { blocks: [text('first part')] }, {
       blocks: [text('second part')],
     })
     await run.send([user('T1')])
-    const r = await run.send([{ type: 'function_call_output', call_id: 'toolu_k', output: 'K' }, {
-      type: 'function_call_output',
-      call_id: 'toolu_u',
-      output: 'unknown tool',
-    }, user('NOTICE-STOP')])
+    // Exercise the Stop fallback independently of undefined-tool surfacing: Code may skip a post-tool hook.
+    const lane = [...run.tg.gw.lanes.values()][0]
+    const hook = lane.hook.bind(lane)
+    lane.hook = (body) => body.hook_event_name === 'Stop' ? hook(body) : {}
+    const r = await run.send([{ type: 'function_call_output', call_id: 'toolu_k', output: 'K' }, user('NOTICE-STOP')])
     assertEquals(r.status, 'completed')
     assertEquals(run.drv.text(r), 'first partsecond part')
     assertEquals(run.tg.events('notice').map((n) => n.data.via), ['Stop'])
