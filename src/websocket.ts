@@ -1,3 +1,4 @@
+import { RECORD_PREFIX } from './records.ts'
 import { Buffer } from 'node:buffer'
 // OpenAI Responses WebSocket subset: one create in flight, text JSON events, no cancel message.
 import { parseRequest } from './api/request.ts'
@@ -162,7 +163,7 @@ class SocketSink implements EventSink {
     const send = this.writer.prepare(events.map(({ type, data }, i) => {
       // The kernel retains reasoning from added; repeating opaque records defeats the bounded batch budget.
       const withoutOpaque = (item: Json): Json => {
-        if (item.type !== 'reasoning') return item
+        if (item.type !== 'reasoning' || !item.encrypted_content?.startsWith(RECORD_PREFIX)) return item
         const { encrypted_content: _, ...rest } = item
         return rest
       }

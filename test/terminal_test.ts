@@ -42,7 +42,7 @@ Deno.test('terminal overflow: drained blocks plus an oversized terminal never co
     }
     await ws.closed
     await run.tg.waitEvent('kill', (d) => d.reason === 'client_disconnected')
-    assertEquals(error?.error.code, 'websocket_message_too_large')
+    assertEquals(error?.error.code, 'response_too_large')
     assertEquals(error?.status, 413)
     assertEquals(doneBlocks, blockCount, 'each model block streamed and drained before aggregate terminal rejection')
     assertEquals(terminal, false)
