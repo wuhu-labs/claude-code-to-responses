@@ -261,10 +261,18 @@ for (const transport of ['sse', 'websocket'] as const) {
         const retry = await run.send([user('PRIVATE-PROMPT')])
         assertEquals([retry.status, retry.response.x_gateway.path], ['completed', 'store'])
         assert(sameRequest(run.fake.main()[1], run.fake.main()[2]))
+        assertEquals(Deno.readTextFileSync(run.tg.gw.failures.path), raw, 'retained after retry overwrites the failed attempt log')
         await run.disrupt('restart')
         assertEquals(Deno.readTextFileSync(run.tg.gw.failures.path), atKill)
         run.fake.reply({ blocks: [text('after restart')] })
-        assertEquals((await run.send([user('after restart')])).status, 'completed')
+        const restarted = await run.send([user('after restart')])
+        assertEquals([restarted.status, restarted.response.x_gateway.path], ['completed', 'store'])
+        assertEquals(Deno.readTextFileSync(run.tg.gw.failures.path), raw, 'retained after the restart-based resumed turn completes')
+        await run.disrupt('idle')
+        run.fake.reply({ blocks: [text('after eviction')] })
+        const evicted = await run.send([user('after eviction')])
+        assertEquals([evicted.status, evicted.response.x_gateway.path], ['completed', 'store'])
+        assertEquals(Deno.readTextFileSync(run.tg.gw.failures.path), raw, 'retained after the eviction-based resumed turn completes')
       } finally {
         console.error = error
       }

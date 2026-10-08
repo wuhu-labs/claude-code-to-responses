@@ -208,7 +208,7 @@ storage before continuing.
 
 `test/failure_diagnostics_test.ts` drives every malformed failure site with raw frames, asserts persistence before terminal emission and kill, checks value-free
 metadata, validation boundaries, rotation and file permissions. Real pinned-Claude tests on both transports check file + journal before child kill,
-byte-identical retry from the last completed response, retained diagnostics after resume/restart, and explicit storage failure.
+byte-identical retry from the last completed response, retained diagnostics after completed restart- and idle-eviction-based resumed turns, and explicit storage failure.
 
 ## WebSocket mode
 
