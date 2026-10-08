@@ -1,6 +1,6 @@
 // Routes each Responses request to a lane: the live process when it sits at the previous response, otherwise a
 // process rebuilt from the response store or from the client's history and the provider records it carries.
-import type { FnTool, InItem, NormRequest, Part } from './api/request.ts'
+import type { InItem, NormRequest, Part } from './api/request.ts'
 import { type EventSink, GatedSink, ResponseState, SseSink } from './api/stream.ts'
 import { type CallAliases, matchRecordItems, remapItems } from './call_ids.ts'
 import { Bridge } from './bridge.ts'
@@ -15,7 +15,7 @@ import {
   userContentEntry,
   userMessageEntry,
 } from './claude/entries.ts'
-import { CLAUDE_CODE_VERSION, MCP_PREFIX, RESUME_LINE } from './claude/pins.ts'
+import { CLAUDE_CODE_VERSION, RESUME_LINE } from './claude/pins.ts'
 import { claudeVersion, executableIdentity, processIdentity } from './claude/process.ts'
 import { type Config, ConfigError, paths } from './config.ts'
 import { asGatewayError, GatewayError, invalid, previousResponseNotFound } from './errors.ts'
@@ -301,13 +301,13 @@ export class Gateway {
   private resumePlan(lane: Lane, log: string[], head: Head, delivery: Delivery) {
     if (delivery.kind === 'turn') return { resume: true, interruptedTurn: false, log, attempt: [] }
     const before = [...log, ...lane.pending]
-    const attempt = this.interruptedEntries(contextOf(before, lane.sessionId, lane.workDir), before, head, delivery, lane.chain.tools)
+    const attempt = this.interruptedEntries(contextOf(before, lane.sessionId, lane.workDir), before, head, delivery)
     return { resume: true, interruptedTurn: true, log, attempt }
   }
 
   /** The tool results plus one user message: the notice text and images, else a fixed line. */
-  private interruptedEntries(ctx: LogContext, log: string[], head: Head, d: Extract<Delivery, { kind: 'outputs' }>, tools: FnTool[] | null): string[] {
-    const out = resultEntries(ctx, log, head.calls, d.outputs, tools)
+  private interruptedEntries(ctx: LogContext, log: string[], head: Head, d: Extract<Delivery, { kind: 'outputs' }>): string[] {
+    const out = resultEntries(ctx, log, head.calls, d.outputs)
     out.push(JSON.stringify(userContentEntry(ctx, d.notices?.parts ?? [{ type: 'text', text: RESUME_LINE }])))
     return out
   }
@@ -418,7 +418,7 @@ export class Gateway {
           if (i === 0 && used.length === 0) extra.push(JSON.stringify({ type: 'atis-latch', atis: '', sessionId }))
         } else {
           // completed calls: their outputs are history, whatever tools this request offers
-          extra.push(...resultEntries(ctx, [...log, ...tailLines, ...extra], calls, d.outputs, null))
+          extra.push(...resultEntries(ctx, [...log, ...tailLines, ...extra], calls, d.outputs))
           if (d.notices !== null) extra.push(JSON.stringify(userContentEntry(ctx, d.notices.parts)))
         }
         const a = assistantEntries(ctx, g.outputs, chain.model)
@@ -445,8 +445,8 @@ export class Gateway {
       spawn = { resume: true, interruptedTurn: false, log, attempt: extra }
     } else {
       const all = [...log, ...tailLines, ...extra]
-      // calls Claude Code made (the head of the records) may be ones it answers itself; synthesized ones never are
-      const r7 = this.interruptedEntries(contextOf(all, sessionId, workDir), all, head, delivery, synth.length ? null : chain.tools)
+      // Answer client calls with their outputs and preserve unanswered native calls from any reused records.
+      const r7 = this.interruptedEntries(contextOf(all, sessionId, workDir), all, head, delivery)
       spawn = { resume: true, interruptedTurn: true, log, attempt: [...extra, ...r7] }
     }
     state.gateway = {
@@ -461,38 +461,32 @@ export class Gateway {
 }
 
 /**
- * Tool results for a log that stops at tool calls, in call order: the client's output for each; a call the log already
- * answers gets nothing more. `tools` is given only for outstanding calls Claude Code itself made in this chain: one of a
- * tool the chain doesn't define gets Claude Code's own error, as on the live path (including hidden native calls). Completed calls from a history
- * (`tools` null) always keep the client's outputs: a tool missing from this request changes nothing about them.
+ * Tool results in model call order. `calls` names the client calls, whose outputs must be kept even in
+ * synthesized history or with a changed tool set. Any other unanswered logged tool_use gets Code's native
+ * error using its actual name; a result already in the log is never replaced or appended twice.
  */
-function resultEntries(ctx: LogContext, log: string[], calls: CallRef[], outputs: Map<string, Part[]>, tools: FnTool[] | null): string[] {
-  const names = tools ? new Set(tools.map((t) => t.name)) : null
+function resultEntries(ctx: LogContext, log: string[], calls: CallRef[], outputs: Map<string, Part[]>): string[] {
   const out: string[] = []
-  // A native error after a held MCP call may not have run yet when the process was evicted. Reproduce Code's
-  // pinned answer using the ACTUAL logged name, in model call order, without inventing a client output for it.
+  // A native error after a held MCP call may not have run yet when the process was evicted. Scan even when
+  // rebuilding synthesized groups: the preceding reused record can still contain that unanswered call.
+  const byId = new Map(calls.map((c) => [c.id, c]))
   const native = new Map<string, string>()
   const order: string[] = []
-  if (names !== null) {
-    for (const line of log) {
-      const e = JSON.parse(line)
-      if (e.type !== 'assistant' || !Array.isArray(e.message?.content)) continue
-      for (const b of e.message.content) {
-        if (b.type !== 'tool_use') continue
-        order.push(b.id)
-        if (!b.name.startsWith(MCP_PREFIX) || !names.has(b.name.slice(MCP_PREFIX.length))) native.set(b.id, b.name)
-      }
+  for (const line of log) {
+    const e = JSON.parse(line)
+    if (e.type !== 'assistant' || !Array.isArray(e.message?.content)) continue
+    for (const b of e.message.content) {
+      if (b.type !== 'tool_use') continue
+      order.push(b.id)
+      if (!byId.has(b.id)) native.set(b.id, b.name)
     }
   }
-  const byId = new Map(calls.map((c) => [c.id, c]))
   for (const id of [...new Set([...order, ...byId.keys()])]) {
-    const c = byId.get(id)
-    if (!c && !native.has(id)) continue
     const all = [...log, ...out]
     if (hasToolResult(all, id)) continue
-    const entry = native.has(id)
-      ? unknownToolEntry(ctx, id, native.get(id)!, assistantUuidFor(all, id))
-      : toolResultEntry(ctx, id, outputs.get(id)!, assistantUuidFor(all, id))
+    const entry = byId.has(id)
+      ? toolResultEntry(ctx, id, outputs.get(id)!, assistantUuidFor(all, id))
+      : unknownToolEntry(ctx, id, native.get(id)!, assistantUuidFor(all, id))
     out.push(JSON.stringify(entry))
   }
   return out

@@ -665,7 +665,7 @@ export class Lane implements BridgeTarget {
           if (name === null || !this.chain.tools.some((t) => t.name === name)) {
             // Even a known bare client name is unavailable to Claude Code: only its MCP name can execute.
             // Keep this block for mirror/argument validation, but let Code answer and infer again natively.
-            a.nativeCalls.push(cb.id)
+            if (!a.nativeCalls.includes(cb.id)) a.nativeCalls.push(cb.id)
             msg.blocks.set(ev.index, { type: cb.type, outputIndex: -1, item: null, buf: '', signature: '', done: false })
             return
           }

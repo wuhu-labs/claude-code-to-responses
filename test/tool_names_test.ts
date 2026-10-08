@@ -1,8 +1,9 @@
 // Claude Code owns unknown-tool recovery; the gateway only holds declared MCP calls.
 import { assert, assertEquals, assertStringIncludes } from '@std/assert'
-import { decodeRecord } from '../src/records.ts'
+import { decodeRecord, encodeRecord } from '../src/records.ts'
 import { call, type Json, text } from './fake.ts'
-import { assertOneUserId, assertPrefix, output, user } from './harness.ts'
+import { assertOneUserId, assertPrefix, assertSameRequests, output, user } from './harness.ts'
+import { committedCallId } from './kernel_shapes.ts'
 import { Run, scenarioTest } from './scenario.ts'
 
 const bare = (id: string, name: string, input: Json = {}) => ({ type: 'tool_use' as const, id, name, input })
@@ -107,4 +108,129 @@ for (const name of ['mcp__fn__echo', 'echo', 'not_available']) {
       assertEquals([r.status, r.response.error?.code], ['failed', 'malformed_model_message'])
     })
   })
+}
+
+for (const synthCall of [false, true]) {
+  scenarioTest(`a synthesized ${synthCall ? 'tool round' : 'text group'} preserves unanswered native calls from a reused record`, async () => {
+    const seen: { run: Run; request: Json }[] = []
+    for (const rebuild of [false, true]) {
+      const run = new Run(`synth-native-${synthCall}-${rebuild}`, false)
+      await run.run(async () => {
+        run.fake.reply({ blocks: [call('toolu_client', 'echo', { text: 'first' }), bare('toolu_native', 'echo', { text: 'second' })] })
+        const held = await run.send([user('run both')])
+        assertEquals(run.drv.calls(held).map((c) => c.call_id), ['toolu_client'])
+        await run.tg.waitEvent('hold')
+        const completion = synthCall
+          ? { type: 'function_call', call_id: 'toolu_synth', name: 'read', arguments: '{"name":"doc"}' }
+          : { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'offline completion' }] }
+        if (rebuild) {
+          await run.disrupt('restart-lost-store')
+          // Preserve the held response's record, but synthesize the following response with no provider record.
+          run.drv.history.push(output('toolu_client', 'FIRST-OUTPUT'), completion)
+        } else {
+          run.fake.reply({ blocks: synthCall ? [call('toolu_synth', 'read', { name: 'doc' })] : [text('offline completion')] })
+          const live = await run.send([output('toolu_client', 'FIRST-OUTPUT')])
+          assertEquals(live.status, 'completed')
+        }
+        run.fake.reply({ blocks: [text('next')] })
+        const next = synthCall ? [output('toolu_synth', 'DOC')] : [user('next')]
+        const r = rebuild ? await run.drv.send(next, 'history') : await run.send(next)
+        assertEquals(r.status, 'completed', JSON.stringify(r.response.error))
+        if (rebuild) {
+          assertEquals(r.response.x_gateway.records, 1)
+          assertEquals(r.response.x_gateway.synthesized_groups, 1)
+        }
+        const request = run.fake.main().at(-1)!
+        const rs = results(request.body)
+        assertEquals(rs.filter((b: Json) => b.tool_use_id === 'toolu_native').length, 1)
+        assertStringIncludes(rs.find((b: Json) => b.tool_use_id === 'toolu_native').content, 'No such tool available: echo')
+        assertStringIncludes(JSON.stringify(rs.find((b: Json) => b.tool_use_id === 'toolu_client')), 'FIRST-OUTPUT')
+        if (synthCall) {
+          assertStringIncludes(JSON.stringify(rs.find((b: Json) => b.tool_use_id === 'toolu_synth' || b.tool_use_id === committedCallId('toolu_synth'))), 'DOC')
+        }
+        seen.push({ run, request })
+      })
+    }
+    // Interrupted-turn delivery adds its documented resume line only in the synthesized tool-round case.
+    if (!synthCall) assertSameRequests([seen[0].request], [seen[1].request], seen[0].run.normalize, seen[1].run.normalize)
+    else {
+      const normalized = (body: Json) =>
+        results(body).map(({ cache_control: _c, ...b }: Json) => ({
+          ...b,
+          tool_use_id: b.tool_use_id === committedCallId('toolu_synth') ? 'toolu_synth' : b.tool_use_id,
+        }))
+      assertEquals(normalized(seen[0].request.body), normalized(seen[1].request.body))
+    }
+  })
+}
+
+scenarioTest('duplicate native ids are deduped on write and legacy duplicate records still continue and rebuild', async () => {
+  const run = new Run('duplicate-native', false)
+  await run.run(async () => {
+    run.fake.reply(
+      { blocks: [bare('toolu_duplicate', 'echo')] },
+      { blocks: [bare('toolu_duplicate', 'echo')] },
+      { blocks: [text('recovered')] },
+    )
+    const first = await run.send([user('go')])
+    assertEquals(first.status, 'completed', JSON.stringify(first.response.error))
+    const rec = (await recordOf(first))!
+    assertEquals(rec.nativeCalls, ['toolu_duplicate'])
+    assertEquals(rec.entries.flatMap((l) => JSON.parse(l).message?.content ?? []).filter((b: Json) => b.type === 'tool_use').length, 2)
+    const legacy = { ...first.response.output.at(-1), encrypted_content: await encodeRecord({ ...rec, nativeCalls: ['toolu_duplicate', 'toolu_duplicate'] }) }
+    assertEquals((await decodeRecord(legacy.encrypted_content))!.nativeCalls, ['toolu_duplicate', 'toolu_duplicate'])
+    run.drv.history[run.drv.history.length - 1] = legacy
+    run.fake.reply({ blocks: [text('continued')] })
+    const continued = await run.send([legacy, user('next')]) // echo an already-written pre-fix record with the warm continuation
+    assertEquals(continued.status, 'completed', JSON.stringify(continued.response.error))
+    await run.disrupt('restart-lost-store')
+    run.fake.reply({ blocks: [text('rebuilt')] })
+    const rebuilt = await run.send([user('next again')])
+    assertEquals(rebuilt.response.x_gateway.records, 2)
+    assertEquals(rebuilt.response.x_gateway.synthesized_groups, 0)
+    assertPrefix(run.fake.main()[3], run.fake.main()[4])
+  })
+})
+
+// Code emits input:{} at block start even when its eventual arguments are null. Inject the malformed
+// stream frame at the lane boundary so these tests reach the HEADER guards, not argument validation.
+for (
+  const [label, patch] of [
+    ['empty id', { id: '' }],
+    ['invalid id characters', { id: 'toolu bad' }],
+    ['overlong id', { id: 'x'.repeat(129) }],
+    ['empty name', { name: '' }],
+    ['invalid name characters', { name: 'bad.name' }],
+    ['overlong name', { name: 'x'.repeat(65) }],
+    ['null input', { input: null }],
+  ] as const
+) {
+  for (const name of ['mcp__fn__echo', 'echo']) {
+    Deno.test(`malformed tool_use header: ${label} fails before client/native dispatch (${name})`, async () => {
+      const run = new Run(`malformed-header-${label}-${name}`, false)
+      await run.run(async () => {
+        run.fake.reply({ blocks: [text('ready')] }, { blocks: [bare('toolu_header', name)] })
+        const parent = await run.send([user('warm up')])
+        const lane = [...run.tg.gw.lanes.values()][0]
+        const frames = lane as unknown as { streamEvent(ev: Json): void }
+        const streamEvent = frames.streamEvent.bind(lane)
+        let injected = false
+        frames.streamEvent = (ev) => {
+          if (ev.type === 'content_block_start' && ev.content_block?.type === 'tool_use') {
+            injected = true
+            ev = { ...ev, content_block: { ...ev.content_block, ...patch } }
+          }
+          streamEvent(ev)
+        }
+        const failed = await run.send([user('bad header')])
+        assert(injected, 'the malformed header reached the lane')
+        assertEquals([failed.status, failed.response.error?.code], ['failed', 'malformed_model_message'])
+        assertStringIncludes(failed.response.error.message, 'malformed tool_use block')
+        assertEquals(run.drv.calls(failed), [])
+        assertEquals(run.tg.events('hold'), [])
+        assert(!run.tg.gw.store.has(failed.response.id), 'no malformed record was committed')
+        assert(run.tg.gw.store.has(parent.response.id), 'the valid parent remains a continuation point')
+      })
+    })
+  }
 }

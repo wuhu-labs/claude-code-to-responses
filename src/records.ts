@@ -128,8 +128,7 @@ export function checkRecord(r: any): void {
   }
   if (
     r.nativeCalls !== undefined && (!Array.isArray(r.nativeCalls) ||
-      r.nativeCalls.some((id: unknown) => typeof id !== 'string' || !CALL_ID.test(id)) ||
-      new Set(r.nativeCalls).size !== r.nativeCalls.length)
+      r.nativeCalls.some((id: unknown) => typeof id !== 'string' || !CALL_ID.test(id)))
   ) fail('bad native calls')
   if (typeof r.digest !== 'string' || !HEX64.test(r.digest)) fail('bad digest')
   if (typeof r.session !== 'string' || !SESSION_ID.test(r.session)) fail('bad session')
