@@ -126,7 +126,7 @@ export class Gateway {
   }
 
   /**
-   * Validates and starts a response; returns its event stream once the model's first output (or the response's end)
+   * Validates and starts a response; returns its event stream once its first output event (or its end)
    * is coming. Errors before streaming are thrown, a backend 429 before any output among them (see GatedSink). A client
    * that leaves while the response is held is noticed when the stream reaches it: its cancel stops the lane then.
    * (The request's abort signal cannot say it sooner: Deno does not notice the disconnect after a body of a few KiB.)

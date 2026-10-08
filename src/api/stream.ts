@@ -97,8 +97,6 @@ export interface EventSink {
    * reports transport acceptance, not peer consumption. No asynchronous work may separate prepare/enqueue. */
   prepare(events: SinkEvent[]): (() => boolean) | null
   close(): void
-  /** The model's first output is coming: a gated sink sends what it held (see GatedSink). */
-  open?(): void
   /** Refuses the response as a whole, before any of it was sent (see GatedSink); false once it is open. */
   refuse?(err: GatewayError): boolean
   /** Sends an event outside the response's sequence (`codex.rate_limits`), even after the response ended, for as long
@@ -167,7 +165,8 @@ export class SseSink implements EventSink {
   }
 }
 
-const TERMINAL = new Set(['response.completed', 'response.failed', 'response.incomplete'])
+/** The events a gated sink holds; any other is output (or the end), and opens it. */
+const OPENING = new Set(['response.created', 'response.in_progress'])
 
 export interface GateHooks {
   /** The held events went out: the response is streaming. */
@@ -177,10 +176,11 @@ export interface GateHooks {
 }
 
 /**
- * Holds a response's opening events (`response.created`, `response.in_progress`) until the model's first output, so
- * a response the backend refuses before any output (a 429) can be refused as a request: a real HTTP 429 with
- * `Retry-After`, or the WebSocket `error` event. Held events are checked against the transport as they come, exactly
- * as if they had been sent; a terminal event before the first output sends them with it, in one batch.
+ * Holds a response's opening events (`response.created`, `response.in_progress`) until its first client-visible
+ * output, so a response the backend refuses before any (a 429) can be refused as a request: a real HTTP 429 with
+ * `Retry-After`, or the WebSocket `error` event. A model message holding only calls Claude Code answers natively sends
+ * nothing, so it does not open the gate. Held events are checked against the transport as they come, exactly as if
+ * they had been sent; the first output or terminal event sends them with it, in one batch.
  */
 export class GatedSink implements EventSink {
   onCancel: (() => void) | null = null
@@ -209,7 +209,7 @@ export class GatedSink implements EventSink {
     if (this.held === null) return this.inner.prepare(events)
     const send = this.inner.prepare([...this.held, ...events])
     if (!send) return null
-    if (!events.some((e) => TERMINAL.has(e.type))) {
+    if (events.every((e) => OPENING.has(e.type))) {
       return () => {
         if (this.isClosed || this.held === null) return false
         this.held.push(...events)
@@ -223,7 +223,7 @@ export class GatedSink implements EventSink {
     }
   }
 
-  open(): void {
+  private open(): void {
     if (this.isClosed || this.held === null) return
     // a refused send means the transport is gone, and its cancel reaches the lane
     if (this.inner.prepare(this.held)?.()) this.release()

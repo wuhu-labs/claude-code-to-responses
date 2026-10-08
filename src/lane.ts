@@ -622,8 +622,6 @@ export class Lane implements BridgeTarget {
         return this.fail(serverError('upstream_stream_cut', 'The model stream was cut short and Claude Code retried; the partial output cannot be withdrawn.'))
       }
       this.continuing = false
-      // the first output is coming: a response held for a possible refusal starts streaming
-      a.sink.open?.()
       // the response goes on with a new model message: the wait for the last one's record is over
       clearTimeout(a.mirrorTimer)
       const u = ev.message?.usage ?? {}

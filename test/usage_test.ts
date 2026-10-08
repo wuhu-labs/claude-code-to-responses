@@ -333,23 +333,39 @@ Deno.test('sse: the stream carries only standard Responses events, no codex.rate
   })
 })
 
+for (const transport of ['sse', 'websocket'] as const) {
+  Deno.test(`${transport}: a 429 after a hidden native tool round, before any client output, is still refused as a request`, async () => {
+    const run = new UsageRun(`usage-after-native-${transport}`, false)
+    await run.run(async () => {
+      const reset = now() + 600
+      // a call of a tool the client never defined is answered by Claude Code itself and emits nothing to the client
+      run.fake.reply({ blocks: [call('toolu_n', 'nonexistent', {})] }, limit(reset, 'five_hour'))
+      if (transport === 'sse') {
+        const r = await sse(run, 'call something unknown')
+        assertEquals([r.status, r.headers.get('retry-after') !== null, r.body.error.code, r.body.error.resets_at], [429, true, 'usage_limit_reached', reset])
+      } else {
+        const events = await wsCreate(run.tg.websocket(), 'call something unknown')
+        assertEquals(events.filter((e) => e.type.startsWith('response.')), [])
+        const e = events.at(-1)
+        assertEquals([e.type, e.status, e.error.code, e.error.resets_at], ['error', 429, 'usage_limit_reached', reset])
+      }
+      assertEquals(run.fake.main().length, 2)
+    })
+  })
+}
+
 Deno.test('a 429 after output has streamed stays a failed response, with the usage fields in its error', async () => {
   const run = new UsageRun('usage-after-output', false)
   await run.run(async () => {
     const reset = now() + 900
-    // the second call names a tool the client never defined, so the notice waits for the end-of-turn hook and the
-    // response makes a second inference after its first output (as in matrix_test.ts)
-    run.fake.reply(
-      { blocks: [call('toolu_k', 'echo', { text: 'k' }), call('toolu_u', 'nonexistent', {})] },
-      { blocks: [text('first part')] },
-      limit(reset, 'five_hour'),
-    )
+    // post-tool hooks are skipped, so the notice goes in at the end-of-turn hook and the response makes a second
+    // inference after its first output (as in matrix_test.ts)
+    run.fake.reply({ blocks: [call('toolu_k', 'echo', { text: 'k' })] }, { blocks: [text('first part')] }, limit(reset, 'five_hour'))
     await run.send([user('T1')])
-    const r = await run.send([
-      { type: 'function_call_output', call_id: 'toolu_k', output: 'K' },
-      { type: 'function_call_output', call_id: 'toolu_u', output: 'unknown tool' },
-      user('NOTICE-STOP'),
-    ])
+    const lane = [...run.tg.gw.lanes.values()][0]
+    const hook = lane.hook.bind(lane)
+    lane.hook = (body) => body.hook_event_name === 'Stop' ? hook(body) : {}
+    const r = await run.send([{ type: 'function_call_output', call_id: 'toolu_k', output: 'K' }, user('NOTICE-STOP')])
     assertEquals(r.status, 'failed')
     assertEquals(r.events[0].type, 'response.created')
     assert(r.events.some((e) => e.type === 'response.output_text.delta'))

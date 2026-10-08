@@ -87,8 +87,9 @@ reads `~/.claude`.
   on from the last completed response.
 - Errors use OpenAI's shape `{"error": {"message", "type", "param", "code"}}`. Before streaming they are HTTP errors;
   once streaming they end the response with `response.failed`. A response's opening events (`response.created`,
-  `response.in_progress`, and so the HTTP status and headers) are held until the model's first output, so a backend
-  429 before any output is an HTTP `429`, never a stream that fails (see **Usage limits** below). An HTTP client that
+  `response.in_progress`, and so the HTTP status and headers) are held until the response's first output event, so a backend
+  429 before any output is an HTTP `429`, never a stream that fails (see **Usage limits** below). A model message
+  holding only calls Claude Code answers natively (non-client tools, hidden) emits nothing and keeps the wait. An HTTP client that
   leaves during that wait is noticed at the first output (Deno does not report the disconnect sooner), which cancels
   the response as any disconnect does. Every code:
 
@@ -136,7 +137,7 @@ reads `~/.claude`.
   the response.
 - **Usage limits.** Claude Code reports the subscription's usage in a `rate_limit_event` whenever it changes, on
   successful requests too (only with `CLAUDE_CODE_OAUTH_TOKEN`; an API key reports nothing). A backend 429 before
-  the model's first output is refused as a request: an HTTP `429` with a JSON error body (and on WebSocket the
+  the response's first output event is refused as a request: an HTTP `429` with a JSON error body (and on WebSocket the
   typed `error` event, below), and nothing of the response is streamed or stored. With a known reset it is
   `usage_limit_reached` with `Retry-After` capped at an hour, even for a weekly limit days away; the client retries
   no more often than hourly and every retry goes to the backend again, since nothing is cached or answered from
