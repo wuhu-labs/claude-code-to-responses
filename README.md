@@ -107,8 +107,8 @@ reads `~/.claude`.
   | `image_too_large` | `400`: an image whose base64 payload exceeds 5,242,880 characters (5 MiB encoded, up to 3,932,160 decoded bytes), the gateway’s own per-image input cap, enforced before Claude Code’s image processing. Resize it before sending. |
   | `conversation_busy` | `409`: another response of the conversation is streaming or starting. |
   | `websocket_response_in_progress` | `409`: a second create arrived before the socket's active response ended. |
-  | `websocket_message_too_large` | `413`: an inbound message or outbound event exceeds 16 MiB; the socket closes with `1009`. |
-  | `websocket_backpressure` | `429`: buffered outbound bytes exceed 16 MiB, or output makes no draining progress for 5 s; the socket closes with `1013`. |
+  | `websocket_message_too_large` | `413`: an inbound message or outbound event exceeds 128 MiB; the socket closes with `1009`. |
+  | `websocket_backpressure` | `429`: buffered outbound bytes exceed 128 MiB, or output makes no draining progress for 5 s; the socket closes with `1013`. |
   | `not_found`, `response_not_in_progress` | Cancel of an unknown response, or of one that is no longer streaming. |
   | `shutting_down` | `503`: the gateway is stopping. |
   | `cancelled` | The response was cancelled (by the cancel route or a client that went away). |
@@ -276,10 +276,12 @@ outputs can still arrive on HTTP or another socket. The normal hold timeout stil
 can also cancel a response created over WebSocket without closing its socket. Gateway shutdown closes idle sockets
 as well as active ones (`1001`).
 
-Application messages/events are limited to **16 MiB of UTF-8 bytes** (binary messages use their byte length).
+Deno 2.9.1 independently rejects individual inbound frames at or above **64 MiB** before application code sees them, and exposes no option to raise that ceiling. Clients must fragment larger creates; the Wuhu kernel preserves single-frame sends up to 16 MiB and uses 16 MiB continuation frames above it. The 128 MiB application-message cap depends on this fragmentation. A native frame rejection cannot carry the gateway's typed application error.
+
+Application messages/events are limited to **128 MiB of UTF-8 bytes** (binary messages use their byte length).
 Deno reassembles inbound frames before this application limit is checked; this is not a wire-level frame or
 preallocation limit. The writer never waits on a client from the Claude Code lane: it caps buffered outbound bytes
-at **16 MiB** and closes if they make no draining progress for **5 seconds**, even after a response's terminal event.
+at **128 MiB** and closes if they make no draining progress for **5 seconds**, even after a response's terminal event.
 The entire final batch (provider-record events plus terminal) is serialized and checked against the message and
 buffer budgets **before success is committed**. A rejected final enqueue cancels the attempt, removes its record,
 and preserves the previous chain head for a retry. HTTP/SSE uses the same boundary: a terminal batch must be

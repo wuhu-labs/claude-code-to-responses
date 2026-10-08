@@ -36,6 +36,55 @@ Deno.test('WebSocket continuation shares HTTP/SSE chains in both directions, inc
   })
 })
 
+Deno.test('WebSocket accepts a create above the former 16 MiB cap without dropping input', async () => {
+  assertEquals(WS_MAX_MESSAGE_BYTES, 128 * 1024 * 1024)
+  assertEquals(WS_MAX_BUFFERED_BYTES, WS_MAX_MESSAGE_BYTES)
+  const run = new Run('ws-large-create', false)
+  await run.run(async () => {
+    const input = 'x'.repeat(17 * 1024 * 1024)
+    run.tg.gw.createInto = async (request, sink) => {
+      const item = request.input[0]
+      assert(item.kind === 'message' && item.parts[0].type === 'text')
+      assertEquals(item.parts[0].text, input)
+      sink.send('response.completed', { response: { id: 'resp_large', status: 'completed' } })
+      sink.close()
+    }
+    const reply = await run.tg.websocket().send({ ...base, input })
+    assertEquals(reply.status, 'completed')
+  })
+})
+
+Deno.test('WebSocket accepts a fragmented create above Deno native 64 MiB frame ceiling', async () => {
+  const run = new Run('ws-fragmented-create', false)
+  await run.run(async () => {
+    const input = 'x'.repeat(65 * 1024 * 1024)
+    run.tg.gw.createInto = async (request, sink) => {
+      const item = request.input[0]
+      assert(item.kind === 'message' && item.parts[0].type === 'text')
+      assertEquals(item.parts[0].text, input)
+      sink.send('response.completed', { response: { id: 'resp_fragmented', status: 'completed' } })
+      sink.close()
+    }
+    const conn = await rawSocket(run.tg.url)
+    try {
+      const bytes = new TextEncoder().encode(JSON.stringify({ type: 'response.create', ...base, input }))
+      for (let at = 0; at < bytes.length; at += 16 * 1024 * 1024) {
+        const end = Math.min(at + 16 * 1024 * 1024, bytes.length)
+        const header = new Uint8Array(14)
+        header[0] = (end === bytes.length ? 0x80 : 0) | (at === 0 ? 1 : 0)
+        header[1] = 0xff
+        new DataView(header.buffer).setBigUint64(2, BigInt(end - at))
+        await writeAll(conn, header)
+        await writeAll(conn, bytes.subarray(at, end))
+      }
+      const event = JSON.parse(new TextDecoder().decode((await readRawFrame(conn)).payload))
+      assertEquals(event.response.status, 'completed')
+    } finally {
+      conn.close()
+    }
+  })
+})
+
 Deno.test('WebSocket single flight reserves before async create; rejected requests leave active work intact', async () => {
   const run = new Run('ws-flight', false)
   await run.run(async () => {
@@ -184,14 +233,17 @@ Deno.test('WebSocket refused upgrade uses the HTTP auth error; valid auth uses t
 Deno.test('WebSocket oversized inbound text yields typed 413 and closes with 1009 before creating a lane', async () => {
   const run = new Run('ws-oversize', false)
   await run.run(async () => {
-    const ws = run.tg.websocket()
-    await ws.opened
-    const closing = new Promise<CloseEvent>((resolve) => ws.socket.addEventListener('close', resolve, { once: true }))
-    ws.socket.send('x'.repeat(WS_MAX_MESSAGE_BYTES + 1))
-    const error = await ws.next()
-    assertEquals([error.type, error.status, error.error.code], ['error', 413, 'websocket_message_too_large'])
-    assertEquals((await closing).code, 1009)
-    assertEquals(run.tg.events('spawn').length, 0)
+    const conn = await rawSocket(run.tg.url)
+    try {
+      await oversizedFragments(conn, 1)
+      const error = JSON.parse(new TextDecoder().decode((await readRawFrame(conn)).payload))
+      assertEquals([error.type, error.status, error.error.code], ['error', 413, 'websocket_message_too_large'])
+      const close = await readRawFrame(conn)
+      assertEquals(new DataView(close.payload.buffer).getUint16(0), 1009)
+      assertEquals(run.tg.events('spawn').length, 0)
+    } finally {
+      conn.close()
+    }
   })
 })
 
@@ -219,6 +271,37 @@ async function writeAll(conn: Deno.TcpConn, bytes: Uint8Array): Promise<void> {
   let at = 0
   while (at < bytes.length) at += await conn.write(bytes.subarray(at))
 }
+// Deno's native socket rejects individual frames >=64 MiB, independently of the application's message cap.
+async function oversizedFragments(conn: Deno.TcpConn, opcode: number): Promise<void> {
+  const chunk = new Uint8Array(1024 * 1024).fill(120)
+  const header = new Uint8Array(14)
+  header[1] = 0xff
+  new DataView(header.buffer).setBigUint64(2, BigInt(chunk.byteLength))
+  for (let i = 0; i < WS_MAX_MESSAGE_BYTES / chunk.byteLength; i++) {
+    header[0] = i === 0 ? opcode : 0
+    await writeAll(conn, header)
+    await writeAll(conn, chunk)
+  }
+  await writeAll(conn, new Uint8Array([0x80, 0x81, 0, 0, 0, 0, 120]))
+}
+async function readRawFrame(conn: Deno.TcpConn): Promise<{ opcode: number; payload: Uint8Array }> {
+  const read = async (count: number) => {
+    const bytes = new Uint8Array(count)
+    let at = 0
+    while (at < count) {
+      const n = await conn.read(bytes.subarray(at))
+      if (n === null) throw new Error('frame EOF')
+      at += n
+    }
+    return bytes
+  }
+  const header = await read(2)
+  let length = header[1] & 127
+  if (length === 126) length = new DataView((await read(2)).buffer).getUint16(0)
+  if (length === 127) length = Number(new DataView((await read(8)).buffer).getBigUint64(0))
+  return { opcode: header[0] & 15, payload: await read(length) }
+}
+
 async function rawCreate(conn: Deno.TcpConn, body: Json): Promise<void> {
   const text = new TextEncoder().encode(JSON.stringify({ type: 'response.create', ...base, ...body }))
   assert(text.length < 65536)
@@ -234,7 +317,7 @@ Deno.test('WebSocket a real non-reading TCP peer cannot wedge the lane or block 
     const previous = await run.send([user('warm')])
     const conn = await rawSocket(run.tg.url)
     try {
-      run.fake.reply({ blocks: Array.from({ length: 40 }, () => text('x'.repeat(512 * 1024))) })
+      run.fake.reply({ blocks: Array.from({ length: 100 }, () => text('x'.repeat(512 * 1024))) })
       await rawCreate(conn, { previous_response_id: previous.response.id, input: 'huge' })
       await run.tg.waitEvent('client_disconnect', () => true, 15000)
       await run.tg.waitEvent('kill', (d) => d.reason === 'client_disconnected')
@@ -378,17 +461,19 @@ Deno.test('WebSocket incomplete terminal passes through unchanged and releases t
   })
 })
 
-Deno.test('WebSocket oversized binary message gets the size error before binary-JSON validation', async () => {
+Deno.test('WebSocket oversized fragmented binary message gets the size error before binary-JSON validation', async () => {
   const run = new Run('ws-oversize-binary', false)
   await run.run(async () => {
-    const ws = run.tg.websocket()
-    await ws.opened
-    const closing = new Promise<CloseEvent>((r) => ws.socket.addEventListener('close', r, { once: true }))
-    ws.socket.send(new Uint8Array(WS_MAX_MESSAGE_BYTES + 1))
-    const event = await ws.next()
-    assertEquals([event.type, event.status, event.error.code], ['error', 413, 'websocket_message_too_large'])
-    assertEquals((await closing).code, 1009)
-    assertEquals(run.tg.events('spawn').length, 0)
+    const conn = await rawSocket(run.tg.url)
+    try {
+      await oversizedFragments(conn, 2)
+      const event = JSON.parse(new TextDecoder().decode((await readRawFrame(conn)).payload))
+      assertEquals([event.type, event.status, event.error.code], ['error', 413, 'websocket_message_too_large'])
+      assertEquals(new DataView((await readRawFrame(conn)).payload.buffer).getUint16(0), 1009)
+      assertEquals(run.tg.events('spawn').length, 0)
+    } finally {
+      conn.close()
+    }
   })
 })
 

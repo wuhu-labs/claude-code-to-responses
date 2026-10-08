@@ -6,8 +6,8 @@ import type { Gateway } from './gateway.ts'
 
 type Json = any
 
-export const WS_MAX_MESSAGE_BYTES = 16 * 1024 * 1024
-export const WS_MAX_BUFFERED_BYTES = 16 * 1024 * 1024
+export const WS_MAX_MESSAGE_BYTES = 128 * 1024 * 1024
+export const WS_MAX_BUFFERED_BYTES = 128 * 1024 * 1024
 export const WS_DRAIN_TIMEOUT_MS = 5000
 
 /** A bounded socket writer. Never await a peer from the Claude Code lane. Even after a terminal event, a
@@ -34,7 +34,7 @@ export class SocketWriter {
     const texts = events.map((event) => JSON.stringify(event))
     const sizes = texts.map((text) => new TextEncoder().encode(text).byteLength)
     if (sizes.some((size) => size > WS_MAX_MESSAGE_BYTES)) {
-      this.fail(new GatewayError(413, 'server_error', 'websocket_message_too_large', 'The outbound event exceeds the 16 MiB message limit.'), 1009)
+      this.fail(new GatewayError(413, 'server_error', 'websocket_message_too_large', 'The outbound event exceeds the 128 MiB message limit.'), 1009)
       return null
     }
     const size = sizes.reduce((total, n) => total + n, 0)
@@ -197,7 +197,7 @@ export function upgradeResponses(req: Request, gw: Gateway): Response {
       ? message.data.size
       : message.data.byteLength
     if (size > WS_MAX_MESSAGE_BYTES) {
-      writer.fail(new GatewayError(413, 'invalid_request_error', 'websocket_message_too_large', 'The message exceeds the 16 MiB limit.'), 1009)
+      writer.fail(new GatewayError(413, 'invalid_request_error', 'websocket_message_too_large', 'The message exceeds the 128 MiB limit.'), 1009)
       return
     }
     if (typeof message.data !== 'string') {

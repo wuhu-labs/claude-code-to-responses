@@ -2,20 +2,27 @@
 import { assert, assertEquals } from '@std/assert'
 import { parseRequest } from '../src/api/request.ts'
 import { SseSink } from '../src/api/stream.ts'
-import { SocketWriter, WS_MAX_BUFFERED_BYTES } from '../src/websocket.ts'
+import { SocketWriter, WS_MAX_BUFFERED_BYTES, WS_MAX_MESSAGE_BYTES } from '../src/websocket.ts'
 import { type Json, text } from './fake.ts'
 import { sameRequest, user } from './harness.ts'
 import { INSTRUCTIONS, MODEL, Run, TOOLS } from './scenario.ts'
 
 const base = { model: MODEL, instructions: INSTRUCTIONS, tools: TOOLS }
 
-Deno.test('terminal overflow: 17 normally drained 1 MiB blocks never commit an undeliverable WebSocket success', async () => {
+Deno.test('terminal overflow: drained blocks plus an oversized terminal never commit an undeliverable WebSocket success', async () => {
+  const blockCount = 17
   const run = new Run('ws-terminal-overflow', false)
   await run.run(async () => {
     run.fake.reply({ blocks: [text('warm')] })
     const previous = await run.send([user('warm')])
     const lane = [...run.tg.gw.lanes.values()][0]
-    run.fake.reply({ blocks: Array.from({ length: 17 }, () => text('x'.repeat(1024 * 1024))), gapMs: 100 })
+    // Inflate only the aggregate terminal at the real commit boundary; model blocks still stream and drain.
+    lane.beforeCommit = async () => {
+      const state = lane.active!.state
+      const object = state.object.bind(state)
+      state.object = () => ({ ...object(), extra: 'x'.repeat(WS_MAX_MESSAGE_BYTES) })
+    }
+    run.fake.reply({ blocks: Array.from({ length: blockCount }, () => text('x'.repeat(1024 * 1024))), gapMs: 100 })
     const ws = run.tg.websocket()
     await ws.opened
     ws.socket.send(JSON.stringify({ type: 'response.create', ...base, previous_response_id: previous.response.id, input: 'large response' }))
@@ -37,7 +44,7 @@ Deno.test('terminal overflow: 17 normally drained 1 MiB blocks never commit an u
     await run.tg.waitEvent('kill', (d) => d.reason === 'client_disconnected')
     assertEquals(error?.error.code, 'websocket_message_too_large')
     assertEquals(error?.status, 413)
-    assertEquals(doneBlocks, 17, 'each model block streamed and drained before aggregate terminal rejection')
+    assertEquals(doneBlocks, blockCount, 'each model block streamed and drained before aggregate terminal rejection')
     assertEquals(terminal, false)
     assertEquals(run.tg.gw.store.has(id), false)
     assertEquals(lane.head?.responseId, previous.response.id)
