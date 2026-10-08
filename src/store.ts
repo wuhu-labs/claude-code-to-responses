@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 // The response store: response id -> provider record, one JSON file per response under <state>/responses.
 // It survives gateway restarts; a request with a known previous_response_id rebuilds Claude Code's log from it.
-import type { ProviderRecord } from './records.ts'
+import { type ProviderRecord, RecordError } from './records.ts'
 
 export class ResponseStore {
   readonly dir: string
@@ -30,7 +30,7 @@ export class ResponseStore {
       }
       if (!/^[0-9a-f]{64}$/.test(actual)) throw new Error('bad payload alias')
       const text = Deno.readTextFileSync(`${this.payloadDir}/${actual}`)
-      if (createHash('sha256').update(text).digest('hex') !== actual) throw new Error('payload sidecar hash mismatch')
+      if (createHash('sha256').update(text).digest('hex') !== actual) throw new RecordError('payload sidecar hash mismatch')
       return JSON.parse(text)
     } catch (error) {
       if (error instanceof Deno.errors.NotFound) return undefined

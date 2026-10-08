@@ -274,10 +274,16 @@ export class Gateway {
     await this.settled(rec.session)
     const records = this.store.chain(prev)
     if (!records) throw previousResponseNotFound(prev, 'its chain is incomplete in the store')
+    let log: string[]
+    try {
+      log = records.flatMap((r) => replayLog(r, this.store))
+    } catch (error) {
+      if (error instanceof RecordError) throw previousResponseNotFound(prev, 'its payload sidecars are unavailable; resend full history')
+      throw error
+    }
     lane = new Lane(rec.session, this.workDir(rec.session), chain, head, this.config, this.bridge, this.store, this.laneEvents)
     lane.callAliases = rec.callAliases ?? []
     this.addLane(lane)
-    const log = records.flatMap((r) => replayLog(r, this.store))
     lane.pending = this.store.tail(prev)
     const spawn = this.resumePlan(lane, log, head, delivery)
     state.gateway = { path: 'store', session: rec.session, records: records.length, resume: spawn.interruptedTurn ? 'interrupted_turn' : 'stdin' }
@@ -372,7 +378,12 @@ export class Gateway {
       // unless a later record covers it
       if (!fits) continue
       aliases = matched!
-      regenerated.set(r.id, replayLog(r, this.store, remapItems(pendingGroups.flatMap((g) => [...g.inputs, ...g.outputs]), aliases)))
+      try {
+        regenerated.set(r.id, replayLog(r, this.store, remapItems(pendingGroups.flatMap((g) => [...g.inputs, ...g.outputs]), aliases)))
+      } catch (error) {
+        if (error instanceof RecordError) throw invalid('input', `Provider record payload recovery failed: ${error.message}`, 'invalid_provider_record')
+        throw error
+      }
       used.push(r)
       headId = r.id
       session = r.session

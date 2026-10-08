@@ -1,4 +1,4 @@
-import { assert, assertEquals, assertExists, assertNotEquals } from '@std/assert'
+import { assert, assertEquals, assertExists, assertNotEquals, assertRejects } from '@std/assert'
 import { decodeRecord, encodeRecord } from '../src/records.ts'
 import { replayLog } from '../src/replay.ts'
 import { call, type Json, text } from './fake.ts'
@@ -95,5 +95,62 @@ Deno.test('slim synthesized tool history retains framing and does not compound r
     assertEquals([recovered.status, recovered.response.x_gateway.records, recovered.response.x_gateway.synthesized_groups], ['completed', 2, 0])
     assertEquals(run.fake.main()[3].raw, live)
     assert(recovered.response.output.at(-1).encrypted_content.length < 16 * 1024)
+  })
+})
+
+for (const damage of ['deleted', 'corrupt'] as const) {
+  Deno.test(`idle eviction with a ${damage} input sidecar is contained and subsequent creates stay typed`, async () => {
+    const run = new Run(`slim-eviction-${damage}`, false, { idleTimeoutMs: 50 })
+    await run.run(async () => {
+      const ws = run.tg.websocket()
+      run.fake.reply({ blocks: [text('seen')] })
+      const first = await ws.send({ ...base, input: 'cacheable input' })
+      const payload = [...Deno.readDirSync(run.tg.gw.store.payloadDir)][0]
+      const path = `${run.tg.gw.store.payloadDir}/${payload.name}`
+      if (damage === 'deleted') Deno.removeSync(path)
+      else Deno.writeTextFileSync(path, '"corrupted payload"')
+      await run.tg.waitEvent('verify_error')
+      await run.tg.waitEvent('kill', (d) => d.reason === 'idle_timeout')
+      assertEquals(run.tg.gw.lanes.size, 0)
+      const errors = run.tg.events('verify_error')
+      assertEquals(errors.length, 1)
+      assert(errors[0].data.error.includes(damage === 'deleted' ? 'sidecar is missing' : 'hash mismatch'))
+      run.tg.gw.events.splice(run.tg.gw.events.indexOf(errors[0]), 1)
+      const unavailable = await assertRejects(() => ws.send({ ...base, previous_response_id: first.response.id, input: 'next' })) as Error & {
+        code: string
+        status: number
+      }
+      assertEquals([unavailable.status, unavailable.code], [400, 'previous_response_not_found'])
+      const full = { ...base, input: [user('cacheable input'), ...first.response.output, user('next')] }
+      if (damage === 'deleted') {
+        run.fake.reply({ blocks: [text('recovered')] })
+        assertEquals((await ws.send(full)).status, 'completed')
+      } else {
+        const invalid = await assertRejects(() => ws.send(full)) as Error & { code: string; status: number }
+        assertEquals([invalid.status, invalid.code], [400, 'invalid_provider_record'])
+      }
+      run.fake.reply({ blocks: [text('unrelated still works')] })
+      assertEquals((await ws.send({ ...base, input: 'independent create' })).status, 'completed')
+    })
+  })
+}
+
+Deno.test('unexpected tail teardown rejection settles kill without an unhandled rejection', async () => {
+  const run = new Run('slim-kill-guard', false)
+  await run.run(async () => {
+    run.fake.reply({ blocks: [text('seen')] })
+    await run.tg.websocket().send({ ...base, input: 'input' })
+    const lane = [...run.tg.gw.lanes.values()][0]
+    ;(lane as unknown as { keepTail: () => void }).keepTail = () => {
+      throw new Error('injected tail failure')
+    }
+    await lane.kill('test_guard')
+    await lane.gone
+    assertEquals(run.tg.gw.lanes.size, 0)
+    const error = run.tg.events('verify_error').find((e) => e.data.reason === 'test_guard')!
+    assertExists(error)
+    run.tg.gw.events.splice(run.tg.gw.events.indexOf(error), 1)
+    run.fake.reply({ blocks: [text('alive')] })
+    assertEquals((await run.tg.websocket().send({ ...base, input: 'independent' })).status, 'completed')
   })
 })

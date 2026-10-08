@@ -325,10 +325,14 @@ export class Lane implements BridgeTarget {
     if (!this.killing) {
       this.dead = true
       // Install the promise before teardown: failing an active response there calls kill() reentrantly.
-      const { promise, resolve, reject } = Promise.withResolvers<void>()
+      const { promise, resolve } = Promise.withResolvers<void>()
       this.killing = promise
       this.events.dead(this)
-      void this.teardown(reason).then(resolve, reject)
+      void this.teardown(reason).then(resolve, (error) => {
+        this.events.note('verify_error', { session: this.sessionId, error: String(error), reason })
+        this.events.gone(this)
+        resolve()
+      })
     }
     return this.killing
   }
@@ -360,8 +364,11 @@ export class Lane implements BridgeTarget {
     try {
       Deno.removeSync(this.runDir, { recursive: true })
     } catch { /* gone */ }
-    if (this.head) this.keepTail(atRest)
-    this.events.gone(this)
+    try {
+      if (this.head) this.keepTail(atRest)
+    } finally {
+      this.events.gone(this)
+    }
   }
 
   /**
@@ -370,7 +377,12 @@ export class Lane implements BridgeTarget {
    * what came before the attempt, never the attempt itself.
    */
   private keepTail(atRest: boolean): void {
-    const chain = this.store.chain(this.head!.responseId)
+    let chain
+    try {
+      chain = this.store.chain(this.head!.responseId)
+    } catch (error) {
+      return this.events.note('verify_error', { session: this.sessionId, error: String(error) })
+    }
     if (!chain) return this.events.note('verify_error', { session: this.sessionId, error: 'chain missing from store' })
     try {
       this.readLog() // the process is gone: everything it wrote is on disk
@@ -383,7 +395,12 @@ export class Lane implements BridgeTarget {
     try {
       disk = Deno.readTextFileSync(this.logFile).split('\n').filter((l) => l !== '')
     } catch { /* checked below */ }
-    const want = [...chain.flatMap((r) => replayLog(r, this.store)), ...tail]
+    let want: string[]
+    try {
+      want = [...chain.flatMap((r) => replayLog(r, this.store)), ...tail]
+    } catch (error) {
+      return this.events.note('verify_error', { session: this.sessionId, error: String(error) })
+    }
     const i = want.findIndex((l, i) => disk[i] !== l)
     if (i >= 0 || (atRest && disk.length !== want.length)) {
       const at = i >= 0 ? i : want.length
