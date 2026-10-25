@@ -28,12 +28,11 @@ export interface RateLimitInfo {
   windows: Record<string, UsageWindow>
 }
 
-const WINDOW_MINUTES: Record<string, number> = {
+const WINDOW_MINUTES: Record<string, number | null> = {
   five_hour: 300,
   seven_day: 10080,
-  seven_day_opus: 10080,
-  seven_day_sonnet: 10080,
   seven_day_overage_included: 10080,
+  overage: null,
 }
 
 const STATUSES = new Set(['allowed', 'allowed_warning', 'rejected'])
@@ -94,8 +93,12 @@ export function codexRateLimits(info: RateLimitInfo): Json | null {
   const rateLimits: Json = {}
   if (info.windows.five_hour) rateLimits.primary = kernelWindow(info.windows.five_hour, PRIMARY_WINDOW_MINUTES)
   if (info.windows.seven_day) rateLimits.secondary = kernelWindow(info.windows.seven_day, SECONDARY_WINDOW_MINUTES)
-  if (!Object.keys(info.windows).length) return null
-  rateLimits.windows = Object.fromEntries(Object.entries(info.windows).map(([name, w]) => [name, kernelWindow(w, WINDOW_MINUTES[name])]))
+  const timed = Object.entries(info.windows).flatMap(([name, w]) => {
+    const minutes = WINDOW_MINUTES[name]
+    return minutes === null ? [] : [[name, kernelWindow(w, minutes)]]
+  })
+  if (!timed.length) return null
+  rateLimits.windows = Object.fromEntries(timed)
   return { type: 'codex.rate_limits', rate_limits: rateLimits }
 }
 

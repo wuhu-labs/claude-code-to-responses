@@ -103,6 +103,8 @@ Deno.test('rate_limit_event: the shapes 2.1.284 produces parse; anything else is
       { status: 'allowed', unifiedWindows: { seven_day: { utilization: 0.1 } } },
       { status: 'allowed', unifiedWindows: { seven_day_overage_included: null } },
       { status: 'allowed', unifiedWindows: { unknown: { utilization: 0, resetsAt: 1 } } },
+      { status: 'allowed', unifiedWindows: { overage: { utilization: -1, resetsAt: 1 } } },
+      { status: 'allowed', unifiedWindows: { seven_day_opus: { utilization: 0, resetsAt: 1 } } },
     ]
   ) {
     assertThrows(() => parseRateLimitEvent({ type: 'rate_limit_event', rate_limit_info: info }), RateLimitShapeError, undefined, JSON.stringify(info))
@@ -143,8 +145,7 @@ Deno.test('codex.rate_limits: model-only windows survive without primary or seco
       status: 'allowed',
       unifiedWindows: {
         seven_day_overage_included: { utilization: 1.07, resetsAt: 1760000000 },
-        seven_day_opus: { utilization: 0.2, resetsAt: 1760000000 },
-        seven_day_sonnet: { utilization: 0.4, resetsAt: 1760000000 },
+        overage: { utilization: 0.2, resetsAt: 1760000000 },
       },
     },
   }))
@@ -153,11 +154,22 @@ Deno.test('codex.rate_limits: model-only windows survive without primary or seco
     rate_limits: {
       windows: {
         seven_day_overage_included: { used_percent: 100, window_minutes: 10080, reset_at: 1760000000 },
-        seven_day_opus: { used_percent: 20, window_minutes: 10080, reset_at: 1760000000 },
-        seven_day_sonnet: { used_percent: 40, window_minutes: 10080, reset_at: 1760000000 },
       },
     },
   })
+})
+
+Deno.test('codex.rate_limits: a credit-only overage report is validated but has no timed event', () => {
+  const info = parseRateLimitEvent({
+    rate_limit_info: {
+      status: 'allowed',
+      unifiedWindows: {
+        overage: { utilization: 0.2, resetsAt: 1760000000 },
+      },
+    },
+  })
+  assertEquals(info.windows, { overage: { utilization: 0.2, resetsAt: 1760000000 } })
+  assertEquals(codexRateLimits(info), null)
 })
 
 Deno.test('the 429 mapping: a reported reset is usage_limit_reached with a capped Retry-After; none stays rate_limit_exceeded', () => {
