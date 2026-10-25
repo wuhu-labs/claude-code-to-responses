@@ -63,8 +63,7 @@ Deno.test('rate_limit_event: the shapes 2.1.284 produces parse; anything else is
     status: 'allowed',
     resetsAt: null,
     rateLimitType: null,
-    fiveHour: null,
-    sevenDay: null,
+    windows: {},
   })
   const full = parseRateLimitEvent({
     type: 'rate_limit_event',
@@ -84,8 +83,11 @@ Deno.test('rate_limit_event: the shapes 2.1.284 produces parse; anything else is
     status: 'rejected',
     resetsAt: 1760000000,
     rateLimitType: 'seven_day_opus',
-    fiveHour: { utilization: 0.25, resetsAt: 1759990000 },
-    sevenDay: { utilization: 1.07, resetsAt: 1760000000 },
+    windows: {
+      five_hour: { utilization: 0.25, resetsAt: 1759990000 },
+      seven_day: { utilization: 1.07, resetsAt: 1760000000 },
+      seven_day_overage_included: { utilization: 0.6, resetsAt: 1760000000 },
+    },
   })
   for (
     const info of [
@@ -100,6 +102,7 @@ Deno.test('rate_limit_event: the shapes 2.1.284 produces parse; anything else is
       { status: 'allowed', unifiedWindows: { five_hour: { utilization: -0.1, resetsAt: 1 } } },
       { status: 'allowed', unifiedWindows: { seven_day: { utilization: 0.1 } } },
       { status: 'allowed', unifiedWindows: { seven_day_overage_included: null } },
+      { status: 'allowed', unifiedWindows: { unknown: { utilization: 0, resetsAt: 1 } } },
     ]
   ) {
     assertThrows(() => parseRateLimitEvent({ type: 'rate_limit_event', rate_limit_info: info }), RateLimitShapeError, undefined, JSON.stringify(info))
@@ -107,25 +110,54 @@ Deno.test('rate_limit_event: the shapes 2.1.284 produces parse; anything else is
 })
 
 Deno.test('codex.rate_limits: five_hour is primary (300), seven_day secondary (10080); unreported windows are omitted', () => {
-  const info = (w: Partial<RateLimitInfo>): RateLimitInfo => ({ status: 'allowed', resetsAt: null, rateLimitType: null, fiveHour: null, sevenDay: null, ...w })
+  const info = (w: Partial<RateLimitInfo>): RateLimitInfo => ({ status: 'allowed', resetsAt: null, rateLimitType: null, windows: {}, ...w })
   assertEquals(codexRateLimits(info({})), null)
-  const both = codexRateLimits(info({ fiveHour: { utilization: 0.25, resetsAt: 1759990000 }, sevenDay: { utilization: 1.07, resetsAt: 1760000000 } }))
+  const both = codexRateLimits(
+    info({ windows: { five_hour: { utilization: 0.25, resetsAt: 1759990000 }, seven_day: { utilization: 1.07, resetsAt: 1760000000 } } }),
+  )
   assertEquals(both, {
     type: 'codex.rate_limits',
     rate_limits: {
       primary: { used_percent: 25, window_minutes: 300, reset_at: 1759990000 },
       // used past its cap: full, within the kernel's 0...100
       secondary: { used_percent: 100, window_minutes: 10080, reset_at: 1760000000 },
+      windows: {
+        five_hour: { used_percent: 25, window_minutes: 300, reset_at: 1759990000 },
+        seven_day: { used_percent: 100, window_minutes: 10080, reset_at: 1760000000 },
+      },
     },
   })
   const p = kernelParse(both)
   assertEquals([p.primary?.window_minutes, p.secondary?.window_minutes, p.plan], [300, 10080, undefined])
-  const five = codexRateLimits(info({ fiveHour: { utilization: 0, resetsAt: 1759990000 } }))
+  const five = codexRateLimits(info({ windows: { five_hour: { utilization: 0, resetsAt: 1759990000 } } }))
   assertEquals(Object.keys(kernelParse(five)), ['primary'])
   assertEquals(five.rate_limits.secondary, undefined)
-  const seven = codexRateLimits(info({ sevenDay: { utilization: 0.5, resetsAt: 1760000000 } }))
+  const seven = codexRateLimits(info({ windows: { seven_day: { utilization: 0.5, resetsAt: 1760000000 } } }))
   assertEquals(Object.keys(kernelParse(seven)), ['secondary'])
   assertEquals(seven.rate_limits.primary, undefined)
+})
+
+Deno.test('codex.rate_limits: model-only windows survive without primary or secondary', () => {
+  const event = codexRateLimits(parseRateLimitEvent({
+    rate_limit_info: {
+      status: 'allowed',
+      unifiedWindows: {
+        seven_day_overage_included: { utilization: 1.07, resetsAt: 1760000000 },
+        seven_day_opus: { utilization: 0.2, resetsAt: 1760000000 },
+        seven_day_sonnet: { utilization: 0.4, resetsAt: 1760000000 },
+      },
+    },
+  }))
+  assertEquals(event, {
+    type: 'codex.rate_limits',
+    rate_limits: {
+      windows: {
+        seven_day_overage_included: { used_percent: 100, window_minutes: 10080, reset_at: 1760000000 },
+        seven_day_opus: { used_percent: 20, window_minutes: 10080, reset_at: 1760000000 },
+        seven_day_sonnet: { used_percent: 40, window_minutes: 10080, reset_at: 1760000000 },
+      },
+    },
+  })
 })
 
 Deno.test('the 429 mapping: a reported reset is usage_limit_reached with a capped Retry-After; none stays rate_limit_exceeded', () => {
@@ -138,8 +170,7 @@ Deno.test('the 429 mapping: a reported reset is usage_limit_reached with a cappe
     status: 'rejected',
     resetsAt: null,
     rateLimitType: 'five_hour',
-    fiveHour: null,
-    sevenDay: null,
+    windows: {},
     ...w,
   })
   const e = rateLimitError("You've hit your session limit", rejected({ resetsAt: 1_760_000_600 }), t)
@@ -283,7 +314,15 @@ Deno.test('websocket: codex.rate_limits on a normal success, in the shape the ke
     const ws = run.tg.websocket()
     run.fake.reply({
       blocks: [text('one')],
-      headers: unified({ status: 'allowed', '5h-utilization': '0.3', '5h-reset': String(r5), '7d-utilization': '0.5', '7d-reset': String(r7) }),
+      headers: unified({
+        status: 'allowed',
+        '5h-utilization': '0.3',
+        '5h-reset': String(r5),
+        '7d-utilization': '0.5',
+        '7d-reset': String(r7),
+        '7d_oi-utilization': '0.8',
+        '7d_oi-reset': String(r7),
+      }),
     })
     const one = await wsCreate(ws, 'one')
     assertEquals(one.at(-1).type, 'response.completed')
@@ -291,16 +330,28 @@ Deno.test('websocket: codex.rate_limits on a normal success, in the shape the ke
     assertEquals(usage.length, 1)
     assertEquals(usage[0], {
       type: 'codex.rate_limits',
-      rate_limits: { primary: { used_percent: 30, window_minutes: 300, reset_at: r5 }, secondary: { used_percent: 50, window_minutes: 10080, reset_at: r7 } },
+      rate_limits: {
+        primary: { used_percent: 30, window_minutes: 300, reset_at: r5 },
+        secondary: { used_percent: 50, window_minutes: 10080, reset_at: r7 },
+        windows: {
+          five_hour: { used_percent: 30, window_minutes: 300, reset_at: r5 },
+          seven_day: { used_percent: 50, window_minutes: 10080, reset_at: r7 },
+          seven_day_overage_included: { used_percent: 80, window_minutes: 10080, reset_at: r7 },
+        },
+      },
     })
     kernelParse(usage[0])
+    assertEquals(run.tg.events('rate_limit').at(-1)?.data.windows.seven_day_overage_included, { utilization: 0.8, resetsAt: r7 })
     // outside the response's sequence
     assertEquals(usage[0].sequence_number, undefined)
 
     // only the weekly window reported: no primary
     run.fake.reply({ blocks: [text('two')], headers: unified({ status: 'allowed', '7d-utilization': '0.6', '7d-reset': String(r7) }) })
     const two = (await wsCreate(ws, 'two')).filter((e) => e.type === 'codex.rate_limits')
-    assertEquals(two.map((e) => e.rate_limits), [{ secondary: { used_percent: 60, window_minutes: 10080, reset_at: r7 } }])
+    assertEquals(two.map((e) => e.rate_limits), [{
+      secondary: { used_percent: 60, window_minutes: 10080, reset_at: r7 },
+      windows: { seven_day: { used_percent: 60, window_minutes: 10080, reset_at: r7 } },
+    }])
 
     // a report without windows (no unified headers) sends nothing: never an invented window
     run.fake.reply({ blocks: [text('three')] })

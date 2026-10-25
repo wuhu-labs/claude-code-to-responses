@@ -250,9 +250,9 @@ sent (opening events are held until the first output, as on HTTP).
 **Usage events.** Whenever Claude Code reports a `rate_limit_event` with usage windows, the socket gets
 `{"type":"codex.rate_limits","rate_limits":{"primary":{"used_percent":30,"window_minutes":300,"reset_at":1760000000},"secondary":{"used_percent":50,"window_minutes":10080,"reset_at":1760300000}}}`,
 the shape Wuhu's kernel parses (`codexSocketUsage`): the 5-hour window is `primary` (300 minutes), the weekly one
-`secondary` (10080). `used_percent` is Claude Code's utilization × 100, capped at 100 (utilization may run past the
+`secondary` (10080). All reported windows also appear under `rate_limits.windows`, keyed by their original Claude names (including `seven_day_overage_included`), in the same `{used_percent, window_minutes, reset_at}` shape. The aliases remain unchanged for older servers. Each report logs the raw window names, utilization and reset numbers only. `used_percent` is Claude Code's utilization × 100, capped at 100 (utilization may run past the
 cap); `reset_at` is the window's reset in epoch seconds. Only windows Claude Code reported are sent, and a report
-without any window sends no event; per-model weekly buckets (`seven_day_overage_included`) have no kernel window.
+without any window sends no event.
 There is no `plan_type`: Claude Code 2.1.284 reports no plan. The event is outside the response's sequence (no
 `sequence_number`) and may come at any time: during a response, before its `error`, or in the idle window after
 `response.completed` (Claude Code reports usage after the model's `message_stop`, and a tool-call response

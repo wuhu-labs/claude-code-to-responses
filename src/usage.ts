@@ -25,8 +25,15 @@ export interface RateLimitInfo {
   status: 'allowed' | 'allowed_warning' | 'rejected'
   resetsAt: number | null
   rateLimitType: string | null
-  fiveHour: UsageWindow | null
-  sevenDay: UsageWindow | null
+  windows: Record<string, UsageWindow>
+}
+
+const WINDOW_MINUTES: Record<string, number> = {
+  five_hour: 300,
+  seven_day: 10080,
+  seven_day_opus: 10080,
+  seven_day_sonnet: 10080,
+  seven_day_overage_included: 10080,
 }
 
 const STATUSES = new Set(['allowed', 'allowed_warning', 'rejected'])
@@ -37,8 +44,7 @@ export class RateLimitShapeError extends Error {}
 
 const isEpoch = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0
 
-function window(w: Json, name: string): UsageWindow | null {
-  if (w === undefined) return null
+function window(w: Json, name: string): UsageWindow {
   if (typeof w !== 'object' || w === null) throw new RateLimitShapeError(`unifiedWindows.${name} is not an object`)
   if (typeof w.utilization !== 'number' || !Number.isFinite(w.utilization) || w.utilization < 0) {
     throw new RateLimitShapeError(`unifiedWindows.${name}.utilization is not a finite non-negative number`)
@@ -61,14 +67,16 @@ export function parseRateLimitEvent(frame: Json): RateLimitInfo {
   }
   const w = info.unifiedWindows
   if (w !== undefined && (typeof w !== 'object' || w === null || Array.isArray(w))) throw new RateLimitShapeError('unifiedWindows is not an object')
-  // seven_day_overage_included (a per-model weekly bucket) is checked but has no kernel window
-  window(w?.seven_day_overage_included, 'seven_day_overage_included')
+  const windows: Record<string, UsageWindow> = {}
+  for (const [name, value] of Object.entries(w ?? {})) {
+    if (!Object.hasOwn(WINDOW_MINUTES, name)) throw new RateLimitShapeError(`unknown window ${JSON.stringify(name)}`)
+    windows[name] = window(value, name)
+  }
   return {
     status: info.status,
     resetsAt: info.resetsAt ?? null,
     rateLimitType: info.rateLimitType ?? null,
-    fiveHour: window(w?.five_hour, 'five_hour'),
-    sevenDay: window(w?.seven_day, 'seven_day'),
+    windows,
   }
 }
 
@@ -79,14 +87,15 @@ function kernelWindow(w: UsageWindow, minutes: number): Json {
 
 /**
  * The `codex.rate_limits` event for one report, or null when Claude Code reported no window. Only reported windows are
- * sent: `five_hour` as `primary`, `seven_day` as `secondary`. Claude Code 2.1.284 reports no plan, so there is no
+ * sent under their Claude names in `windows`, with `five_hour` also as `primary`, `seven_day` as `secondary`. Claude Code reports no plan, so there is no
  * `plan_type`.
  */
 export function codexRateLimits(info: RateLimitInfo): Json | null {
   const rateLimits: Json = {}
-  if (info.fiveHour) rateLimits.primary = kernelWindow(info.fiveHour, PRIMARY_WINDOW_MINUTES)
-  if (info.sevenDay) rateLimits.secondary = kernelWindow(info.sevenDay, SECONDARY_WINDOW_MINUTES)
-  if (!rateLimits.primary && !rateLimits.secondary) return null
+  if (info.windows.five_hour) rateLimits.primary = kernelWindow(info.windows.five_hour, PRIMARY_WINDOW_MINUTES)
+  if (info.windows.seven_day) rateLimits.secondary = kernelWindow(info.windows.seven_day, SECONDARY_WINDOW_MINUTES)
+  if (!Object.keys(info.windows).length) return null
+  rateLimits.windows = Object.fromEntries(Object.entries(info.windows).map(([name, w]) => [name, kernelWindow(w, WINDOW_MINUTES[name])]))
   return { type: 'codex.rate_limits', rate_limits: rateLimits }
 }
 

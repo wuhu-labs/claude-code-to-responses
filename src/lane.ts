@@ -637,7 +637,7 @@ export class Lane implements BridgeTarget {
       return
     }
     this.rateLimit = info
-    this.events.note('rate_limit', { session: this.sessionId, status: info.status, type: info.rateLimitType, resets_at: info.resetsAt })
+    this.events.note('rate_limit', { session: this.sessionId, status: info.status, type: info.rateLimitType, resets_at: info.resetsAt, windows: info.windows })
     const event = codexRateLimits(info)
     if (event) this.quota?.(event)
   }
