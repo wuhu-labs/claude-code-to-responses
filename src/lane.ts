@@ -531,7 +531,7 @@ export class Lane implements BridgeTarget {
     for (const f of w) f()
   }
 
-  // ---- MCP and hooks ---------------------------------------------------------------------------------
+  // ---- MCP ---------------------------------------------------------------------------------
 
   mcpTools(): Json[] {
     return this.chain.tools.map((t) => ({
@@ -603,11 +603,6 @@ export class Lane implements BridgeTarget {
     const ws = this.knownWaiters.get(callId)
     this.knownWaiters.delete(callId)
     for (const w of ws ?? []) w()
-  }
-
-  hook(_body: Json): Json {
-    if (this.dead) throw new StaleEpoch('stale Claude Code process: it was killed')
-    return {}
   }
 
   // ---- Claude Code's stream -------------------------------------------------------------------------

@@ -8,7 +8,7 @@ export interface Config {
   port: number
   /** Bearer token clients must send; required unless the listener is on loopback. Read from an environment variable. */
   authToken?: string
-  /** Loopback port of the MCP and hook endpoint Claude Code calls (0: any free port). */
+  /** Loopback port of the MCP endpoint Claude Code calls (0: any free port). */
   bridgePort: number
   /** Gateway state: the response store, Claude Code's config dir and scratch home. */
   stateDir: string
@@ -90,7 +90,7 @@ Usage: claude-code-to-responses [options]
                              (default /tmp/claude-code-to-responses; keep it the same on every machine)
   --claude <path>            Claude Code ${CLAUDE_CODE_VERSION} binary (required)
   --auth-token-env <VAR>     clients must send 'Authorization: Bearer <$VAR>'; required off loopback
-  --bridge-port <port>       loopback port for Claude Code's MCP and hook calls (default: any free port)
+  --bridge-port <port>       loopback port for Claude Code's MCP calls (default: any free port)
   --tz <zone>                TZ for every Claude Code process (default UTC)
   --idle-timeout <seconds>   kill a process idle at a finished turn after this long (default 1800)
   --hold-timeout <seconds>   kill a process holding tool calls after this long (default 600)

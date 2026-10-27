@@ -254,10 +254,7 @@ scenarioTest('stale calls from a killed process are fenced by its epoch', async 
     })
     assertEquals(late.status, 410)
     assertEquals((await late.json()).error.code, -32001)
-    const hook = await post(`/hook/${epoch}`, { hook_event_name: 'PostToolUse', tool_use_id: 'toolu_f' })
-    assertEquals(hook.status, 410)
-    await hook.body?.cancel()
-    assert(bridge.fenced.filter((f) => f.epoch === epoch).length >= 2)
+    assertEquals(bridge.fenced.filter((f) => f.epoch === epoch).length, 1)
     // the new process gets its own epoch and the output reaches it
     run.fake.reply({ blocks: [text('F done')] })
     const r2 = await run.send([{ type: 'function_call_output', call_id: run.drv.calls(r)[0].call_id, output: 'F' }])

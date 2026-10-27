@@ -105,8 +105,8 @@ reads `~/.claude`.
   | `missing_tool_output`, `unexpected_tool_output` | The outputs don't match the calls the conversation waits on. |
   | `tool_output_too_large` | An output over 500,000 characters (Claude Code would move it to a file). |
   | `image_too_large` | `400`: an image whose base64 payload exceeds 5,242,880 characters (5 MiB encoded, up to 3,932,160 decoded bytes), the gateway’s own per-image input cap, enforced before Claude Code’s image processing. Resize it before sending. |
-  | `unsupported_notice_command` | `400`: a queued notice begins with a command-shaped slash token after trimming whitespace. Claude Code would drop it; send an ordinary user turn instead. No client text is relabeled. |
-| `conversation_busy` | `409`: another response of the conversation is streaming or starting. |
+  | `unsupported_notice_command` | `400`: the final written block of a new queued notice is text whose trimmed value starts with `/`. Claude Code would defer it to a separate turn; send an ordinary user turn instead. No client text is relabeled. |
+  | `conversation_busy` | `409`: another response of the conversation is streaming or starting. |
   | `websocket_response_in_progress` | `409`: a second create arrived before the socket's active response ended. |
   | `response_too_large` | `413`: an outbound message or terminal batch exceeds its byte limit; reports required/allowed bytes, closes `1009`, and is nonretryable without changing input. |
   | `websocket_message_too_large` | `413`: an inbound message exceeds 128 MiB; the socket closes with `1009`. |
@@ -411,7 +411,12 @@ text block beginning with a command-shaped token (`/^\/\w[\w:-]*(?=\s|$)/`), the
 space** to that block only: `/compact` becomes ` /compact`. The text is not dropped or escaped, and all other
 blocks keep their order and bytes. This also prevents native unknown-command context for `/foo`. Leading
 whitespace/newlines, a slash later within text, path-like tokens such as `/tmp/file`, and an image-ending message
-already bypass dispatch and are unchanged. Queued notices whose joined text begins with a command-shaped slash token after trimming whitespace are refused as `400 unsupported_notice_command`: the queue renderer drops them even after the stdin space guard. No label is prepended. Other queued notices use the same stdin boundary and guard. Assistant content and tool
+already bypass dispatch and are unchanged.
+
+For new queued notices, the gateway checks the blocks it actually writes after the ordinary stdin guard.
+If the **last block is text** and its `trim()` starts with `/` (including `/tmp/x` and `/ x`), it refuses with `400 unsupported_notice_command`: Claude Code’s queue check skips it in the current drain and runs it as a separate turn afterwards.
+A slash text followed by an image is allowed. Synthesized history attachments do not drain through that queue and are not refused. No label is prepended.
+Other queued notices use the same stdin boundary and guard. Assistant content and tool
 outputs are not command input and are unchanged. Synthesized user history uses the same boundary; provider
 records keep the actual transformed log bytes, so evictions and lost-store rebuilds do not add another space.
 `--setting-sources ""` separately prevents user/project commands and skills from loading.

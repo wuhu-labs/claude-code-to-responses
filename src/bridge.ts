@@ -1,4 +1,4 @@
-// The loopback MCP server and hook endpoint every Claude Code process talks to. Each process gets its own epoch:
+// The loopback MCP server every Claude Code process talks to. Each process gets its own epoch:
 // a random path segment that dies with the process, so a call from a killed process can never reach its successor.
 import { newId } from './api/stream.ts'
 
@@ -19,8 +19,6 @@ export interface BridgeTarget {
   mcpTools(): Json[]
   /** Resolves with the MCP tools/call result once the client's output arrives. Throws StaleEpoch or McpCallError. */
   toolCall(callId: string, name: string, args: Json, signal: AbortSignal): Promise<Json>
-  /** Throws StaleEpoch when the process is gone. */
-  hook(body: Json): Json
 }
 
 export class Bridge {
@@ -42,10 +40,6 @@ export class Bridge {
     return `${this.url}/mcp/${epoch}`
   }
 
-  hookUrl(epoch: string): string {
-    return `${this.url}/hook/${epoch}`
-  }
-
   register(epoch: string, t: BridgeTarget): void {
     this.targets.set(epoch, t)
   }
@@ -60,13 +54,12 @@ export class Bridge {
 
   private stale(epoch: string, kind: string, id: Json): Response {
     this.fenced.push({ epoch, kind, at: Date.now() })
-    if (kind === 'hook') return Response.json({}, { status: 410 })
     return Response.json({ jsonrpc: '2.0', id: id ?? null, error: { code: -32001, message: 'stale Claude Code process: this epoch is gone' } }, { status: 410 })
   }
 
   private async handle(req: Request): Promise<Response> {
     if (req.headers.get('authorization') !== `Bearer ${this.bearer}`) return new Response(null, { status: 401 })
-    const m = /^\/(mcp|hook)\/([A-Za-z0-9_]+)$/.exec(new URL(req.url).pathname)
+    const m = /^\/(mcp)\/([A-Za-z0-9_]+)$/.exec(new URL(req.url).pathname)
     if (!m) return new Response(null, { status: 404 })
     const [, kind, epoch] = m
     if (req.method !== 'POST') return new Response(null, { status: 405 })
@@ -79,14 +72,6 @@ export class Bridge {
     // looked up only once the body is in: a process killed while its request was still uploading is fenced
     const target = this.targets.get(epoch)
     if (!target) return this.stale(epoch, kind, body?.id)
-    if (kind === 'hook') {
-      try {
-        return Response.json(target.hook(body))
-      } catch (e) {
-        if (e instanceof StaleEpoch) return this.stale(epoch, kind, null)
-        throw e
-      }
-    }
     if (body?.id === undefined || body?.id === null) return new Response(null, { status: 202 })
     const reply = (result: Json) => Response.json({ jsonrpc: '2.0', id: body.id, result })
     const fail = (code: number, message: string) => Response.json({ jsonrpc: '2.0', id: body.id, error: { code, message } })

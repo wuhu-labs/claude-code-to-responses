@@ -14,6 +14,7 @@ import {
   queuedNoticeEntry,
   toolResultEntry,
   unknownToolEntry,
+  userContentBlocks,
   userContentEntry,
   userMessageEntry,
 } from './claude/entries.ts'
@@ -716,22 +717,23 @@ function deliveryFor(head: Head | null, input: InItem[], isNew = true): Delivery
   let notice: Notice | null = null
   if (notices.length) {
     const parts = notices.flat()
-    // 2.1.284's queued-command renderer trims leading whitespace and drops slash commands.
-    // The ordinary stdin space guard cannot prevent that loss. Reject, never relabel client input.
-    const text = parts.filter((p): p is Extract<Part, { type: 'text' }> => p.type === 'text').map((p) => p.text).join('\n').trimStart()
-    if (/^\/\w[\w:-]*(?=\s|$)/.test(text)) {
-      throw invalid(
-        'input',
-        'Claude Code drops slash-leading queued notices after trimming whitespace; send this as a new user turn instead.',
-        'unsupported_notice_command',
-      )
-    }
     if (parts.some((p) => p.type === 'image')) notice = { parts }
     else {
       // Preserve text-only message concatenation bytes, including separators between messages.
       const text = notices.map((ps) => ps.map((p) => (p as { text: string }).text).join('\n')).join('\n\n')
       notice = { parts: [{ type: 'text', text }] }
     }
+  }
+  // G$ on 2.1.284 checks the LAST block after trim(), not the renderer or the first text.
+  // Such queued inputs are skipped in the current drain and run as their own turn afterwards.
+  // Synthesized history uses attachments directly and never goes through that live drain.
+  const last = notice ? userContentBlocks(notice.parts).at(-1) : undefined
+  if (isNew && last?.type === 'text' && last.text.trim().startsWith('/')) {
+    throw invalid(
+      'input',
+      'Claude Code defers queued notices whose last text block trims to a slash-leading string into a separate turn; send an ordinary user turn instead.',
+      'unsupported_notice_command',
+    )
   }
   return { kind: 'outputs', outputs, notices: notice }
 }

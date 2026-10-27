@@ -1,6 +1,7 @@
 // The queue path paired with the old hook path on the pinned binary, never a paid endpoint.
 import { assert, assertEquals, assertStringIncludes } from '@std/assert'
-import { contextOf, queuedNoticeEntry, userContentEntry } from '../src/claude/entries.ts'
+import { contextOf, queuedNoticeEntry, userContentBlocks, userContentEntry } from '../src/claude/entries.ts'
+import { settingsJson } from '../src/claude/pins.ts'
 import { call, FakeAnthropic, type Json, text } from '../test/fake.ts'
 import { IMAGE_BLOCK } from '../test/images.ts'
 import { assertPrefix, freePort } from '../test/harness.ts'
@@ -80,40 +81,58 @@ for (const image of [false, true]) {
 
 Deno.test('queue paired control: a 40 KB hook notice is persisted/truncated, never delivered whole', async () => {
   const p = new Probe(), fake = new FakeAnthropic(freePort())
+  const notice = 'HOOK-BEGIN' + 'x'.repeat(40000) + 'HOOK-END'
+  // Deliberately test-only: production and every other probe use settingsJson() with no hooks.
+  const hook = Deno.serve({ hostname: '127.0.0.1', port: 0, onListen() {} }, () =>
+    Response.json({
+      hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: notice },
+    }))
   try {
     const target = new ProbeTarget(['echo'])
-    target.postToolNotice = 'HOOK-BEGIN' + 'x'.repeat(40000) + 'HOOK-END'
-    const r = p.launch({ name: 'hook-cap', fake, target })
+    const settings = { ...settingsJson(), hooks: { PostToolUse: [{ hooks: [{ type: 'http', url: `http://127.0.0.1:${hook.addr.port}`, timeout: 600 }] }] } }
+    const r = p.launch({ name: 'hook-cap', fake, target, settings })
     fake.reply({ blocks: [call('toolu_hook', 'echo', {})] }, { blocks: [text('done')] })
     await r.turn('go')
     const body = JSON.stringify(fake.main()[1].body.messages)
     assertStringIncludes(body, '<persisted-output>')
-    assert(!body.includes(target.postToolNotice ?? 'x'.repeat(40000)))
+    assert(!body.includes('x'.repeat(40000)))
   } finally {
     await p.close()
     await fake.close()
+    await hook.shutdown()
   }
 })
 
-Deno.test('queue paired slash boundary: one-space guard works for turns but a mid-turn slash notice disappears', async () => {
-  const p = new Probe(), fake = new FakeAnthropic(freePort())
-  try {
-    const target = new ProbeTarget(['hold'])
-    const r = p.launch({ name: 'queue-slash', fake, target })
-    fake.reply({ blocks: [call('toolu_slash', 'hold', {})] }, { blocks: [text('done')] }, { blocks: [text('turn')] })
-    await r.user('go')
-    await r.until((f) => f.type === 'stream_event' && f.event?.type === 'message_stop')
-    const from = r.frames.length
-    await r.user(' /compact')
-    await r.until((f) => f.type === 'transcript_mirror' && f.entries.some((e: Json) => e.type === 'queue-operation' && e.operation === 'enqueue'), 5000, from)
-    while (!target.held.has('toolu_slash')) await new Promise((resolve) => setTimeout(resolve, 1))
-    target.release('toolu_slash', 'RESULT')
-    await r.until((f) => f.type === 'result')
-    assert(!JSON.stringify(fake.main()[1].body.messages).includes('/compact'))
-    await r.turn(' /compact')
-    assertStringIncludes(JSON.stringify(fake.main()[2].body.messages), ' /compact')
-  } finally {
-    await p.close()
-    await fake.close()
-  }
-})
+for (
+  const [name, parts, deferred] of [
+    ['path', [{ type: 'text' as const, text: '/tmp/x' }], true],
+    ['space', [{ type: 'text' as const, text: '/ x' }], true],
+    ['image-text', [{ type: 'image' as const, mediaType: 'image/png', data: IMAGE_BLOCK.source.data }, { type: 'text' as const, text: '/tmp/x' }], true],
+    ['text-image', [{ type: 'text' as const, text: '/compact' }, { type: 'image' as const, mediaType: 'image/png', data: IMAGE_BLOCK.source.data }], false],
+  ] as const
+) {
+  Deno.test(`queue slash check: ${name} is ${deferred ? 'deferred into its own turn' : 'delivered beside the tool result'}`, async () => {
+    const p = new Probe(), fake = new FakeAnthropic(freePort())
+    try {
+      const target = new ProbeTarget(['hold'])
+      const r = p.launch({ name: `queue-slash-${name}`, fake, target })
+      fake.reply({ blocks: [call('toolu_slash', 'hold', {})] }, { blocks: [text('tool-step')] }, { blocks: [text('notice-turn')] })
+      await r.user('go')
+      await r.until((f) => f.type === 'stream_event' && f.event?.type === 'message_stop')
+      const from = r.frames.length
+      const content = userContentBlocks([...parts])
+      await r.userContent(content)
+      await r.until((f) => f.type === 'transcript_mirror' && f.entries.some((e: Json) => e.type === 'queue-operation' && e.operation === 'enqueue'), 5000, from)
+      while (!target.held.has('toolu_slash')) await new Promise((resolve) => setTimeout(resolve, 1))
+      target.release('toolu_slash', 'RESULT')
+      await r.until((f) => f.type === 'result' && f.result === (deferred ? 'notice-turn' : 'tool-step'))
+      const needle = parts.find((part) => part.type === 'text')!.text
+      assertEquals(JSON.stringify(fake.main()[1].body.messages).includes(needle), !deferred)
+      assertEquals(fake.main().length, deferred ? 3 : 2)
+      if (deferred) assertStringIncludes(JSON.stringify(fake.main()[2].body.messages), needle)
+    } finally {
+      await p.close()
+      await fake.close()
+    }
+  })
+}

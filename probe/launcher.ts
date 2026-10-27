@@ -1,23 +1,13 @@
 // Launches Claude Code exactly as the gateway does (src/claude/pins.ts), with one pin changed at a time,
-// against the fake endpoint and a scriptable MCP/hook target. Used by the per-release probe.
+// against the fake endpoint and a scriptable MCP target. Used by the per-release probe.
 import { Bridge, type BridgeTarget } from '../src/bridge.ts'
 import { launchArgs, launchEnv, type LaunchSpec, logPath, MAX_RESULT_CHARS, mcpConfigJson, settingsJson } from '../src/claude/pins.ts'
 import type { FakeAnthropic, Json } from '../test/fake.ts'
 import { CLAUDE, freePort } from '../test/harness.ts'
 
-export interface ProbeTools {
-  tools: Json[]
-  call(id: string, name: string, args: Json): Promise<Json>
-  hook(body: Json): Json
-}
-
 export class ProbeTarget implements BridgeTarget {
-  hooks: Json[] = []
   calls: { id: string; name: string; args: Json; at: number }[] = []
   held = new Map<string, (r: Json) => void>()
-  /** Text returned for each PostToolUse / Stop hook, once. */
-  postToolNotice: string | null = null
-  stopNotice: string | null = null
   resultFor: (name: string, args: Json) => Json | null = (_n, a) => ({ content: [{ type: 'text', text: `ECHO ${JSON.stringify(a)}` }] })
   withMeta = true
   constructor(readonly toolNames: string[] = ['echo', 'hold']) {}
@@ -40,25 +30,12 @@ export class ProbeTarget implements BridgeTarget {
     this.held.delete(id)
     r?.({ content: [{ type: 'text', text }] })
   }
-  hook(body: Json): Json {
-    this.hooks.push(body)
-    const ev = body.hook_event_name
-    if ((ev === 'PostToolUse' || ev === 'PostToolUseFailure') && this.postToolNotice) {
-      const t = this.postToolNotice
-      this.postToolNotice = null
-      return { hookSpecificOutput: { hookEventName: ev, additionalContext: t } }
-    }
-    if (ev === 'Stop' && this.stopNotice && !body.stop_hook_active) {
-      const t = this.stopNotice
-      this.stopNotice = null
-      return { hookSpecificOutput: { hookEventName: 'Stop', additionalContext: t } }
-    }
-    return {}
-  }
 }
 
 export interface ProbeOpts {
   name: string
+  /** Only the paired hook-cap control overrides production settings. */
+  settings?: Json
   fake: FakeAnthropic
   target: ProbeTarget
   sessionId?: string
@@ -92,7 +69,7 @@ export class ProbeRun {
     const configDir = `${root}/config`, homeDir = `${root}/home`
     for (const d of [configDir, homeDir]) Deno.mkdirSync(d, { recursive: true })
     const settingsPath = `${root}/${o.name}.settings.json`, mcpConfigPath = `${root}/${o.name}.mcp.json`
-    Deno.writeTextFileSync(settingsPath, JSON.stringify(settingsJson(bridge.hookUrl(epoch), bridge.bearer)))
+    Deno.writeTextFileSync(settingsPath, JSON.stringify(o.settings ?? settingsJson()))
     Deno.writeTextFileSync(mcpConfigPath, JSON.stringify(mcpConfigJson(bridge.mcpUrl(epoch), bridge.bearer)))
     Deno.writeTextFileSync(`${root}/${o.name}.system-prompt.txt`, o.systemPrompt ?? 'You are a probe.')
     this.spec = {

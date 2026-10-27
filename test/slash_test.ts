@@ -86,10 +86,7 @@ Deno.test('slash-leading notices are typed invalid input before release, includi
     for (const evicted of [false, true]) {
       if (evicted) await run.disrupt('hold')
       for (
-        const content of ['/compact', ' /cost', '\n/context', '/foo', [IMAGE, { type: 'input_text', text: '/cost' }], [
-          { type: 'input_text', text: '/compact' },
-          IMAGE,
-        ]]
+        const content of ['/compact', ' /cost', '\n/context', '/foo', '/tmp/x', '/ x', [IMAGE, { type: 'input_text', text: '/tmp/x' }]]
       ) {
         const response = await fetch(`${run.tg.url}/v1/responses`, {
           method: 'POST',
@@ -109,7 +106,7 @@ Deno.test('slash-leading notices are typed invalid input before release, includi
       }
     }
     run.fake.reply({ blocks: [text('notice received')] })
-    const accepted = await run.send([output('toolu_slash', 'RESULT'), user('<sender>user</sender> /compact')])
+    const accepted = await run.send([output('toolu_slash', 'RESULT'), { role: 'user', content: [{ type: 'input_text', text: '/compact' }, IMAGE] }])
     assertEquals(accepted.status, 'completed')
   })
 })
@@ -123,7 +120,9 @@ Deno.test('recordless slash-leading history synthesizes the same user boundary, 
       { role: 'assistant', content: '/cost' },
       { type: 'function_call', call_id: 'toolu_synthslash', name: 'echo', arguments: '{"text":"x"}' },
       output('toolu_synthslash', '/context'),
-      user('<sender>user</sender> /foo'),
+      user('/foo'),
+      { role: 'assistant', content: 'historical answer' },
+      user('continue'),
     ])
     assertEquals(r.status, 'completed')
     assertEquals(run.drv.text(r), 'model answer')
@@ -131,7 +130,7 @@ Deno.test('recordless slash-leading history synthesizes the same user boundary, 
     const before = run.fake.main()[0]
     const blocks = (role: string) => before.body.messages.filter((m: Json) => m.role === role).flatMap((m: Json) => m.content)
     assert(blocks('user').some((b: Json) => b.type === 'text' && b.text === ' /compact'))
-    assert(JSON.stringify(before.body.messages).includes('<sender>user</sender> /foo'))
+    assert(JSON.stringify(before.body.messages).includes('/foo'))
     assert(blocks('assistant').some((b: Json) => b.type === 'text' && b.text === '/cost'))
     assertEquals(blocks('user').find((b: Json) => b.type === 'tool_result').content[0].text, '/context')
     await run.disrupt('restart-lost-store')

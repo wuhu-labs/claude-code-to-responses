@@ -34,10 +34,9 @@ Deno.test(`version: the binary is Claude Code ${CLAUDE_CODE_VERSION}`, async () 
 })
 
 probe(
-  'headless stream-json, --include-partial-messages, --session-mirror, --system-prompt, --model, --effort, backend env, hooks, toolUseId',
+  'headless stream-json, --include-partial-messages, --session-mirror, --system-prompt, --model, --effort, backend env, toolUseId',
   async (p, fake) => {
     const t = new ProbeTarget(['echo'])
-    t.postToolNotice = 'NOTICE-POST'
     const r = p.launch({ name: 'basic', fake, target: t })
     fake.reply({ blocks: [think('a'), call('toolu_b1', 'echo', { text: 'x' })] }, { blocks: [text('done')] })
     const res = await r.turn('hello')
@@ -51,7 +50,7 @@ probe(
     assertEquals(mirrored, r.log())
     // CLAUDE_CONFIG_DIR + --session-id: the log lives in the isolated config dir under the session id
     assert(r.logFile.startsWith(r.spec.configDir) && r.logFile.endsWith(`${r.spec.sessionId}.jsonl`))
-    const [first, second] = fake.main()
+    const [first] = fake.main()
     assertEquals(first.body.system[1].text, AGENT_SDK_LINE)
     assertEquals(first.body.system[2].text, 'You are a probe.')
     assertEquals(first.body.model, 'claude-opus-5-5')
@@ -59,12 +58,7 @@ probe(
     assertEquals(first.headers['authorization'], 'Bearer probe-key')
     // only the conversation's own requests reach the backend (plus Claude Code's /api/hello)
     assertEquals(fake.exchanges.filter((e) => e.kind !== 'main').map((e) => e.path), ['/api/hello'])
-    // MCP calls carry Claude Code's tool_use id; the PostToolUse hook names it and renders its context as a system message
     assertEquals(t.calls.map((c) => c.id), ['toolu_b1'])
-    const post = t.hooks.find((h) => h.hook_event_name === 'PostToolUse')
-    assertEquals(post.tool_use_id, 'toolu_b1')
-    assertEquals(second.body.messages.at(-1).role, 'system')
-    assertEquals(second.body.messages.at(-1).content[0].text, 'PostToolUse:mcp__fn__echo hook additional context: NOTICE-POST')
   },
 )
 
@@ -85,17 +79,6 @@ probe('--system-prompt-file: the prompt reaches the model byte for byte, as --sy
   const [f, g] = fake.main()
   assertEquals(f.body.system[2].text, prompt)
   assertEquals(JSON.stringify(f.body.system), JSON.stringify(g.body.system))
-})
-
-probe('Stop hook additionalContext continues inference in the same turn', async (p, fake) => {
-  const t = new ProbeTarget(['echo'])
-  t.stopNotice = 'NOTICE-STOP'
-  const r = p.launch({ name: 'stop', fake, target: t })
-  fake.reply({ blocks: [text('first')] }, { blocks: [text('second')] })
-  const res = await r.turn('go')
-  assertEquals(res.result, 'second')
-  assertEquals(fake.main().length, 2)
-  assertStringIncludes(JSON.stringify(fake.main()[1].body.messages.at(-1)), 'Stop hook additional context: NOTICE-STOP')
 })
 
 probe('--tools "": no native tools, no Skill tool (paired with --tools default)', async (p, fake) => {
@@ -643,18 +626,7 @@ probe('slash dispatch uses the last block, including text after images, not conc
   }
 })
 
-probe('slash notices: PostToolUse context never dispatches; appended text dispatches, image-ending entries do not', async (p, fake) => {
-  const hook = new ProbeTarget(['echo'])
-  const live = p.launch({ name: 'slash-hook', fake, target: hook })
-  for (const command of SLASH_COMMANDS) {
-    hook.postToolNotice = command
-    fake.reply({ blocks: [call(`toolu_slash${fake.main().length}`, 'echo', {})] })
-    const n = fake.exchanges.length
-    await live.turn('tool')
-    assertEquals(fake.exchanges.slice(n).filter((e) => e.kind === 'main').length, 2)
-    assertEquals(fake.main().at(-1)!.body.messages.at(-1).content[0].text, `PostToolUse:mcp__fn__echo hook additional context: ${command}`)
-  }
-  await live.kill()
+probe('slash resume: appended text dispatches, image-ending entries do not', async (p, fake) => {
   const t = new ProbeTarget(['hold'])
   fake.reply({ blocks: [call('toolu_slashhold', 'hold', {})] })
   const a = p.launch({ name: 'slash-resume-seed', fake, target: t })

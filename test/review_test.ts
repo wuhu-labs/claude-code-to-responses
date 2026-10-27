@@ -58,40 +58,33 @@ Deno.test('an MCP call whose body finishes after its process was killed is fence
       dispatched++
       return Promise.resolve({ content: [] })
     },
-    hook: () => {
-      dispatched++
-      return {}
-    },
   })
   const enc = new TextEncoder()
-  for (const kind of ['mcp', 'hook']) {
-    let push!: (s: string | null) => void
-    const body = new ReadableStream<Uint8Array>({
-      start(c) {
-        push = (s) => (s === null ? c.close() : c.enqueue(enc.encode(s)))
-      },
-    })
-    const res = fetch(
-      `${bridge.url}/${kind}/ep_race`,
-      { method: 'POST', headers: { authorization: `Bearer ${bridge.bearer}` }, body, duplex: 'half' } as RequestInit,
-    )
-    push('{"jsonrpc":"2.0","id":1,')
-    await new Promise((r) => setTimeout(r, 200))
-    if (kind === 'hook') bridge.unregister('ep_race')
-    else bridge.unregister('ep_race')
-    push('"method":"tools/call","params":{"name":"echo","_meta":{"claudecode/toolUseId":"toolu_x"}},"hook_event_name":"Stop"}')
-    push(null)
-    const r = await res
-    assertEquals(r.status, 410)
-    await r.body?.cancel()
-    bridge.register('ep_race', { mcpTools: () => [], toolCall: () => Promise.resolve({}), hook: () => ({}) })
-    bridge.unregister('ep_race')
-  }
+  let push!: (s: string | null) => void
+  const body = new ReadableStream<Uint8Array>({
+    start(c) {
+      push = (s) => (s === null ? c.close() : c.enqueue(enc.encode(s)))
+    },
+  })
+  const res = fetch(
+    `${bridge.url}/mcp/ep_race`,
+    { method: 'POST', headers: { authorization: `Bearer ${bridge.bearer}` }, body, duplex: 'half' } as RequestInit,
+  )
+  push('{"jsonrpc":"2.0","id":1,')
+  await new Promise((r) => setTimeout(r, 200))
+  bridge.unregister('ep_race')
+  push('"method":"tools/call","params":{"name":"echo","_meta":{"claudecode/toolUseId":"toolu_x"}}}')
+  push(null)
+  const r = await res
+  assertEquals(r.status, 410)
+  await r.body?.cancel()
+  bridge.register('ep_race', { mcpTools: () => [], toolCall: () => Promise.resolve({}) })
+  bridge.unregister('ep_race')
   assertEquals(dispatched, 0)
   await bridge.close()
 })
 
-Deno.test('a killed lane answers late MCP calls and hooks as stale, without touching its results', async () => {
+Deno.test('a killed lane answers late MCP calls as stale, without touching its results', async () => {
   const run = new Run('dead-lane', false)
   await run.run(async () => {
     run.fake.reply({ blocks: [call('toolu_d1', 'echo', { text: 'a' }), call('toolu_d2', 'echo', { text: 'b' })] })
@@ -103,7 +96,6 @@ Deno.test('a killed lane answers late MCP calls and hooks as stale, without touc
     const late = lane.toolCall('toolu_d2', 'echo', {}, new AbortController().signal)
     const timeout = new Promise((_, no) => setTimeout(() => no(new Error('a late call was held by a dead lane')), 1000))
     await assertRejects(() => Promise.race([late, timeout]), StaleEpoch)
-    assertThrows(() => lane.hook({ hook_event_name: 'PostToolUse', tool_use_id: 'toolu_d1' }), StaleEpoch)
   })
 })
 
