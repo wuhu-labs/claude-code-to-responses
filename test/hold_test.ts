@@ -1,3 +1,4 @@
+import { queueWrapper } from './queue.ts'
 import { replayLog } from '../src/replay.ts'
 import { scenarioTest } from './scenario.ts'
 // Eviction during a held call: the interrupted-turn resume with the gateway-written user text.
@@ -49,13 +50,14 @@ for (const withNotice of [true, false]) {
       assertPrefix(beforeHold, { ...afterHold, body: { ...afterHold.body, messages: afterHold.body.messages.slice(0, beforeHold.body.messages.length) } })
       // then exactly the tool results and the gateway's user text: nothing Claude Code made up
       const tail = tailFrom(afterHold.body, 'toolu_h1')
-      assertEquals(tail.length, 2, JSON.stringify(tail))
+      assertEquals(tail.length, withNotice ? 3 : 2, JSON.stringify(tail))
       const results = tail[1]
       assertEquals(results.role, 'user')
       const blocks = results.content
-      assertEquals(blocks.map((b: Json) => b.type), ['tool_result', 'tool_result', 'text'])
+      assertEquals(blocks.map((b: Json) => b.type), withNotice ? ['tool_result', 'tool_result'] : ['tool_result', 'tool_result', 'text'])
       assertEquals(blocks.slice(0, 2).map((b: Json) => [b.tool_use_id, b.content[0].text]), [['toolu_h1', 'ECHO slow'], ['toolu_h2', 'BIG CONTENT']])
-      assertEquals(blocks[2].text, withNotice ? 'NOTICE during the hold' : RESUME_LINE)
+      if (withNotice) assertEquals(tail[2].content[0].text, queueWrapper('NOTICE during the hold'))
+      else assertEquals(blocks[2].text, RESUME_LINE)
       assert(!JSON.stringify(afterHold.body).includes('No response requested'))
       if (withNotice) assert(!JSON.stringify(afterHold.body).includes(RESUME_LINE))
       // the resume text is in that response's provider record, so every later rebuild repeats it byte for byte

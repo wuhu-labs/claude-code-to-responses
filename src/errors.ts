@@ -41,6 +41,7 @@ export const ERROR_CODES = [
   'unexpected_control_request',
   'turn_ended_without_message',
   'notice_undelivered',
+  'unsupported_notice_command',
   'record_incomplete',
   'claude_code_exited',
   'claude_code_killed',

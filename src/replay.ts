@@ -84,11 +84,24 @@ export class ReplayIndex {
       }
       return result
     }
+    // Queued text includes Claude Code's rendered wrapper, which a lost-store rebuild cannot
+    // regenerate from an input-part reference. Keep that framing verbatim; images still use sidecars.
+    const queuedImages = (value: Json): Json => {
+      if (Array.isArray(value)) return value.map(queuedImages)
+      if (!value || typeof value !== 'object') return value
+      if (value.type === 'image' && value.source?.type === 'base64') return replace(value)
+      return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, queuedImages(child)]))
+    }
     lines.forEach((line, at) => {
       const entry = JSON.parse(line)
-      if (entry.type !== 'user' && !generated.has(line)) {
+      const queued = entry.type === 'attachment' && entry.attachment?.type === 'queued_command'
+      if (entry.type !== 'user' && !queued && !generated.has(line)) {
         entries.push(line)
         return
+      }
+      if (queued) {
+        entry.attachment.prompt = queuedImages(entry.attachment.prompt)
+        if (entry.rendered !== undefined) entry.rendered = queuedImages(entry.rendered)
       }
       const before = imageAt
       if (entry.message?.content !== undefined) entry.message.content = replace(entry.message.content)

@@ -24,7 +24,7 @@ CLAUDE_CODE_OAUTH_TOKEN=… deno run -A src/main.ts \
 | `--work-dir` | `/tmp/claude-code-to-responses` | The one working folder of every session. Keep it the same absolute path on every machine; it must be outside any git repository (checked at startup). Claude Code reports its real path (`/private/tmp/…` on macOS). |
 | `--device-id` | generated once into `<state-dir>/device-id` | The Claude Code device id every session sends in `metadata.user_id` (also `CLAUDE_CODE_TO_RESPONSES_DEVICE_ID`). 64 lowercase hex digits, or a startup error. Give the same id to every gateway that should share a backend cache. |
 | `--claude` | required | The Claude Code 2.1.284 binary. |
-| `--bridge-port` | any free port | Loopback port Claude Code calls for MCP tools and hooks. |
+| `--bridge-port` | any free port | Loopback port Claude Code calls for MCP tools. |
 | `--tz` | `UTC` | `TZ` of every Claude Code process. |
 | `--idle-timeout` | 1800 s | Kill a process that sits at a finished turn this long. |
 | `--hold-timeout` | 600 s | Kill a process whose held tool calls wait this long. |
@@ -105,7 +105,8 @@ reads `~/.claude`.
   | `missing_tool_output`, `unexpected_tool_output` | The outputs don't match the calls the conversation waits on. |
   | `tool_output_too_large` | An output over 500,000 characters (Claude Code would move it to a file). |
   | `image_too_large` | `400`: an image whose base64 payload exceeds 5,242,880 characters (5 MiB encoded, up to 3,932,160 decoded bytes), the gateway’s own per-image input cap, enforced before Claude Code’s image processing. Resize it before sending. |
-  | `conversation_busy` | `409`: another response of the conversation is streaming or starting. |
+  | `unsupported_notice_command` | `400`: a queued notice begins with a command-shaped slash token after trimming whitespace. Claude Code would drop it; send an ordinary user turn instead. No client text is relabeled. |
+| `conversation_busy` | `409`: another response of the conversation is streaming or starting. |
   | `websocket_response_in_progress` | `409`: a second create arrived before the socket's active response ended. |
   | `response_too_large` | `413`: an outbound message or terminal batch exceeds its byte limit; reports required/allowed bytes, closes `1009`, and is nonretryable without changing input. |
   | `websocket_message_too_large` | `413`: an inbound message exceeds 128 MiB; the socket closes with `1009`. |
@@ -120,7 +121,7 @@ reads `~/.claude`.
   | `unexpected_rate_limit_event` | Claude Code reported its usage in a shape 2.1.284 does not produce; the response fails rather than guess what a later 429 means. |
   | `upstream_stream_cut` | The model stream broke mid-message; streamed output cannot be withdrawn. |
   | `malformed_model_message`, `unexpected_block` | The model stopped for tool use without a tool call, sent a malformed tool-use id/name or non-object arguments, or sent a block type the subset doesn't carry. |
-  | `turn_ended_without_message`, `notice_undelivered`, `record_incomplete` | Claude Code ended a turn without a model message, called tools again before staged notices could go in, or did not log what it streamed. |
+  | `turn_ended_without_message`, `notice_undelivered`, `record_incomplete` | Claude Code ended a turn without a model message, did not acknowledge a queued notice within 5 seconds (or a second unacknowledged write was attempted), or did not log what it streamed. |
   | `unexpected_control_request` | Claude Code asked the host something (a permission prompt) it should never need. |
   | `claude_code_exited`, `claude_code_killed`, `claude_code_stdin`, `claude_code_error` | The process exited, was killed, could not be written to, or ended the turn with an error of its own. |
   | `internal_error` | A bug in the gateway; the process is killed and the next request rebuilds. |
@@ -366,20 +367,42 @@ call is held, keyed by its `claudecode/toolUseId`. The response ends at the mode
 `function_call` in it, never at the first MCP call. The next request's `function_call_output` items release the held
 calls by id, in whatever order Claude Code makes them.
 
-**Notices.** `message` items sent alongside outputs are notices. A blank text-only one (empty or whitespace) is
-treated as absent; an image-only notice is not blank. Text-only notices are staged before any result is released
-and go in through the PostToolUse hook of the response's last call. If that hook never runs, they go in at the end-of-turn Stop hook, and the inference that follows is part of the
-same response. With no held calls, new `message` items go in through stdin as one user turn.
+**Notices.** `message` items sent alongside outputs are notices. Blank text-only messages are absent;
+image-only messages are not blank. Before publishing **any** tool result, the gateway writes one user message
+to Claude Code's stdin and waits for its mirrored `queue-operation` / `enqueue` entry. Only then are all held
+calls released. A call racing with the write still waits. Claude Code drains this queue beside the tool results
+in the very next model step, without a hook's 10,000-character cap. There is no hook fallback and no image eviction.
+With no held calls, new messages go through stdin as an ordinary user turn.
 
-A notice containing images cannot go through a text-only hook. After validating the complete request, the gateway
-deliberately evicts the live process and uses the held-call resume path instead: append all tool results in call
-order, then **one user log entry containing the notices’ text and real image blocks in input order**, and resume
-with `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1`. Nothing is released to the old process first. That appended entry
-lands in this response’s provider record, so idle evictions and lost-store history rebuilds replay it verbatim.
-An already-evicted hold uses the same path. This costs a process restart only for image notices; text-only delivery
-is unchanged. Images must be valid base64 data URLs with media type `image/png`, `image/jpeg`, `image/gif` or
-`image/webp`, within the per-image limit below. Unsupported formats/URLs are `400 unsupported`, oversized payloads
-are `400 image_too_large`, and malformed base64 is `400 invalid_request`, all before eviction or tool-output release.
+Queue-operation entries on 2.1.284 carry neither content nor an id. Correlation is the first mirrored enqueue
+after the write: the lane is the sole stdin writer, permits only one unacknowledged queue write, and earlier turn
+enqueues precede the assistant mirror that completed the held head. No ack within 5 seconds fails with typed
+`notice_undelivered` and kills the lane; a failed write is `claude_code_stdin`. Neither publishes tool results.
+
+Text-only messages preserve the existing concatenation (parts separated by `\n`, messages by `\n\n`).
+The model sees a system text block with these exact bytes (`NOTICE` stands for the notice, no added trailing newline):
+
+```text
+The user sent a new message while you were working:
+NOTICE
+
+This is how Claude Code surfaces messages the user sends mid-turn — within the running turn, often alongside the next tool result, rather than as a separate conversation turn. Address the message above as you continue this turn.
+```
+
+Image notices preserve real image blocks in input order. The text wrapper additionally has
+`<system-reminder>\n` before and `\n</system-reminder>` after it, and remains in the user message beside the
+tool results and images rather than being hoisted to a system message. The binary probe pins both forms.
+Supported image formats are PNG, JPEG, GIF and WebP base64 data URLs within the input cap below; bad requests
+are rejected before any release or restart.
+
+**Notice resume/cache bytes.** Existing records always replay their original log bytes, including queued-command
+attachments and their renderings; later steps, evictions and lost-store rebuilds do not rewrite model-visible history.
+For a newly arriving notice on an evicted hold, the gateway appends tool results, the same `queued_command`
+attachment that the live queue logs, and an empty `userContentEntry` anchor. The anchor renders zero blocks but
+prevents interrupted-turn resume from inserting its own “Continue from where you left off.” into the preceding
+tool-result message. `probe/queue_probe_test.ts` compares live, later-step and interrupted-resume prefixes byte for
+byte for 40 KB text and image notices. A hold resumed **without** notices retains the existing fixed resume line.
+No queue environment knob is needed; `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1` still enables interrupted resumes.
 
 **Slash-command safety.** Client text is model input, never a Claude Code command; `/compact` is client-owned.
 Claude Code 2.1.284 dispatches a slash command from the **last content block** of stdin user input or the last
@@ -388,7 +411,7 @@ text block beginning with a command-shaped token (`/^\/\w[\w:-]*(?=\s|$)/`), the
 space** to that block only: `/compact` becomes ` /compact`. The text is not dropped or escaped, and all other
 blocks keep their order and bytes. This also prevents native unknown-command context for `/foo`. Leading
 whitespace/newlines, a slash later within text, path-like tokens such as `/tmp/file`, and an image-ending message
-already bypass dispatch and are unchanged. Text-only PostToolUse/Stop hook notices, assistant content and tool
+already bypass dispatch and are unchanged. Queued notices whose joined text begins with a command-shaped slash token after trimming whitespace are refused as `400 unsupported_notice_command`: the queue renderer drops them even after the stdin space guard. No label is prepended. Other queued notices use the same stdin boundary and guard. Assistant content and tool
 outputs are not command input and are unchanged. Synthesized user history uses the same boundary; provider
 records keep the actual transformed log bytes, so evictions and lost-store rebuilds do not add another space.
 `--setting-sources ""` separately prevents user/project commands and skills from loading.
@@ -412,10 +435,10 @@ model call order. `unknownToolEntry` implements this necessary resume case; it i
 client calls in synthesized history still keep the client's outputs, whatever tools the request offers.
 
 **Provider records.** A record carries Claude Code's new output and log framing since the previous response, plus small replay templates for regenerated history
-and input lines. It never carries image bytes or copies of request payloads. Templates retain UUIDs, timestamps, provider tool ids and field order, and refer to
+and input lines. It never carries image bytes. Queued attachment text (including Claude Code’s rendered wrapper) remains verbatim framing so a lost-store rebuild can reproduce it; ordinary user payloads use replay templates. Templates retain UUIDs, timestamps, provider tool ids and field order, and refer to
 canonical input items and SHA-256-addressed payload sidecars under `<state-dir>/payloads` (owner-only). This includes native PNG-to-JPEG conversions: their
 actual bytes live only in the sidecar. The store's records plus sidecars reconstruct the session log byte for byte, including lines Claude Code writes only to
-disk; `--session-mirror` only tells the gateway when to read the file. A turn completes after its result and end-of-turn hook; held calls complete at
+disk; `--session-mirror` only tells the gateway when to read the file. A turn completes after its result; held calls complete at
 `message_stop`.
 
 Records live under `<state-dir>/responses` and travel as `encrypted_content` (gzip + base64, not encrypted). Existing fat v1 records remain readable and replay
@@ -447,10 +470,10 @@ response is attached, so simultaneous requests never rebuild it twice. The next 
   aliases are saved in subsequent provider records so they survive another process eviction, retained-store restart
   or lost-store history rebuild. Provider ids remain the ids in Responses output; the kernel still translates warm
   deltas normally. Already-issued records work too: no alternate digest or new-record-only matching is required.
-- When the log stops at held calls, the gateway appends the tool results plus one user message, and resumes with
-  `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1`. The message contains the notices’ text and images that came with the outputs, else the fixed line
-  `Continue from where you left off.`. It lands in that response's record, so every later rebuild repeats it exactly.
-- Each process gets a random epoch in its MCP and hook URLs; a call from a killed process finds no epoch and is
+- When the log stops at held calls, the gateway appends tool results and the queued notice/empty anchor described above,
+  or the fixed line `Continue from where you left off.` without notices, then resumes with
+  `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1`. These entries land in the response's record and replay exactly.
+- Each process gets a random epoch in its MCP URL; a call from a killed process finds no epoch and is
   rejected (`410`), so it can never reach the process that replaced it. An MCP call for a tool_use id the model never
   produced is refused; a duplicate call of one id gets the same output.
 
@@ -470,7 +493,7 @@ the table). The source of truth is `src/claude/pins.ts`.
 | `--tools ""` (passed once) | | No native tools, no Skill tool: the request's tools are the only tools | `--tools ""` … (paired with `default`) |
 | `--permission-mode dontAsk` + settings `permissions.allow: ["mcp__fn"]` | | MCP calls run without a permission prompt | every probe: no `control_request` |
 | `--setting-sources ""` | | No user or project settings (hooks, env, permissions), and no user or project MCP servers | `--setting-sources ""` … (two probes, each paired) |
-| `--settings <file>` | gateway-written | The gateway's own hooks: PostToolUse, PostToolUseFailure, Stop (HTTP) | headless …, Stop hook … |
+| `--settings <file>` | gateway-written | Only MCP permission allow-list; no notice hooks | queue … (paired hook-cap control)  |
 | `--strict-mcp-config --mcp-config <file>` | gateway-written | Only the gateway's MCP server (`fn`, HTTP, `timeout: 2147483647`), even with settings open | `--strict-mcp-config` … (paired, planted user and project servers) |
 | `--session-id` / `--resume` | chain's session | New session, or a rebuilt log | headless …, a log rebuilt … |
 | MCP server `timeout` | `2147483647` | The longest Claude Code accepts; holds end by eviction, never by this | MCP server timeout … (65 s hold) |
@@ -490,7 +513,7 @@ the table). The source of truth is `src/claude/pins.ts`.
 Set but **not verified** by the probe:
 
 - `PATH=/usr/bin:/bin`, so any helper Claude Code starts finds the system tools; the rest of the environment is
-  cleared. Nothing the gateway uses spawns one (no native tools; hooks and MCP are HTTP), and with `PATH` unset the
+  cleared. Nothing the gateway uses spawns one (no native tools; MCP is HTTP), and with `PATH` unset the
   model sees the same prompt (measured), so there is no effect to assert.
 
 - `DISABLE_AUTOUPDATER=1`. In 2.1.284 the updater fetches from a fixed `https://downloads.claude.ai/claude-code-releases`
@@ -556,7 +579,7 @@ persistent WebSockets: one conversation runs twice,
 once on a single live process and once with idle evictions, a gateway restart that keeps the store and one that
 loses it (full-history rebuild from records); every request the model receives is byte-identical (working folder
 normalized). Around each disruption, the next request repeats the one before it up to the new tail. The matrix adds
-parallel calls released out of order, notices mid-turn, at a turn start and at the end-of-turn hook, eviction during a
+parallel calls released out of order, notices mid-turn, at a turn start and alongside native tool continuations, eviction during a
 hold (with and without notices, then evicted and rebuilt again), a midnight via `TZ`, cancellation mid-stream and
 mid-continuation, a client disconnect, stale-call fencing, typed errors, and two negative controls: a moved working
 folder (an environment update at the tail, prefix intact) and a history without records (synthesized, a cache miss,

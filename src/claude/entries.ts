@@ -108,12 +108,26 @@ export function userTextEntry(ctx: LogContext, text: string): Json {
   return userContentEntry(ctx, [{ type: 'text', text }])
 }
 
-/** A notice entry on the interrupted-turn resume; image blocks stay images, never hook text. */
+/** Raw user entry for fixed resume text or a zero-block anchor; notices use queuedNoticeEntry. */
 export function userContentEntry(ctx: LogContext, parts: Part[]): Json {
   return base(ctx, {
     ...(ctx.promptId ? { promptId: ctx.promptId } : {}),
     type: 'user',
     message: { role: 'user', content: userContentBlocks(parts) },
+  })
+}
+
+/** Same queued_command attachment Claude Code logs live; its renderer owns text/image wrappers. */
+export function queuedNoticeEntry(ctx: LogContext, parts: Part[]): Json {
+  return base(ctx, {
+    type: 'attachment',
+    attachment: {
+      type: 'queued_command',
+      prompt: userContentBlocks(parts),
+      source_uuid: crypto.randomUUID(),
+      commandMode: 'prompt',
+      timestamp: new Date().toISOString(),
+    },
   })
 }
 

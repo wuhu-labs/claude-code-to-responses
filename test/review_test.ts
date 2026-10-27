@@ -304,19 +304,15 @@ Deno.test('a work root inside git is refused before anything is created or chang
   Deno.removeSync(inGit, { recursive: true })
 })
 
-Deno.test('an end-of-turn continuation may stream longer than the record timeout', async () => {
+Deno.test('an native-tool continuation may stream longer than the record timeout', async () => {
   const run = new Run('long-continuation', false, { recordTimeoutMs: 800 })
   await run.run(async () => {
     run.fake.reply(
       { blocks: [call('toolu_k', 'echo', { text: 'k' }), call('toolu_u', 'nonexistent', {})] },
-      { blocks: [text('first part')] },
+      { blocks: [text('first part'), call('toolu_continue', 'nonexistent', {})] },
       { blocks: [text('second'), text(' part'), text(' streams slowly')], gapMs: 600 },
     )
     await run.send([user('T1')])
-    // Exercise the Stop fallback independently of undefined-tool surfacing: Code may skip a post-tool hook.
-    const lane = [...run.tg.gw.lanes.values()][0]
-    const hook = lane.hook.bind(lane)
-    lane.hook = (body) => body.hook_event_name === 'Stop' ? hook(body) : {}
     const r = await run.send([output('toolu_k', 'K'), user('NOTICE-STOP')])
     assertEquals(r.status, 'completed', JSON.stringify(r.response.error))
     assertEquals(run.drv.text(r), 'first partsecond part streams slowly')
@@ -653,19 +649,15 @@ Deno.test('cancel: an unknown id is 404 not_found, a finished response 409 respo
   })
 })
 
-Deno.test('the record timeout never covers the end-of-turn hook round trip or a slow first byte of the continuation', async () => {
+Deno.test('the record timeout never covers the queued-notice native continuation round trip or a slow first byte of the continuation', async () => {
   const run = new Run('slow-continuation-start', false, { recordTimeoutMs: 800 })
   await run.run(async () => {
     run.fake.reply(
       { blocks: [call('toolu_k', 'echo', { text: 'k' }), call('toolu_u', 'nonexistent', {})] },
-      { blocks: [text('first part')] },
+      { blocks: [text('first part'), call('toolu_continue', 'nonexistent', {})] },
       { blocks: [text(' and the rest')], delayMs: 2000 },
     )
     await run.send([user('T1')])
-    // Exercise the Stop fallback independently of undefined-tool surfacing: Code may skip a post-tool hook.
-    const lane = [...run.tg.gw.lanes.values()][0]
-    const hook = lane.hook.bind(lane)
-    lane.hook = (body) => body.hook_event_name === 'Stop' ? hook(body) : {}
     const r = await run.send([output('toolu_k', 'K'), user('NOTICE-STOP')])
     assertEquals(r.status, 'completed', JSON.stringify(r.response.error))
     assertEquals(run.drv.text(r), 'first part and the rest')

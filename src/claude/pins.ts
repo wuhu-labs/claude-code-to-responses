@@ -100,10 +100,10 @@ export function launchEnv(s: LaunchSpec): Record<string, string> {
 /** The backend variables the gateway passes through from its own environment, and nothing else. */
 export const BACKEND_ENV = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'] as const
 
-export function settingsJson(hookUrl: string, bearer: string) {
+export function settingsJson(hookUrl?: string, bearer?: string) {
   const hook = [{ hooks: [{ type: 'http', url: hookUrl, headers: { Authorization: `Bearer ${bearer}` }, timeout: 600 }] }]
   return {
-    hooks: { PostToolUse: hook, PostToolUseFailure: hook, Stop: hook },
+    ...(hookUrl ? { hooks: { PostToolUse: hook, PostToolUseFailure: hook, Stop: hook } } : {}),
     permissions: { allow: [`mcp__${MCP_SERVER}`] },
   }
 }

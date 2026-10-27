@@ -5,7 +5,7 @@ import { contentFor, mcpResult } from '../src/lane.ts'
 import { call, type Json, text } from './fake.ts'
 import { assertPrefix, output, user } from './harness.ts'
 import { IMAGE, IMAGE_BLOCK, PNG } from './images.ts'
-import { Run } from './scenario.ts'
+import { INSTRUCTIONS, MODEL, Run, TOOLS } from './scenario.ts'
 
 Deno.test('only a last user block with a command-shaped token receives one space; other content and caller data stay unchanged', () => {
   const image: Part = { type: 'image', mediaType: 'image/png', data: PNG }
@@ -78,48 +78,41 @@ Deno.test('slash-leading stdin user text is model input, including later text bl
   })
 })
 
-for (const path of ['live-hook', 'evicted-text', 'image-first', 'image-last'] as const) {
-  Deno.test(`slash notices on ${path}: no local command, loss, or rewriting of tool results; history recovery preserves exact bytes`, async () => {
-    const run = new Run(`slash-${path}`, false)
-    await run.run(async () => {
-      for (const command of ['/compact', '/cost', '/context', '/foo']) {
-        const id = `toolu_slash_${run.fake.main().length}`
-        run.fake.reply({ blocks: [call(id, 'echo', { text: 'x' })] })
-        await run.send([user('tool please')])
-        await run.tg.waitEvent('hold', (d) => d.call === id)
-        if (path === 'evicted-text') await run.disrupt('hold')
-        const content = path === 'image-first'
-          ? [IMAGE, { type: 'input_text', text: command }]
-          : path === 'image-last'
-          ? [{ type: 'input_text', text: command }, IMAGE]
-          : command
-        const n = run.fake.main().length
-        run.fake.reply({ blocks: [text('notice received')] })
-        const r = await run.send([output(id, '/cost'), { role: 'user', content }])
-        assertEquals(r.status, 'completed')
-        assertEquals(run.drv.text(r), 'notice received')
-        assertEquals(run.fake.main().length, n + 1)
-        const after = run.fake.main().at(-1)!, msgs = after.body.messages
-        const result = msgs.flatMap((m: Json) => m.content instanceof Array ? m.content : []).find((b: Json) =>
-          b.type === 'tool_result' && b.tool_use_id === id
-        )
-        assertEquals(result.content[0].text, '/cost', 'tool outputs are not command input')
-        if (path === 'live-hook') assertEquals(msgs.at(-1).content[0].text, `PostToolUse:mcp__fn__echo hook additional context: ${command}`)
-        else {
-          const texts = msgs.at(-1).content.filter((b: Json) =>
-            b.type === 'text' && !b.text.startsWith('[Image: source:') && !b.text.startsWith('# Environment\n')
-          )
-          assertEquals(texts.map((b: Json) => b.text), [path === 'image-last' ? command : ' ' + command + (path === 'image-first' ? '\n' : '')])
-          if (path.startsWith('image')) assertEquals(msgs.at(-1).content.find((b: Json) => b.type === 'image'), IMAGE_BLOCK)
-        }
-        assert(!after.raw.includes("The user's message starts with the slash command"))
-        await run.disrupt('restart-lost-store')
-        await run.turn('history continuation')
-        assertPrefix(after, run.fake.main().at(-1)!)
+Deno.test('slash-leading notices are typed invalid input before release, including whitespace/images and evicted holds', async () => {
+  const run = new Run('slash-notice-invalid', false)
+  await run.run(async () => {
+    run.fake.reply({ blocks: [call('toolu_slash', 'echo', {})] })
+    const first = await run.send([user('tool please')])
+    for (const evicted of [false, true]) {
+      if (evicted) await run.disrupt('hold')
+      for (
+        const content of ['/compact', ' /cost', '\n/context', '/foo', [IMAGE, { type: 'input_text', text: '/cost' }], [
+          { type: 'input_text', text: '/compact' },
+          IMAGE,
+        ]]
+      ) {
+        const response = await fetch(`${run.tg.url}/v1/responses`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: MODEL,
+            instructions: INSTRUCTIONS,
+            tools: TOOLS,
+            stream: true,
+            previous_response_id: first.response.id,
+            input: [output('toolu_slash', 'RESULT'), { role: 'user', content }],
+          }),
+        })
+        assertEquals(response.status, 400)
+        assertEquals((await response.json()).error.code, 'unsupported_notice_command')
+        assertEquals(run.fake.main().length, 1)
       }
-    })
+    }
+    run.fake.reply({ blocks: [text('notice received')] })
+    const accepted = await run.send([output('toolu_slash', 'RESULT'), user('<sender>user</sender> /compact')])
+    assertEquals(accepted.status, 'completed')
   })
-}
+})
 
 Deno.test('recordless slash-leading history synthesizes the same user boundary, without touching assistant text or tool outputs', async () => {
   const run = new Run('slash-synth', false, { mode: 'history' })
@@ -130,7 +123,7 @@ Deno.test('recordless slash-leading history synthesizes the same user boundary, 
       { role: 'assistant', content: '/cost' },
       { type: 'function_call', call_id: 'toolu_synthslash', name: 'echo', arguments: '{"text":"x"}' },
       output('toolu_synthslash', '/context'),
-      user('/foo'),
+      user('<sender>user</sender> /foo'),
     ])
     assertEquals(r.status, 'completed')
     assertEquals(run.drv.text(r), 'model answer')
@@ -138,7 +131,7 @@ Deno.test('recordless slash-leading history synthesizes the same user boundary, 
     const before = run.fake.main()[0]
     const blocks = (role: string) => before.body.messages.filter((m: Json) => m.role === role).flatMap((m: Json) => m.content)
     assert(blocks('user').some((b: Json) => b.type === 'text' && b.text === ' /compact'))
-    assert(blocks('user').some((b: Json) => b.type === 'text' && b.text === ' /foo'))
+    assert(JSON.stringify(before.body.messages).includes('<sender>user</sender> /foo'))
     assert(blocks('assistant').some((b: Json) => b.type === 'text' && b.text === '/cost'))
     assertEquals(blocks('user').find((b: Json) => b.type === 'tool_result').content[0].text, '/context')
     await run.disrupt('restart-lost-store')

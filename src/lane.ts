@@ -2,7 +2,7 @@ import { ReplayIndex, replayLog } from './replay.ts'
 import { Buffer } from 'node:buffer'
 // A lane is one Claude Code session (one chain of responses) and, while it lives, the one process serving it.
 // It turns Claude Code's stream into Responses events, holds MCP calls until the client's outputs come,
-// delivers notices through hooks, and records every log entry so the process can be killed and rebuilt.
+// delivers notices through the stdin queue, and records every log entry so the process can be killed and rebuilt.
 import type { FnTool, InItem, Part } from './api/request.ts'
 import { type EventSink, newId, type ResponseState, usageObject, type UsageTotals } from './api/stream.ts'
 import { type Bridge, type BridgeTarget, McpCallError, StaleEpoch } from './bridge.ts'
@@ -133,8 +133,7 @@ export class Lane implements BridgeTarget {
   private known = new Set<string>()
   private answered = new Set<string>()
   private knownWaiters = new Map<string, (() => void)[]>()
-  private staged: { callId: string; text: string } | null = null
-  private continuing = false
+  private queued: { resolve: () => void; reject: (e: GatewayError) => void; timer: ReturnType<typeof setTimeout> } | null = null
   /** For each model message id: the stream indexes whose log entries the mirror has delivered. */
   private mirrored = new Map<string, Set<number>>()
   private timer: ReturnType<typeof setTimeout> | undefined
@@ -235,7 +234,7 @@ export class Lane implements BridgeTarget {
     const mcpConfigPath = `${this.runDir}/mcp.json`
     const systemPromptPath = `${this.runDir}/system-prompt.txt`
     Deno.writeTextFileSync(systemPromptPath, this.chain.instructions, { mode: 0o600 })
-    Deno.writeTextFileSync(settingsPath, JSON.stringify(settingsJson(this.bridge.hookUrl(this.epoch), this.bridge.bearer)), { mode: 0o600 })
+    Deno.writeTextFileSync(settingsPath, JSON.stringify(settingsJson()), { mode: 0o600 })
     Deno.writeTextFileSync(mcpConfigPath, JSON.stringify(mcpConfigJson(this.bridge.mcpUrl(this.epoch), this.bridge.bearer)), { mode: 0o600 })
     const spec: LaunchSpec = {
       binary: this.config.claudeBinary,
@@ -346,6 +345,11 @@ export class Lane implements BridgeTarget {
     const atRest = this.pendingAtAttach === null
     clearTimeout(this.timer)
     this.bridge.unregister(this.epoch)
+    if (this.queued) {
+      clearTimeout(this.queued.timer)
+      this.queued.reject(serverError('notice_undelivered', 'Claude Code stopped before acknowledging the notice.'))
+      this.queued = null
+    }
     for (const [, resolvers] of this.held) {
       for (const resolve of resolvers) resolve({ content: [{ type: 'text', text: 'gateway: process evicted' }], isError: true })
     }
@@ -458,19 +462,48 @@ export class Lane implements BridgeTarget {
     }
   }
 
-  /** Releases held calls with the client's outputs. Notices are staged on the last call's hook first. */
-  release(outputs: Map<string, Part[]>, notices: string | null): void {
-    // the held calls are the open turn's: this response continues it
+  /** A single stdin writer, with at most one unacknowledged mid-turn write. Queue-operation entries
+   * have no content/id in 2.1.284: the next mirrored enqueue acknowledges this write. Earlier turn
+   * enqueues precede the assistant mirror that completed the head; no other writer can race it.
+   * Do not publish results before the ack: even an MCP call arriving during the write must wait. */
+  async release(outputs: Map<string, Part[]>, notices: Part[] | null): Promise<void> {
     if (this.active) this.active.ownsTurn = true
-    const calls = this.head!.calls
-    this.staged = notices !== null ? { callId: calls[calls.length - 1].id, text: notices } : null
-    for (const [id, parts] of outputs) this.results.set(id, mcpResult(parts))
-    for (const [id, resolvers] of [...this.held]) {
-      const r = this.results.get(id)
-      if (r === undefined) continue
-      this.held.delete(id)
-      this.answered.add(id)
-      for (const resolve of resolvers) resolve(r)
+    try {
+      if (notices !== null) await this.enqueue(notices)
+      if (this.dead) return
+      for (const [id, parts] of outputs) this.results.set(id, mcpResult(parts))
+      for (const [id, resolvers] of [...this.held]) {
+        const r = this.results.get(id)
+        if (r === undefined) continue
+        this.held.delete(id)
+        this.answered.add(id)
+        for (const resolve of resolvers) resolve(r)
+      }
+    } catch (error) {
+      this.fail(asGatewayError(error))
+      void this.kill('notice_failed')
+    }
+  }
+
+  private async enqueue(parts: Part[]): Promise<void> {
+    if (this.queued) throw serverError('notice_undelivered', 'A queued stdin write is already awaiting acknowledgement.')
+    const { promise, resolve, reject } = Promise.withResolvers<void>()
+    const timer = setTimeout(() => {
+      this.queued = null
+      reject(serverError('notice_undelivered', 'Claude Code did not mirror the notice enqueue within 5 seconds.'))
+    }, 5000)
+    this.queued = { resolve, reject, timer }
+    try {
+      await Promise.all([
+        promise,
+        this.proc!.write({ type: 'user', session_id: '', parent_tool_use_id: null, message: { role: 'user', content: contentFor(parts) } })
+          .catch((error) => {
+            throw serverError('claude_code_stdin', `Could not write the notice to Claude Code: ${String(error)}`)
+          }),
+      ])
+    } finally {
+      clearTimeout(timer)
+      this.queued = null
     }
   }
 
@@ -572,23 +605,8 @@ export class Lane implements BridgeTarget {
     for (const w of ws ?? []) w()
   }
 
-  hook(body: Json): Json {
+  hook(_body: Json): Json {
     if (this.dead) throw new StaleEpoch('stale Claude Code process: it was killed')
-    const event = body?.hook_event_name
-    if ((event === 'PostToolUse' || event === 'PostToolUseFailure') && this.staged && body.tool_use_id === this.staged.callId) {
-      const text = this.staged.text
-      this.staged = null
-      this.events.note('notice', { session: this.sessionId, via: event, call: body.tool_use_id })
-      return { hookSpecificOutput: { hookEventName: event, additionalContext: text } }
-    }
-    if (event === 'Stop' && this.staged && this.active && !this.active.finished) {
-      // the last call's hook never ran: the notices continue this response's inference from the end-of-turn hook
-      const text = this.staged.text
-      this.staged = null
-      this.continuing = true
-      this.events.note('notice', { session: this.sessionId, via: 'Stop' })
-      return { hookSpecificOutput: { hookEventName: 'Stop', additionalContext: text } }
-    }
     return {}
   }
 
@@ -644,6 +662,11 @@ export class Lane implements BridgeTarget {
 
   private mirror(e: Json): void {
     this.mirroredLines.push(JSON.stringify(e))
+    if (e?.type === 'queue-operation' && e.operation === 'enqueue' && this.queued) {
+      clearTimeout(this.queued.timer)
+      this.queued.resolve()
+      this.events.note('notice', { session: this.sessionId, via: 'queue' })
+    }
     if (e?.type === 'assistant' && typeof e.message?.id === 'string' && typeof e.apiBlockIndex === 'number') {
       const m = this.mirrored.get(e.message.id) ?? new Set<number>()
       m.add(e.apiBlockIndex)
@@ -677,7 +700,6 @@ export class Lane implements BridgeTarget {
       if (a.msg && !a.msg.stopped) {
         return this.fail(serverError('upstream_stream_cut', 'The model stream was cut short and Claude Code retried; the partial output cannot be withdrawn.'))
       }
-      this.continuing = false
       // the response goes on with a new model message: the wait for the last one's record is over
       clearTimeout(a.mirrorTimer)
       const u = ev.message?.usage ?? {}
@@ -826,8 +848,7 @@ export class Lane implements BridgeTarget {
 
   /**
    * A response ends at the model's message_stop, once the log entries of every block are in hand. When the model
-   * ends its turn, the response also waits for the turn's result: Claude Code has then logged the turn's end-of-turn
-   * hook, so the record holds the whole turn and nothing is left over for the next one.
+   * ends its turn, the response also waits for the turn's result, so its record holds the whole turn.
    */
   private maybeFinish(): void {
     const a = this.active
@@ -845,9 +866,7 @@ export class Lane implements BridgeTarget {
       return this.fail(toolStopError())
     }
     if (toolStop && !calls) return // native tool errors continue this response, not a client tool round
-    if (!calls && (this.staged || this.continuing)) return // notices go in at the end-of-turn hook; inference goes on
     if (!calls && !a.turnEnded) return
-    if (calls && this.staged) return this.fail(serverError('notice_undelivered', 'The model called tools again before the notices could be delivered.'))
     a.finishing = true
     const callRefs: CallRef[] = calls ? callBlocks.map((b) => ({ id: b.item.call_id, name: b.item.name })) : []
     void this.cutRecord(a, msg.id, Math.max(...msg.blocks.keys()), calls, callRefs, msg.stopReason!)

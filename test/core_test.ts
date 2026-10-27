@@ -1,3 +1,4 @@
+import { queueWrapper } from './queue.ts'
 import { replayLog } from '../src/replay.ts'
 import { scenarioTest } from './scenario.ts'
 // Gateway core on the fake endpoint: held calls, message_stop, notices, records, usage, eviction and restart bytes.
@@ -37,7 +38,7 @@ scenarioTest('parallel calls are held until the outputs come, in any order; the 
     assertEquals(rec.end, 'calls')
     assertEquals(rec.calls.map((c) => c.id), ['toolu_a', 'toolu_b', 'toolu_c'])
 
-    // outputs in reverse order, plus a notice: it goes in on the last call's PostToolUse hook
+    // outputs in reverse order, plus a notice: it is enqueued before any call is released
     run.fake.reply({ blocks: [text('all done')] })
     const r2 = await run.send([output('toolu_c', 'C-OUT'), output('toolu_b', 'B-OUT'), user('NOTICE: a new message arrived'), output('toolu_a', 'A-OUT')])
     assertEquals(r2.status, 'completed')
@@ -49,9 +50,8 @@ scenarioTest('parallel calls are held until the outputs come, in any order; the 
     assertEquals(results.content.map((b: Json) => [b.tool_use_id, b.content[0].text]), [['toolu_a', 'A-OUT'], ['toolu_b', 'B-OUT'], ['toolu_c', 'C-OUT']])
     const notice = msgs[msgs.length - 1]
     assertEquals(notice.role, 'system')
-    assertEquals(notice.content[0].text, 'PostToolUse:mcp__fn__echo hook additional context: NOTICE: a new message arrived')
-    assertEquals(run.tg.events('notice').map((n) => n.data.via), ['PostToolUse'])
-    assertEquals(run.tg.events('notice')[0].data.call, 'toolu_c')
+    assertEquals(notice.content[0].text, queueWrapper('NOTICE: a new message arrived'))
+    assertEquals(run.tg.events('notice').map((n) => n.data.via), ['queue'])
     assertEquals(run.fake.main().length, 2, 'exactly one model request per tool round')
   })
 })
@@ -104,7 +104,6 @@ scenarioTest('a provider record is every log entry since the previous response, 
     const joined = recs.flatMap((r) => replayLog(r!, run.tg.gw.store))
     assertEquals(disk, joined)
     assertEquals(run.tg.gw.store.tail(r3.response.id), [])
-    assert(recs[2]!.entries.some((e) => e.includes('stop_hook_summary')), 'the turn end is in its response record')
   })
   assert(run.tg.events('verify_ok').length > 0)
 })

@@ -1,5 +1,5 @@
 import { replayLog } from '../src/replay.ts'
-// Image notices must evict even a live hold, then survive every record-based rebuild without losing image bytes.
+// Image notices use the queue without eviction, then survive every record-based rebuild without losing image bytes.
 import { assert, assertEquals, assertExists } from '@std/assert'
 import { MAX_IMAGE_BASE64_CHARS } from '../src/api/request.ts'
 import { decodeRecord } from '../src/records.ts'
@@ -16,7 +16,6 @@ for (const path of ['live', 'evicted', 'history'] as const) {
       await run.send([user('two tools')])
       await run.tg.waitEvent('hold', (d) => d.call === 'toolu_img1')
       const before = run.fake.main()[0]
-      const oldPid = run.tg.events('spawn')[0].data.pid
       if (path === 'evicted') await run.disrupt('hold')
       if (path === 'history') await run.disrupt('restart-lost-store')
       run.fake.reply({ blocks: [text('saw the images')] })
@@ -24,41 +23,30 @@ for (const path of ['live', 'evicted', 'history'] as const) {
       // Multiple message items (including image-only and blank ones) become one user log entry after all results.
       const r = await run.send([output('toolu_img2', 'BIG'), notice, output('toolu_img1', 'ECHO'), user('   '), { role: 'user', content: [IMAGE] }])
       assertEquals(r.status, 'completed', JSON.stringify(r.response.error))
-      assertEquals(r.response.x_gateway.resume, 'interrupted_turn')
+      if (path !== 'live') assertEquals(r.response.x_gateway.resume, 'interrupted_turn')
       if (path === 'live') {
-        assertEquals(r.response.x_gateway.path, 'store')
-        assertEquals(run.tg.events('kill').filter((e) => e.data.reason === 'image_notice').map((e) => e.data.pid), [oldPid])
-        assertEquals(run.tg.events('spawn').length, 2)
+        assertEquals(r.response.x_gateway.path, 'live')
+        assertEquals(run.tg.events('kill').length, 0)
+        assertEquals(run.tg.events('spawn').length, 1)
       }
-      assertEquals(run.tg.events('notice').length, 0, 'no text hook delivery for an image notice')
+      assertEquals(run.tg.events('notice').length, path === 'live' ? 1 : 0)
       const after = run.fake.main()[1]
       assertPrefix(before, { ...after, body: { ...after.body, messages: after.body.messages.slice(0, before.body.messages.length) } })
       const tail = after.body.messages.slice(before.body.messages.length)
       assertEquals(tail.length, 2)
       assertEquals(tail[0].role, 'assistant')
       assertEquals(tail[0].content.map((b: Json) => b.id), ['toolu_img1', 'toolu_img2'])
-      assertEquals({ ...tail[1], content: tail[1].content.slice(0, 6) }, {
-        role: 'user',
-        content: [
-          { type: 'tool_result', tool_use_id: 'toolu_img1', content: [{ type: 'text', text: 'ECHO' }] },
-          { type: 'tool_result', tool_use_id: 'toolu_img2', content: [{ type: 'text', text: 'BIG' }] },
-          { type: 'text', text: 'NOTICE before image' },
-          IMAGE_BLOCK,
-          { type: 'text', text: 'after image' },
-          IMAGE_BLOCK,
-        ],
-      })
-      assertEquals(tail[1].content.length, 8, 'Claude Code adds source labels after the real images')
-      for (const [i, block] of tail[1].content.slice(6).entries()) {
-        assertEquals(block.type, 'text')
-        assert(block.text.startsWith('[Image: source: '))
-        assert(block.text.endsWith(`/images/${i + 1}.png]`))
-      }
+      const content = tail[1].content
+      assertEquals(content.slice(0, 2).map((b: Json) => [b.tool_use_id, b.content[0].text]), [['toolu_img1', 'ECHO'], ['toolu_img2', 'BIG']])
+      assertEquals(content.filter((b: Json) => b.type === 'image').map((b: Json) => b.source), [IMAGE_BLOCK.source, IMAGE_BLOCK.source])
+      assert(JSON.stringify(content).includes('The user sent a new message while you were working:'))
+      assert(JSON.stringify(content).includes('NOTICE before image'))
+      assert(JSON.stringify(content).includes('after image'))
       const rec = await decodeRecord(r.response.output.at(-1).encrypted_content)
       assertExists(rec)
       const noticeEntries = replayLog(rec, run.tg.gw.store).filter((e) => e.includes('NOTICE before image'))
       assertEquals(noticeEntries.length, 1)
-      assertEquals(JSON.parse(noticeEntries[0]).message.content, tail[1].content.slice(2, 6))
+      assertEquals(JSON.parse(noticeEntries[0]).attachment.type, 'queued_command')
       await run.disrupt('idle')
       run.fake.reply({ blocks: [text('after idle')] })
       await run.turn('next')
@@ -164,7 +152,7 @@ for (const path of ['live', 'lost-store'] as const) {
       assertEquals(corrected.status, 'completed')
       assertEquals(run.drv.text(corrected), 'corrected retry')
       assertEquals(corrected.response.x_gateway.path, 'history')
-      assertEquals(run.fake.main().at(-1)!.body.messages.at(-1).content.find((b: Json) => b.type === 'image'), IMAGE_BLOCK)
+      assertEquals(run.fake.main().at(-1)!.body.messages.at(-1).content.find((b: Json) => b.type === 'image').source, IMAGE_BLOCK.source)
     })
   })
 }
@@ -181,7 +169,7 @@ for (const [path, size] of [['live', 'small'], ['evicted', 'small'], ['lost-stor
       if (size === 'large') run.drv.opts.model += '[1m]' // fake count_tokens counts encoded characters as text
       run.fake.reply({ blocks: [call('toolu_outputimg', 'echo', { text: 'image' })] })
       await run.send([{ role: 'user', content: [IMAGE, { type: 'input_text', text: 'tool image' }] }])
-      assertEquals(run.fake.main()[0].body.messages[0].content.find((b: Json) => b.type === 'image'), IMAGE_BLOCK)
+      assertEquals(run.fake.main()[0].body.messages[0].content.find((b: Json) => b.type === 'image').source, IMAGE_BLOCK.source)
       await run.tg.waitEvent('hold')
       if (path === 'evicted') await run.disrupt('hold')
       if (path === 'lost-store') await run.disrupt('restart-lost-store')

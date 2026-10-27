@@ -1,5 +1,5 @@
 import { scenarioTest } from './scenario.ts'
-// The fake-endpoint matrix: midnight, moved folder, records-less history, turn-start notices, the end-of-turn hook,
+// The fake-endpoint matrix: midnight, moved folder, records-less history, turn-start notices, the queued-notice native continuation,
 // cancellation and interrupts, stale-call fencing, typed errors.
 import { assert, assertEquals, assertNotEquals, assertRejects, assertStringIncludes, assertThrows } from '@std/assert'
 import { call, type Json, text, think } from './fake.ts'
@@ -111,27 +111,24 @@ scenarioTest('notices at a turn start go in through stdin as one user turn', asy
   })
 })
 
-scenarioTest('a notice delivered at the end-of-turn hook continues inference within the same response', async () => {
+scenarioTest('a notice delivered at the queued-notice native continuation continues inference within the same response', async () => {
   const run = new Run('stophook', false)
   await run.run(async () => {
-    // The second call is hidden and answered natively; explicitly skip post-tool hooks below to exercise
-    // notice delivery through the end-of-turn fallback.
-    run.fake.reply({ blocks: [call('toolu_k', 'echo', { text: 'k' }), call('toolu_u', 'nonexistent', {})] }, { blocks: [text('first part')] }, {
+    // Hidden native calls can continue inference after the queued notice has reached the model.
+    run.fake.reply({ blocks: [call('toolu_k', 'echo', { text: 'k' }), call('toolu_u', 'nonexistent', {})] }, {
+      blocks: [text('first part'), call('toolu_continue', 'nonexistent', {})],
+    }, {
       blocks: [text('second part')],
     })
     await run.send([user('T1')])
-    // Exercise the Stop fallback independently of undefined-tool surfacing: Code may skip a post-tool hook.
-    const lane = [...run.tg.gw.lanes.values()][0]
-    const hook = lane.hook.bind(lane)
-    lane.hook = (body) => body.hook_event_name === 'Stop' ? hook(body) : {}
     const r = await run.send([{ type: 'function_call_output', call_id: 'toolu_k', output: 'K' }, user('NOTICE-STOP')])
     assertEquals(r.status, 'completed')
     assertEquals(run.drv.text(r), 'first partsecond part')
-    assertEquals(run.tg.events('notice').map((n) => n.data.via), ['Stop'])
+    assertEquals(run.tg.events('notice').map((n) => n.data.via), ['queue'])
     assertEquals(run.tg.events('completed').length, 2)
     const reqs = run.fake.main()
     assertEquals(reqs.length, 3)
-    assertStringIncludes(lastText(reqs[2].body), 'Stop hook additional context: NOTICE-STOP')
+    assertStringIncludes(JSON.stringify(reqs[1].body.messages), 'NOTICE-STOP')
     // and the record of that response replays both messages after an eviction
     await run.disrupt('idle')
     run.fake.reply({ blocks: [text('later')] })

@@ -432,12 +432,14 @@ for (const transport of ['sse', 'websocket'] as const) {
       await run.run(async () => {
         const reset = now() + (weekly ? 604800 : 900)
         const claim = weekly ? 'seven_day' : 'five_hour'
-        // Skipped post-tool hooks deliver the notice at Stop, causing another inference after text streamed.
-        run.fake.reply({ blocks: [call('toolu_k', 'echo', { text: 'k' })] }, { blocks: [text('first part')] }, limit(reset, claim))
+        // A hidden native tool after visible text causes another inference in this response.
+        run.fake.reply(
+          { blocks: [call('toolu_k', 'echo', { text: 'k' })] },
+          { blocks: [text('first part'), call('toolu_native', 'nonexistent', {})] },
+          limit(reset, claim),
+        )
         await run.send([user('T1')])
         const lane = [...run.tg.gw.lanes.values()][0]
-        const hook = lane.hook.bind(lane)
-        lane.hook = (body) => body.hook_event_name === 'Stop' ? hook(body) : {}
         // Capture the already-computed error: the pre-output refusal sends exactly these HTTP headers.
         const fail = lane.fail.bind(lane)
         let expected: Json
@@ -470,13 +472,11 @@ for (const transport of ['sse', 'websocket'] as const) {
       // With no unified reset headers, Code reports a bare rejection, not a known subscription reset.
       run.fake.reply(
         { blocks: [call('toolu_k', 'echo', { text: 'k' })] },
-        { blocks: [text('first part')] },
+        { blocks: [text('first part'), call('toolu_native', 'nonexistent', {})] },
         { blocks: [], error: LIMITED },
       )
       await run.send([user('T1')])
       const lane = [...run.tg.gw.lanes.values()][0]
-      const hook = lane.hook.bind(lane)
-      lane.hook = (body) => body.hook_event_name === 'Stop' ? hook(body) : {}
       const r = await run.send([{ type: 'function_call_output', call_id: 'toolu_k', output: 'K' }, user('NOTICE-STOP')])
       assertEquals(r.status, 'failed')
       assert(r.events.some((e) => e.type === 'response.output_text.delta'))

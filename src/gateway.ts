@@ -11,6 +11,7 @@ import {
   contextOf,
   hasToolResult,
   type LogContext,
+  queuedNoticeEntry,
   toolResultEntry,
   unknownToolEntry,
   userContentEntry,
@@ -34,10 +35,9 @@ export interface GatewayEvent {
   data: Json
 }
 
-/** Hook text is null only when the notice needs the image-capable interrupted-turn resume. */
+/** Notices use the same queued-command representation live and on interrupted resume. */
 interface Notice {
   parts: Part[]
-  hookText: string | null
 }
 
 /** What a request asks of Claude Code after the point the log is at. */
@@ -213,7 +213,7 @@ export class Gateway {
       this.note('request', { session: lane.sessionId, response: state.id, path: state.gateway.path })
       if (plan.spawn) lane.spawn(plan.spawn)
       if (plan.delivery?.kind === 'turn') void lane.startTurn(plan.delivery.parts)
-      else if (plan.delivery?.kind === 'outputs') lane.release(plan.delivery.outputs, plan.delivery.notices?.hookText ?? null)
+      else if (plan.delivery?.kind === 'outputs') void lane.release(plan.delivery.outputs, plan.delivery.notices?.parts ?? null)
     } catch (error) {
       // Once attached, both transports own a streaming response. Never bubble an exception back to the
       // route's pre-stream error handler: fail/close that response and clear/kill its lane instead.
@@ -264,13 +264,12 @@ export class Gateway {
     this.reserve(rec.session, reservation)
     let lane = this.lanes.get(rec.session)
     if (
-      lane && !lane.dead && lane.head?.responseId === prev &&
-      !(delivery.kind === 'outputs' && delivery.notices?.hookText === null)
+      lane && !lane.dead && lane.head?.responseId === prev
     ) {
       state.gateway = { path: 'live', session: rec.session }
       return { lane, delivery, prevId: prev, covered: input, spawn: null }
     }
-    if (lane) await lane.kill(delivery.kind === 'outputs' && delivery.notices?.hookText === null ? 'image_notice' : 'superseded')
+    if (lane) await lane.kill('superseded')
     await this.settled(rec.session)
     const records = this.store.chain(prev)
     if (!records) throw previousResponseNotFound(prev, 'its chain is incomplete in the store')
@@ -325,10 +324,13 @@ export class Gateway {
     return { resume: true, interruptedTurn: true, log, attempt }
   }
 
-  /** The tool results plus one user message: the notice text and images, else a fixed line. */
+  /** Tool results, then the queued notice plus an empty resume anchor, else the fixed resume line. */
   private interruptedEntries(ctx: LogContext, log: string[], head: Head, d: Extract<Delivery, { kind: 'outputs' }>): string[] {
     const out = resultEntries(ctx, log, head.calls, d.outputs)
-    out.push(JSON.stringify(userContentEntry(ctx, d.notices?.parts ?? [{ type: 'text', text: RESUME_LINE }])))
+    out.push(JSON.stringify(d.notices ? queuedNoticeEntry(ctx, d.notices.parts) : userContentEntry(ctx, [{ type: 'text', text: RESUME_LINE }])))
+    // A queued attachment alone makes interrupted resume invent a Continue prompt, changing tool-result
+    // bytes. An empty user anchor suppresses that prompt and renders zero blocks (paired binary probe).
+    if (d.notices) out.push(JSON.stringify(userContentEntry(ctx, [])))
     return out
   }
 
@@ -446,7 +448,7 @@ export class Gateway {
         } else {
           // completed calls: their outputs are history, whatever tools this request offers
           extra.push(...resultEntries(ctx, [...log, ...tailLines, ...extra], calls, d.outputs))
-          if (d.notices !== null) extra.push(JSON.stringify(userContentEntry(ctx, d.notices.parts)))
+          if (d.notices !== null) extra.push(JSON.stringify(queuedNoticeEntry(ctx, d.notices.parts)))
         }
         const a = assistantEntries(ctx, g.outputs, chain.model)
         for (const e of a.entries) extra.push(JSON.stringify(e))
@@ -714,11 +716,21 @@ function deliveryFor(head: Head | null, input: InItem[], isNew = true): Delivery
   let notice: Notice | null = null
   if (notices.length) {
     const parts = notices.flat()
-    if (parts.some((p) => p.type === 'image')) notice = { parts, hookText: null }
+    // 2.1.284's queued-command renderer trims leading whitespace and drops slash commands.
+    // The ordinary stdin space guard cannot prevent that loss. Reject, never relabel client input.
+    const text = parts.filter((p): p is Extract<Part, { type: 'text' }> => p.type === 'text').map((p) => p.text).join('\n').trimStart()
+    if (/^\/\w[\w:-]*(?=\s|$)/.test(text)) {
+      throw invalid(
+        'input',
+        'Claude Code drops slash-leading queued notices after trimming whitespace; send this as a new user turn instead.',
+        'unsupported_notice_command',
+      )
+    }
+    if (parts.some((p) => p.type === 'image')) notice = { parts }
     else {
-      // Preserve the existing text-only hook/resume bytes, including separators between messages.
+      // Preserve text-only message concatenation bytes, including separators between messages.
       const text = notices.map((ps) => ps.map((p) => (p as { text: string }).text).join('\n')).join('\n\n')
-      notice = { parts: [{ type: 'text', text }], hookText: text }
+      notice = { parts: [{ type: 'text', text }] }
     }
   }
   return { kind: 'outputs', outputs, notices: notice }
