@@ -296,6 +296,8 @@ for (const transport of ['sse', 'websocket'] as const) {
       run.fake.reply(limit(reset, 'five_hour', { '5h-utilization': '1', '5h-reset': String(reset) }))
       let status: number, retryAfter: string | null, error: Json, events: Json[] = []
       const ws = transport === 'websocket' ? run.tg.websocket() : null
+      if (ws) await ws.opened
+      const before = Date.now()
       if (!ws) {
         const r = await sse(run, 'over the limit')
         ;[status, retryAfter, error] = [r.status, r.headers.get('retry-after'), r.body.error]
@@ -305,9 +307,14 @@ for (const transport of ['sse', 'websocket'] as const) {
         assertEquals(e.type, 'error')
         ;[status, retryAfter, error] = [e.status, e.headers['retry-after'], e.error]
       }
+      const after = Date.now()
       assertEquals(status, 429)
+      // the gateway reads its clock between `before` and `after`: Retry-After is the reset from then, rounded up
       const seconds = Number(retryAfter)
-      assert(seconds >= 595 && seconds <= 600, `Retry-After ${retryAfter}`)
+      assert(
+        seconds >= retryAfterSeconds(reset, after) && seconds <= retryAfterSeconds(reset, before) && seconds <= 600,
+        `Retry-After ${retryAfter}`,
+      )
       assertEquals([error.code, error.type, error.limit_type, error.resets_at], ['usage_limit_reached', 'server_error', 'five_hour', reset])
       assert(error.message.includes("You've hit your session limit"), error.message)
       if (transport === 'websocket') {
