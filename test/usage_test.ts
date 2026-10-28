@@ -188,32 +188,24 @@ const report = (w: Record<string, [number, number]>): Json => {
   }
 }
 
-Deno.test('the usage ledger: windows merge by name, survive a reload, and a passed reset reads as an unused window', () => {
+Deno.test('the usage ledger: windows merge by name, survive a reload, and are served as reported, a passed reset included', () => {
   const dir = Deno.makeTempDirSync()
   const path = `${dir}/usage.json`
-  const t = 1_760_000_000, ms = t * 1000
+  const t = 1_760_000_000
   const reported = (windows: RateLimitInfo['windows']): RateLimitInfo => ({ status: 'allowed', resetsAt: null, rateLimitType: null, windows })
   try {
     const ledger = new UsageLedger(path)
-    assertEquals(ledger.report(ms), report({ five_hour: [0, t + 300 * 60], seven_day: [0, t + 10080 * 60], seven_day_overage_included: [0, t + 10080 * 60] }))
+    assertEquals(ledger.report(), report({ five_hour: [0, 0], seven_day: [0, 0], seven_day_overage_included: [0, 0] }))
     ledger.record(reported({}))
     assertThrows(() => Deno.statSync(path), Deno.errors.NotFound)
-    ledger.record(reported({ five_hour: { utilization: 0.25, resetsAt: t + 600 }, seven_day: { utilization: 0.5, resetsAt: t + 86400 } }))
+    ledger.record(reported({ five_hour: { utilization: 0.25, resetsAt: t - 600 }, seven_day: { utilization: 0.5, resetsAt: t + 86400 } }))
     ledger.record(reported({ seven_day_overage_included: { utilization: 1.2, resetsAt: t + 86400 }, overage: { utilization: 0.1, resetsAt: t + 86400 } }))
-    const held = report({ five_hour: [25, t + 600], seven_day: [50, t + 86400], seven_day_overage_included: [100, t + 86400] })
-    assertEquals(ledger.report(ms), held)
+    const held = report({ five_hour: [25, t - 600], seven_day: [50, t + 86400], seven_day_overage_included: [100, t + 86400] })
+    assertEquals(ledger.report(), held)
     const reloaded = new UsageLedger(path)
-    assertEquals(reloaded.report(ms), held)
-    const later = t + 601
-    assertEquals(
-      reloaded.report(later * 1000),
-      report({ five_hour: [0, later + 300 * 60], seven_day: [50, t + 86400], seven_day_overage_included: [100, t + 86400] }),
-    )
-    reloaded.record(reported({ five_hour: { utilization: 0.05, resetsAt: later + 3600 } }))
-    assertEquals(
-      new UsageLedger(path).report(later * 1000),
-      report({ five_hour: [5, later + 3600], seven_day: [50, t + 86400], seven_day_overage_included: [100, t + 86400] }),
-    )
+    assertEquals(reloaded.report(), held)
+    reloaded.record(reported({ five_hour: { utilization: 0.05, resetsAt: t + 3600 } }))
+    assertEquals(new UsageLedger(path).report(), report({ five_hour: [5, t + 3600], seven_day: [50, t + 86400], seven_day_overage_included: [100, t + 86400] }))
   } finally {
     Deno.removeSync(dir, { recursive: true })
   }
@@ -222,11 +214,11 @@ Deno.test('the usage ledger: windows merge by name, survive a reload, and a pass
 Deno.test('the usage ledger: a file it cannot read starts it empty', () => {
   const dir = Deno.makeTempDirSync()
   const path = `${dir}/usage.json`
-  const empty = report({ five_hour: [0, 1_760_018_000], seven_day: [0, 1_760_604_800], seven_day_overage_included: [0, 1_760_604_800] })
+  const empty = report({ five_hour: [0, 0], seven_day: [0, 0], seven_day_overage_included: [0, 0] })
   try {
     for (const text of ['{', '[]', '{"five_hour":{"utilization":-1,"resetsAt":1760000600}}', '{"hourly":{"utilization":0.5,"resetsAt":1760000600}}']) {
       Deno.writeTextFileSync(path, text)
-      assertEquals(new UsageLedger(path).report(1_760_000_000_000), empty, text)
+      assertEquals(new UsageLedger(path).report(), empty, text)
     }
   } finally {
     Deno.removeSync(dir, { recursive: true })
@@ -579,30 +571,31 @@ Deno.test('GET /v1/usage serves the saved windows in the WebSocket event shape, 
   const run = new UsageRun('usage-read', false)
   await run.run(async () => {
     const usage = async () => (await fetch(`${run.tg.url}/v1/usage`)).json()
-    const t = now()
-    const fresh = await usage()
-    assertEquals(Object.keys(fresh.rate_limits.windows), ['five_hour', 'seven_day', 'seven_day_overage_included'])
-    assertEquals(Object.values(fresh.rate_limits.windows).map((w) => (w as Json).used_percent), [0, 0, 0])
-    assert(fresh.rate_limits.primary.reset_at >= t + 300 * 60, 'an unreported window resets a full window later')
-    const r5 = t + 3 * 3600, r7 = t + 4 * 86400
+    const unreported = { used_percent: 0, window_minutes: 10080, reset_at: 0 }
+    assertEquals(await usage(), {
+      type: 'codex.rate_limits',
+      rate_limits: {
+        primary: { used_percent: 0, window_minutes: 300, reset_at: 0 },
+        secondary: unreported,
+        windows: { five_hour: { used_percent: 0, window_minutes: 300, reset_at: 0 }, seven_day: unreported, seven_day_overage_included: unreported },
+      },
+    })
+    const r5 = now() + 3 * 3600, r7 = now() + 4 * 86400
     run.fake.reply({
       blocks: [text('one')],
       headers: unified({ status: 'allowed', '5h-utilization': '0.3', '5h-reset': String(r5), '7d-utilization': '0.5', '7d-reset': String(r7) }),
     })
     assertEquals((await sse(run, 'one')).events.at(-1).type, 'response.completed')
+    const five = { used_percent: 30, window_minutes: 300, reset_at: r5 }, seven = { used_percent: 50, window_minutes: 10080, reset_at: r7 }
     const saved = await usage()
     kernelParse(saved)
-    assertEquals([saved.rate_limits.primary, saved.rate_limits.windows.seven_day], [
-      { used_percent: 30, window_minutes: 300, reset_at: r5 },
-      { used_percent: 50, window_minutes: 10080, reset_at: r7 },
-    ])
-    assertEquals(saved.rate_limits.windows.seven_day_overage_included.used_percent, 0)
+    assertEquals(saved.rate_limits, { primary: five, secondary: seven, windows: { five_hour: five, seven_day: seven, seven_day_overage_included: unreported } })
     await run.disrupt('restart')
     assertEquals(await usage(), saved)
   })
 })
 
-Deno.test('GET /v1/usage sits behind the same bearer token as /v1/responses', async () => {
+Deno.test('GET /v1/usage sits behind the bearer token, and an API-key backend has no usage to serve', async () => {
   const d = dirs('usage-auth')
   const tg = await TestGateway.start({
     dirs: d,
@@ -613,7 +606,7 @@ Deno.test('GET /v1/usage sits behind the same bearer token as /v1/responses', as
     const refused = await fetch(`${tg.url}/v1/usage`)
     assertEquals([refused.status, (await refused.json()).error.code], [401, 'invalid_api_key'])
     const read = await fetch(`${tg.url}/v1/usage`, { headers: { authorization: 'Bearer usage-secret' } })
-    assertEquals([read.status, (await read.json()).type], [200, 'codex.rate_limits'])
+    assertEquals([read.status, (await read.json()).error.code], [404, 'usage_unsupported'])
   } finally {
     await tg.close()
     cleanup(d)

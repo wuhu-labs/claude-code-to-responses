@@ -33,6 +33,7 @@ export const ERROR_CODES = [
   'usage_limit_reached',
   'rate_limit_exceeded',
   'unexpected_rate_limit_event',
+  'usage_unsupported',
   'server_error',
   'upstream_error',
   'upstream_stream_cut',

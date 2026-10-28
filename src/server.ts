@@ -23,7 +23,7 @@ export function handler(gw: Gateway): (req: Request) => Promise<Response> {
       }
       if (req.method === 'GET' && url.pathname === '/healthz') return Response.json({ ok: true, lanes: gw.lanes.size })
       if (req.method === 'GET' && url.pathname === '/v1/responses') return upgradeResponses(req, gw)
-      if (req.method === 'GET' && url.pathname === '/v1/usage') return Response.json(gw.usage.report())
+      if (req.method === 'GET' && url.pathname === '/v1/usage') return Response.json(gw.usageReport())
       if (req.method === 'POST' && url.pathname === '/v1/responses') {
         let body: unknown
         try {

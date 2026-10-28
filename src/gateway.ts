@@ -50,7 +50,7 @@ type Delivery =
 export class Gateway {
   readonly store: ResponseStore
   readonly failures: FailureLog
-  readonly usage: UsageLedger
+  private readonly usage: UsageLedger
   readonly bridge: Bridge
   readonly lanes = new Map<string, Lane>()
   readonly events: GatewayEvent[] = []
@@ -110,6 +110,19 @@ export class Gateway {
     await Promise.all([...this.processes].map((l) => l.kill('gateway_shutdown')))
     await this.bridge.close()
     releaseLock(this.config.stateDir)
+  }
+
+  /** Claude Code reports usage only for a subscription, so an API-key backend has none to serve. */
+  usageReport(): Json {
+    if (!('CLAUDE_CODE_OAUTH_TOKEN' in this.config.backendEnv)) {
+      throw new GatewayError(
+        404,
+        'not_found_error',
+        'usage_unsupported',
+        'The backend is not a Claude subscription (CLAUDE_CODE_OAUTH_TOKEN), so it reports no usage.',
+      )
+    }
+    return this.usage.report()
   }
 
   private laneEvents = {

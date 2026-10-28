@@ -103,8 +103,9 @@ export function codexRateLimits(windows: Record<string, UsageWindow>): Json | nu
   return { type: 'codex.rate_limits', rate_limits: rateLimits }
 }
 
-/** The windows `GET /v1/usage` always reports. */
+/** The windows `GET /v1/usage` always reports; one never reported reads unused with a reset already passed. */
 const SERVED = ['five_hour', 'seven_day', 'seven_day_overage_included']
+const UNREPORTED: UsageWindow = { utilization: 0, resetsAt: 0 }
 
 /**
  * The account's latest report of each window, merged by name across processes and kept in `<state-dir>/usage.json`,
@@ -130,13 +131,9 @@ export class UsageLedger {
     }
   }
 
-  /** Every served window at `nowMs`; one never reported or past its reset is unused, resetting a full window later. */
-  report(nowMs = Date.now()): Json {
-    const now = Math.floor(nowMs / 1000)
-    return codexRateLimits(Object.fromEntries(SERVED.map((name) => {
-      const w = this.windows[name]
-      return [name, w && w.resetsAt > now ? w : { utilization: 0, resetsAt: now + WINDOW_MINUTES[name]! * 60 }]
-    })))
+  /** The stored windows as reported, a passed reset included: the reader decides what a passed reset means. */
+  report(): Json {
+    return codexRateLimits(Object.fromEntries(SERVED.map((name) => [name, this.windows[name] ?? UNREPORTED])))
   }
 }
 
