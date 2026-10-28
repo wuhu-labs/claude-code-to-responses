@@ -54,6 +54,8 @@ export interface LaneEvents {
   dead(lane: Lane): void
   /** Its process has exited. */
   gone(lane: Lane): void
+  /** Claude Code reported the account's usage. */
+  usage(info: RateLimitInfo): void
 }
 
 interface BlockState {
@@ -651,7 +653,8 @@ export class Lane implements BridgeTarget {
     }
     this.rateLimit = info
     this.events.note('rate_limit', { session: this.sessionId, status: info.status, type: info.rateLimitType, resets_at: info.resetsAt, windows: info.windows })
-    const event = codexRateLimits(info)
+    this.events.usage(info)
+    const event = codexRateLimits(info.windows)
     if (event) this.quota?.(event)
   }
 

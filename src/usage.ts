@@ -1,5 +1,6 @@
 // Subscription usage as Claude Code reports it (`rate_limit_event`), and what the gateway makes of it: a 429 that says
-// when the limit resets, and the `codex.rate_limits` WebSocket event Wuhu's kernel puts on its usage board.
+// when the limit resets, the `codex.rate_limits` WebSocket event Wuhu's kernel puts on its usage board, and the saved
+// windows `GET /v1/usage` serves in the same shape.
 // Measured on 2.1.284 against the fake endpoint (probe/probe_test.ts, "rate_limit_event …").
 import { GatewayError } from './errors.ts'
 
@@ -85,21 +86,82 @@ function kernelWindow(w: UsageWindow, minutes: number): Json {
 }
 
 /**
- * The `codex.rate_limits` event for one report, or null when Claude Code reported no window. Only reported windows are
- * sent under their Claude names in `windows`, with `five_hour` also as `primary`, `seven_day` as `secondary`. Claude Code reports no plan, so there is no
- * `plan_type`.
+ * The `codex.rate_limits` event for some windows, or null when none is timed. Timed windows are sent under their Claude
+ * names in `windows`, with `five_hour` also as `primary`, `seven_day` as `secondary`. Claude Code reports no plan, so
+ * there is no `plan_type`.
  */
-export function codexRateLimits(info: RateLimitInfo): Json | null {
+export function codexRateLimits(windows: Record<string, UsageWindow>): Json | null {
   const rateLimits: Json = {}
-  if (info.windows.five_hour) rateLimits.primary = kernelWindow(info.windows.five_hour, PRIMARY_WINDOW_MINUTES)
-  if (info.windows.seven_day) rateLimits.secondary = kernelWindow(info.windows.seven_day, SECONDARY_WINDOW_MINUTES)
-  const timed = Object.entries(info.windows).flatMap(([name, w]) => {
+  if (windows.five_hour) rateLimits.primary = kernelWindow(windows.five_hour, PRIMARY_WINDOW_MINUTES)
+  if (windows.seven_day) rateLimits.secondary = kernelWindow(windows.seven_day, SECONDARY_WINDOW_MINUTES)
+  const timed = Object.entries(windows).flatMap(([name, w]) => {
     const minutes = WINDOW_MINUTES[name]
     return minutes === null ? [] : [[name, kernelWindow(w, minutes)]]
   })
   if (!timed.length) return null
   rateLimits.windows = Object.fromEntries(timed)
   return { type: 'codex.rate_limits', rate_limits: rateLimits }
+}
+
+/** The windows `GET /v1/usage` always reports. */
+const SERVED = ['five_hour', 'seven_day', 'seven_day_overage_included']
+
+/**
+ * The account's latest report of each window, merged by name across processes and kept in `<state-dir>/usage.json`,
+ * so a restarted gateway serves it at once. It is a cache of reports the next one refills: a file it cannot read
+ * starts it empty, and a failed write keeps the memory copy.
+ */
+export class UsageLedger {
+  private windows: Record<string, UsageWindow>
+
+  constructor(private readonly path: string) {
+    this.windows = loadWindows(path)
+  }
+
+  record(info: RateLimitInfo): void {
+    const merged = { ...this.windows, ...info.windows }
+    if (JSON.stringify(merged) === JSON.stringify(this.windows)) return
+    this.windows = merged
+    try {
+      Deno.writeTextFileSync(`${this.path}.tmp`, JSON.stringify(merged), { mode: 0o600 })
+      Deno.renameSync(`${this.path}.tmp`, this.path)
+    } catch (e) {
+      console.error(`usage_write_failed ${JSON.stringify({ error: String(e) })}`)
+    }
+  }
+
+  /** Every served window at `nowMs`; one never reported or past its reset is unused, resetting a full window later. */
+  report(nowMs = Date.now()): Json {
+    const now = Math.floor(nowMs / 1000)
+    return codexRateLimits(Object.fromEntries(SERVED.map((name) => {
+      const w = this.windows[name]
+      return [name, w && w.resetsAt > now ? w : { utilization: 0, resetsAt: now + WINDOW_MINUTES[name]! * 60 }]
+    })))
+  }
+}
+
+function loadWindows(path: string): Record<string, UsageWindow> {
+  let text: string
+  try {
+    text = Deno.readTextFileSync(path)
+  } catch (e) {
+    if (e instanceof Deno.errors.NotFound) return {}
+    console.error(`usage_unreadable ${JSON.stringify({ error: String(e) })}`)
+    return {}
+  }
+  try {
+    const saved = JSON.parse(text)
+    if (typeof saved !== 'object' || saved === null || Array.isArray(saved)) throw new RateLimitShapeError('usage.json is not an object')
+    return Object.fromEntries(
+      Object.entries(saved).map(([name, w]) => {
+        if (!Object.hasOwn(WINDOW_MINUTES, name)) throw new RateLimitShapeError(`unknown window ${JSON.stringify(name)}`)
+        return [name, window(w, name)]
+      }),
+    )
+  } catch (e) {
+    console.error(`usage_unreadable ${JSON.stringify({ error: String(e) })}`)
+    return {}
+  }
 }
 
 /** Seconds until `resetsAt`, rounded up, within 0...MAX_RETRY_AFTER_SECONDS. */

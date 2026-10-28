@@ -20,7 +20,7 @@ CLAUDE_CODE_OAUTH_TOKEN=… deno run -A src/main.ts \
 |---|---|---|
 | `--listen host:port` | `127.0.0.1:18330` | Responses API address. Off loopback the gateway refuses to start without `--auth-token-env`. |
 | `--auth-token-env VAR` | none | Clients must send `Authorization: Bearer $VAR` (`401 invalid_api_key` otherwise). The token is read from the environment, never from argv. |
-| `--state-dir` | required | Response store (`responses/`, `tails/`), the gateway's Claude Code config folder and scratch home (`claude/config`, `claude/home`), its device id (`device-id`), per-process files (`run/`), sanitized failure diagnostics (`failures.jsonl`, one rotated archive `failures.jsonl.1`). |
+| `--state-dir` | required | Response store (`responses/`, `tails/`), the gateway's Claude Code config folder and scratch home (`claude/config`, `claude/home`), its device id (`device-id`), the account's last usage report (`usage.json`), per-process files (`run/`), sanitized failure diagnostics (`failures.jsonl`, one rotated archive `failures.jsonl.1`). |
 | `--work-dir` | `/tmp/claude-code-to-responses` | The one working folder of every session. Keep it the same absolute path on every machine; it must be outside any git repository (checked at startup). Claude Code reports its real path (`/private/tmp/…` on macOS). |
 | `--device-id` | generated once into `<state-dir>/device-id` | The Claude Code device id every session sends in `metadata.user_id` (also `CLAUDE_CODE_TO_RESPONSES_DEVICE_ID`). 64 lowercase hex digits, or a startup error. Give the same id to every gateway that should share a backend cache. |
 | `--claude` | required | The Claude Code 2.1.284 binary. |
@@ -259,6 +259,8 @@ There is no `plan_type`: Claude Code 2.1.284 reports no plan. The event is outsi
 `response.completed` (Claude Code reports usage after the model's `message_stop`, and a tool-call response
 completes there). It goes to the socket of the last response the Claude Code process served, while that socket is
 open.
+
+**Reading usage without a response.** `GET /v1/usage` (same bearer token as `/v1/responses`) answers the same `codex.rate_limits` object from the account's last reports, never calling the backend. Every report merges into `<state-dir>/usage.json` window by window (a report naming only `seven_day` keeps the last `five_hour`), written atomically on each change and loaded at start, so a restarted gateway answers at once; a file it cannot read starts it empty, and a failed write is logged and keeps the in-memory copy. The answer always carries `five_hour` (also `primary`), `seven_day` (also `secondary`) and `seven_day_overage_included`: a window never reported, or whose reset has passed, reads `used_percent: 0` with `reset_at` a full window after the read, since Claude Code says nothing more until the next request.
 Ordinary validation errors leave the connection usable; after generation has started, model errors still arrive
 as `response.failed`, exactly as on SSE. This includes a process-start/rebuild exception after the response is
 attached: it terminates that response, kills any partially started process, discards the attempt's tail and releases
@@ -613,7 +615,7 @@ accepted terminal. Failed attempts do not advance the store/head, and retries re
 `test/usage_test.ts` checks the 429 mapping on both transports (a reset 10 minutes away, the one-hour cap for a
 weekly limit, a 429 without a reset and one with only a backend `retry-after`), that the next request reaches the
 backend again, a 429 after output, and `codex.rate_limits` against the kernel parser's contract: on a normal success,
-in the idle window after a tool-call response, with only the reported windows, none without windows, and none on SSE.
+in the idle window after a tool-call response, with only the reported windows, none without windows, and none on SSE; and `GET /v1/usage`: windows merged by name, served across a restart, a passed reset read as an unused window, an unreadable file started empty, and the bearer gate.
 
 `test/image_notice_test.ts` checks real image delivery against live/evicted/rebuilt holds, prefix stability within
 each run, and verbatim provider-record replay through idle eviction and lost-store rebuilds. It does not assert

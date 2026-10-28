@@ -97,6 +97,7 @@ for (
         note() {},
         dead() {},
         gone() {},
+        usage() {},
       },
     )
     lane.attach(new Active(state, sink, 'resp_previous', []))

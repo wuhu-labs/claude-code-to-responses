@@ -17,7 +17,7 @@ function fixture(write: () => Promise<void> = () => Promise.resolve()) {
     { stateDir: root } as Config,
     { unregister() {} } as unknown as Bridge,
     new ResponseStore(root),
-    { failure() {}, note() {}, dead() {}, gone() {} },
+    { failure() {}, note() {}, dead() {}, gone() {}, usage() {} },
   )
   lane.proc = { write, kill: () => Promise.resolve() } as unknown as ClaudeProcess
   lane.fail = (error: GatewayError) => {

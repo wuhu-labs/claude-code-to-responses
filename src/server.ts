@@ -1,4 +1,5 @@
-// Responses routes: POST /v1/responses (SSE), GET /v1/responses (WebSocket), POST /v1/responses/{id}/cancel; GET /healthz.
+// Responses routes: POST /v1/responses (SSE), GET /v1/responses (WebSocket), POST /v1/responses/{id}/cancel; GET /v1/usage;
+// GET /healthz.
 import { parseRequest } from './api/request.ts'
 import { asGatewayError, GatewayError, invalid } from './errors.ts'
 import type { Gateway } from './gateway.ts'
@@ -22,6 +23,7 @@ export function handler(gw: Gateway): (req: Request) => Promise<Response> {
       }
       if (req.method === 'GET' && url.pathname === '/healthz') return Response.json({ ok: true, lanes: gw.lanes.size })
       if (req.method === 'GET' && url.pathname === '/v1/responses') return upgradeResponses(req, gw)
+      if (req.method === 'GET' && url.pathname === '/v1/usage') return Response.json(gw.usage.report())
       if (req.method === 'POST' && url.pathname === '/v1/responses') {
         let body: unknown
         try {

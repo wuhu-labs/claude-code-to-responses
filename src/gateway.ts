@@ -26,6 +26,7 @@ import { Active, type ChainSpec, type Head, Lane, MAX_RESULT_CHARS, outputChars 
 import { type CallRef, decodeRecord, decodeThinking, type ProviderRecord, RecordError, sha256, THINKING_PREFIX } from './records.ts'
 import { ResponseStore } from './store.ts'
 import { type FailureDiagnostic, FailureLog } from './failures.ts'
+import { type RateLimitInfo, UsageLedger } from './usage.ts'
 
 // deno-lint-ignore no-explicit-any
 type Json = any
@@ -49,6 +50,7 @@ type Delivery =
 export class Gateway {
   readonly store: ResponseStore
   readonly failures: FailureLog
+  readonly usage: UsageLedger
   readonly bridge: Bridge
   readonly lanes = new Map<string, Lane>()
   readonly events: GatewayEvent[] = []
@@ -57,6 +59,7 @@ export class Gateway {
   private constructor(readonly config: Config) {
     this.store = new ResponseStore(config.stateDir)
     this.failures = new FailureLog(config.stateDir)
+    this.usage = new UsageLedger(`${config.stateDir}/usage.json`)
     this.bridge = new Bridge(config.bridgePort)
   }
 
@@ -128,6 +131,7 @@ export class Gateway {
     gone: (lane: Lane) => {
       this.processes.delete(lane)
     },
+    usage: (info: RateLimitInfo) => this.usage.record(info),
   }
 
   private addLane(lane: Lane): void {
