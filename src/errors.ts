@@ -16,7 +16,6 @@ export const ERROR_CODES = [
   'missing_tool_output',
   'unexpected_tool_output',
   'tool_output_too_large',
-  'image_too_large',
   'conversation_busy',
   'websocket_response_in_progress',
   'websocket_message_too_large',

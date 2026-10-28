@@ -1,7 +1,6 @@
 import { replayLog } from '../src/replay.ts'
 // Image notices use the queue without eviction, then survive every record-based rebuild without losing image bytes.
 import { assert, assertEquals, assertExists } from '@std/assert'
-import { MAX_IMAGE_BASE64_CHARS } from '../src/api/request.ts'
 import { decodeRecord } from '../src/records.ts'
 import { call, type Json, text } from './fake.ts'
 import { assertOneUserId, assertPrefix, output, user } from './harness.ts'
@@ -83,7 +82,6 @@ Deno.test('bad-format, malformed-base64 and oversized image notices are typed 40
       ['data:image/webp;base64,AA\nAA', 'invalid_request'],
       ['data:image/png;base64,A', 'invalid_request'],
       ['data:image/png;base64,AAA===', 'invalid_request'],
-      [`data:image/png;base64,${'A'.repeat(MAX_IMAGE_BASE64_CHARS + 4)}`, 'image_too_large'],
     ]
     for (const [image_url, code] of errors) {
       const response = await fetch(`${run.tg.url}/v1/responses`, {

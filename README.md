@@ -104,7 +104,6 @@ reads `~/.claude`.
   | `unexpected_reasoning_item` | A reasoning item next to new input that the gateway did not issue in this conversation. |
   | `missing_tool_output`, `unexpected_tool_output` | The outputs don't match the calls the conversation waits on. |
   | `tool_output_too_large` | An output over 500,000 characters (Claude Code would move it to a file). |
-  | `image_too_large` | `400`: an image whose base64 payload exceeds 5,242,880 characters (5 MiB encoded, up to 3,932,160 decoded bytes), the gateway’s own per-image input cap, enforced before Claude Code’s image processing. Resize it before sending. |
   | `unsupported_notice_command` | `400`: the final written block of a new queued notice is text whose trimmed value starts with `/`. Claude Code would defer it to a separate turn; send an ordinary user turn instead. No client text is relabeled. |
   | `conversation_busy` | `409`: another response of the conversation is streaming or starting. |
   | `websocket_response_in_progress` | `409`: a second create arrived before the socket's active response ended. |
@@ -536,7 +535,7 @@ The `2.1.284: images in an appended user log entry …` probe asserts that a use
 results sends actual base64 PNG image blocks (correct media type and unchanged payload) immediately after the
 results in the same user turn, retains the prior request’s prefix and leaves the appended log bytes unchanged.
 The large-image probe shows that Claude Code can resize/re-encode appended images, even over its nominal API
-limit; the gateway caps input before that processing, rather than relying on it as a fallback.
+limit; the gateway relies on that processing and sets no byte cap of its own.
 
 The unknown-name probe sends a bare declared client name, an undefined bare name and an undefined MCP name
 with `--tools ""` and only the gateway MCP server. All three get Code's native error tool result and continue to
@@ -648,7 +647,7 @@ Whether Anthropic's own cache depends on `metadata` is unknown: no request in th
 
 ## Known limits
 
-- Image input is limited to PNG, JPEG, GIF and WebP base64 data URLs, each at most 5,242,880 base64 characters.
+- Image input is limited to PNG, JPEG, GIF and WebP base64 data URLs; the gateway sets no byte cap, Claude Code resizes/re-encodes large images itself.
   The limit applies at turn starts, to notices, and to images inside tool outputs. Remote URLs and other formats
   are refused, never downloaded or silently dropped. The gateway does not transcode images; Claude Code may
   resize/re-encode them (including on an appended-log resume), so arbitrary image payloads need not reach the
