@@ -1,4 +1,4 @@
-// Counts Claude Code's "No such tool available" tool results in a gateway's Claude Code transcripts (WUHU-645):
+// Counts Claude Code's native "No such tool available" tool results in a gateway's Claude Code transcripts (WUHU-645):
 // per UTC day, per Claude session, and per missing tool name. Read-only: it opens files for reading and nothing else,
 // so it runs with `--allow-read` alone.
 //
@@ -61,11 +61,9 @@ async function* lines(path: string): AsyncGenerator<string> {
   if (rest) yield rest
 }
 
-function resultText(content: Json): string {
-  if (typeof content === 'string') return content
-  if (Array.isArray(content)) return content.map((c) => (c?.type === 'text' && typeof c.text === 'string' ? c.text : '')).join('')
-  return ''
-}
+/** Claude Code 2.1.284's own answer to a call of a tool it doesn't have: an error result whose whole content is this
+ * string (src/claude/entries.ts `unknownToolEntry`, probe/probe_test.ts). A result that merely quotes it is no hit. */
+const NATIVE_ERROR = /^<tool_use_error>Error: No such tool available: (\S+)<\/tool_use_error>$/
 
 /** The unknown-tool results of one transcript line (a user entry's tool_result blocks). */
 export function hitsOf(line: string, fallbackSession: string): Hit[] {
@@ -81,9 +79,8 @@ export function hitsOf(line: string, fallbackSession: string): Hit[] {
   const timestamp = typeof e.timestamp === 'string' ? e.timestamp : ''
   const hits: Hit[] = []
   for (const b of e.message.content) {
-    if (b?.type !== 'tool_result' || typeof b.tool_use_id !== 'string') continue
-    const text = resultText(b.content)
-    const m = text.match(/No such tool available: ([^<\s]+)/)
+    if (b?.type !== 'tool_result' || b.is_error !== true || typeof b.tool_use_id !== 'string' || typeof b.content !== 'string') continue
+    const m = b.content.match(NATIVE_ERROR)
     if (m) hits.push({ session, toolUseId: b.tool_use_id, timestamp, name: m[1] })
   }
   return hits

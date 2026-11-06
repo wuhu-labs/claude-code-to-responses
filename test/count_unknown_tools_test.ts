@@ -66,11 +66,15 @@ Deno.test('count script: per day and per session, deduplicated, only tool result
   })
   const a = [
     entry('sess-a', '2026-11-05T23:59:00.000Z', [unknown('t1', 'grep'), unknown('t2', 'send_message')]),
-    entry('sess-a', '2026-11-06T00:01:00.000Z', [{
-      type: 'tool_result',
-      tool_use_id: 't3',
-      content: [{ type: 'text', text: 'No such tool available: compact' }],
-    }]),
+    entry('sess-a', '2026-11-06T00:01:00.000Z', [
+      unknown('t4', 'compact'),
+      // a successful grep whose output quotes the native error (a log, this script, the docs) is no hit
+      { type: 'tool_result', tool_use_id: 't3', content: '<tool_use_error>Error: No such tool available: grep</tool_use_error>' },
+      { type: 'tool_result', tool_use_id: 't5', is_error: false, content: [{ type: 'text', text: 'log: No such tool available: grep' }] },
+      // nor is a client tool's own error that quotes it, in either content shape
+      { type: 'tool_result', tool_use_id: 't6', is_error: true, content: [{ type: 'text', text: unknown('x', 'grep').content }] },
+      { type: 'tool_result', tool_use_id: 't7', is_error: true, content: 'grep failed: ' + unknown('x', 'grep').content },
+    ]),
     entry('sess-a', '2026-11-06T00:02:00.000Z', [{ type: 'text', text: 'the user typed No such tool available: grep' }]),
     JSON.stringify({ type: 'assistant', sessionId: 'sess-a', timestamp: '2026-11-06T00:03:00.000Z', message: { content: 'No such tool available: x' } }),
     'not json, mentions No such tool available: x',

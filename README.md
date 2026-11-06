@@ -449,8 +449,10 @@ prefix; a chain started on a gateway without the line pays one cache miss when i
 the chain key and the response's `instructions` hold the client's prompt alone. `test/tool_name_line_test.ts` asserts
 the bytes across chains, tool sets and a lost-store rebuild.
 
-To measure it, `scripts/count_unknown_tools.ts` counts the `No such tool available` tool results in a state dir's
-Claude Code transcripts (`<state-dir>/claude/config/projects/**/*.jsonl`), once per session and `tool_use_id`, since a
+To measure it, `scripts/count_unknown_tools.ts` counts Claude Code's native unknown-tool errors in a state dir's
+Claude Code transcripts (`<state-dir>/claude/config/projects/**/*.jsonl`): `tool_result` blocks with `is_error: true`
+whose whole content is `<tool_use_error>Error: No such tool available: …</tool_use_error>` (a result that only quotes
+it, such as a grep of a log, is not counted). Each counts once per session and `tool_use_id`, since a
 rebuild rewrites a session's log from its records. It prints the totals per UTC day, the top sessions (count,
 first and last result, called names) and the called names. It only reads (`--allow-read` is its only permission):
 
