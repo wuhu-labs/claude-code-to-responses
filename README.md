@@ -434,6 +434,31 @@ held and released normally. The model can instead finish with text; retrying wit
 choice, not guaranteed or forced by the gateway. A bare name can therefore cost an extra model step. No upstream
 traffic or logged tool names are rewritten, and malformed tool-use blocks/arguments still fail with a typed error.
 
+**Tool-name line.** A client's prompt names its tools bare (`grep`, `send_message`), while the model sees them as
+`mcp__fn__<name>`, so it sometimes calls the bare name and gets the error above. The system prompt file Claude Code gets
+is therefore the client's `instructions` byte for byte, then `\n\n`, then one constant line of the gateway's own
+(`TOOL_NAME_LINE` in `src/claude/pins.ts`, built from the MCP server name):
+
+```text
+The tools this prompt names, such as send_message, are available as mcp__fn__send_message and so on.
+```
+
+Measured on Claude Code 2.1.284: it reaches the model as the end of `system[2].text`, after the client's bytes. Nothing in
+the client's text is rewritten. The line is the same for every chain and tool set, so it never moves a chain's cache
+prefix; a chain started on a gateway without the line pays one cache miss when it is rebuilt on one with it. Records,
+the chain key and the response's `instructions` hold the client's prompt alone. `test/tool_name_line_test.ts` asserts
+the bytes across chains, tool sets and a lost-store rebuild.
+
+To measure it, `scripts/count_unknown_tools.ts` counts the `No such tool available` tool results in a state dir's
+Claude Code transcripts (`<state-dir>/claude/config/projects/**/*.jsonl`), once per session and `tool_use_id`, since a
+rebuild rewrites a session's log from its records. It prints the totals per UTC day, the top sessions (count,
+first and last result, called names) and the called names. It only reads (`--allow-read` is its only permission):
+
+```sh
+deno run --allow-read scripts/count_unknown_tools.ts --state-dir /var/lib/ccgw/state-claude [--since 2026-11-07T00:00:00Z] [--top 20] [--json]
+# without Deno on the host: deno task compile:count-unknown-tools, then .state/bin/count-unknown-tools with the same options
+```
+
 Records retain Claude Code's actual log bytes, including every hidden call and native error; their optional
 `nativeCalls` metadata excludes only those ids from client call-id matching on a full-history rebuild. Older
 records without that metadata remain supported. In a mixed message, eviction may occur while a real client call is
@@ -497,7 +522,7 @@ the table). The source of truth is `src/claude/pins.ts`.
 | `--include-partial-messages` | | Stream events, so the response streams and ends at `message_stop` | headless stream-json … |
 | `--session-mirror` | | `transcript_mirror` frames carry every log line verbatim, in order (the provider records) | headless stream-json … |
 | `--model`, `--effort` | request `model`, `reasoning.effort` | Fixed per chain | headless stream-json … |
-| `--system-prompt-file` | a 0600 file holding `instructions` | Replaces Claude Code's default prompt, byte for byte as `--system-prompt` would, without putting it on argv where every local user could read it. Claude Code still prepends its billing header and "You are a Claude agent, built on Anthropic's Claude Agent SDK." | `--system-prompt-file` … (paired with `--system-prompt`) |
+| `--system-prompt-file` | a 0600 file holding `instructions`, `\n\n` and the tool-name line | Replaces Claude Code's default prompt, byte for byte as `--system-prompt` would, without putting it on argv where every local user could read it. Claude Code still prepends its billing header and "You are a Claude agent, built on Anthropic's Claude Agent SDK." | `--system-prompt-file` … (paired with `--system-prompt`) |
 | `--tools ""` (passed once) | | No native tools, no Skill tool: the request's tools are the only tools | `--tools ""` … (paired with `default`) |
 | `--permission-mode dontAsk` + settings `permissions.allow: ["mcp__fn"]` | | MCP calls run without a permission prompt | every probe: no `control_request` |
 | `--setting-sources ""` | | No user or project settings (hooks, env, permissions), and no user or project MCP servers | `--setting-sources ""` … (two probes, each paired) |

@@ -10,7 +10,7 @@ import { userContentBlocks } from './claude/entries.ts'
 import { isNoResponseFrame, resultError } from './claude/failure.ts'
 import { ClaudeProcess, executableIdentity, type Frame } from './claude/process.ts'
 import type { CallAliases } from './call_ids.ts'
-import { type LaunchSpec, logPath, MAX_RESULT_CHARS, MCP_PREFIX, mcpConfigJson, projectDir, settingsJson } from './claude/pins.ts'
+import { type LaunchSpec, logPath, MAX_RESULT_CHARS, MCP_PREFIX, mcpConfigJson, projectDir, settingsJson, systemPrompt } from './claude/pins.ts'
 import { type Config, paths } from './config.ts'
 import { asGatewayError, type ErrorCode, GatewayError, serverError } from './errors.ts'
 import { type CallRef, encodeRecord, encodeThinking, ItemDigest, type ProviderRecord } from './records.ts'
@@ -235,7 +235,7 @@ export class Lane implements BridgeTarget {
     const settingsPath = `${this.runDir}/settings.json`
     const mcpConfigPath = `${this.runDir}/mcp.json`
     const systemPromptPath = `${this.runDir}/system-prompt.txt`
-    Deno.writeTextFileSync(systemPromptPath, this.chain.instructions, { mode: 0o600 })
+    Deno.writeTextFileSync(systemPromptPath, systemPrompt(this.chain.instructions), { mode: 0o600 })
     Deno.writeTextFileSync(settingsPath, JSON.stringify(settingsJson()), { mode: 0o600 })
     Deno.writeTextFileSync(mcpConfigPath, JSON.stringify(mcpConfigJson(this.bridge.mcpUrl(this.epoch), this.bridge.bearer)), { mode: 0o600 })
     const spec: LaunchSpec = {

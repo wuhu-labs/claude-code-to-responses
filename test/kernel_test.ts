@@ -1,5 +1,6 @@
 import { assert, assertEquals, assertRejects, assertThrows } from '@std/assert'
 import { parseRequest } from '../src/api/request.ts'
+import { systemPrompt } from '../src/claude/pins.ts'
 import { GatewayError } from '../src/errors.ts'
 import { decodeRecord, encodeRecord } from '../src/records.ts'
 import { call, type Json, text } from './fake.ts'
@@ -140,7 +141,7 @@ Deno.test('kernel WebSocket delta inherits durable instructions, enforces cap/ch
     run.fake.reply({ blocks: [call('toolu_kernel', 'echo', { text: 'x' })] })
     const first = await ws.send(b)
     assertEquals(first.status, 'completed')
-    assertEquals(run.fake.main()[0].body.system[2].text, 'You are helpful.')
+    assertEquals(run.fake.main()[0].body.system[2].text, systemPrompt('You are helpful.'))
     assertEquals(run.fake.main()[0].body.max_tokens, 4096)
     assertEquals(first.response.max_output_tokens, 4096)
     const delta = { ...b, previous_response_id: first.response.id, input: [{ type: 'function_call_output', call_id: 'toolu_kernel', output: 'tool result' }] }

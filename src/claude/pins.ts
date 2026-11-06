@@ -8,6 +8,15 @@ export const CLAUDE_CODE_VERSION = '2.1.284'
 export const MCP_SERVER = 'fn'
 export const MCP_PREFIX = `mcp__${MCP_SERVER}__`
 
+/** The gateway's one line after the client's system prompt: clients name their tools bare, the model sees them prefixed.
+ * Constant for every chain and tool set, so it never moves the cache prefix. */
+export const TOOL_NAME_LINE = `The tools this prompt names, such as send_message, are available as ${MCP_PREFIX}send_message and so on.`
+
+/** The system prompt Claude Code gets: the client's instructions byte for byte, a blank line, then `TOOL_NAME_LINE`. */
+export function systemPrompt(instructions: string): string {
+  return `${instructions}\n\n${TOOL_NAME_LINE}`
+}
+
 /** Anthropic tool names are at most 64 characters, so client tool names get what the prefix leaves. */
 export const MAX_TOOL_NAME = 64 - MCP_PREFIX.length
 
