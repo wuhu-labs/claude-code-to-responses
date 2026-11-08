@@ -127,7 +127,7 @@ reads `~/.claude`.
   | `unexpected_control_request` | Claude Code asked the host something (a permission prompt) it should never need. |
   | `claude_code_exited`, `claude_code_killed`, `claude_code_stdin`, `claude_code_error` | The process exited, was killed, could not be written to, or ended the turn with an error of its own. |
   | `internal_error` | A bug in the gateway; the process is killed and the next request rebuilds. |
-- **Wuhu retry policy.** Wuhu classifies the gateway's error code the same way on SSE and WebSocket, before or after output has streamed: `upstream_unreachable` is an outage, retried with backoff (at most 300 s apart) until it works, without an attempt limit; `server_error` is transient and bounded to **eight failed attempts** in a row, then the session is marked errored; an unrecognized code is terminal.
+- **Wuhu retry policy.** Wuhu classifies the gateway's error code the same way on SSE and WebSocket, before or after output has streamed: `upstream_unreachable` is an outage, retried with backoff (at most 300 s apart) until it works, without an attempt limit; `server_error` is transient and bounded to **eight failed attempts** in a row, then the session is marked errored; an unrecognized code, `claude_code_exited` and `claude_code_killed` included, and a failed response without an error object get the same eight-attempt bound.
 - Events are the standard streaming events: `response.created`, `response.in_progress`, `response.output_item.added`
   / `.done`, `response.content_part.added` / `.done`, `response.output_text.delta` / `.done`,
   `response.reasoning_text.delta` / `.done`, `response.function_call_arguments.delta` / `.done`, and one final
