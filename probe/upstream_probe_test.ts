@@ -1,5 +1,5 @@
 import { assert, assertEquals, assertStringIncludes } from '@std/assert'
-import { isNoResponseFrame, resultError } from '../src/claude/failure.ts'
+import { resultError } from '../src/claude/failure.ts'
 import { FakeAnthropic, text } from '../test/fake.ts'
 import { freePort } from '../test/harness.ts'
 import { Probe, ProbeTarget } from './launcher.ts'
@@ -56,7 +56,6 @@ for (const c of cases) {
       assertEquals(assistant.length, 1)
       assertEquals([assistant[0].is_api_error_message, assistant[0].error, assistant[0].message.model], [true, 'server_error', '<synthetic>'])
       assertEquals(assistant[0].message.content, [{ type: 'text', text: result.result }])
-      assertEquals(isNoResponseFrame(assistant[0]), noResponse)
       if ('status' in c) assertStringIncludes(result.result, `API Error: ${c.status} probe ${c.status}. This is a server-side issue, usually temporary`)
       else if (c.name === 'timeout') assertEquals(result.result, 'Request timed out')
       else if (c.name === 'reset') assertEquals(result.result, 'API Error: Connection dropped (ECONNRESET)')
@@ -66,7 +65,7 @@ for (const c of cases) {
         if (c.name === 'no-response-short') assertEquals(result.result, `API Error: No response from API (waited 11s). ${STALL_ADVICE}`)
         else assert(/^API Error: No response from API \(waited 3m/.test(result.result), result.result)
       }
-      assertEquals(resultError(result, null, isNoResponseFrame(assistant[0])).code, 'server_error')
+      assertEquals(resultError(result, null).code, 'status' in c ? 'server_error' : 'upstream_unreachable')
       assertEquals(r.frames.filter((f) => f.subtype === 'api_retry'), [], 'CLAUDE_CODE_MAX_RETRIES=0: no hidden retry')
       if (listener) assert(connections >= 1)
       else assertEquals(fake.main().length, 1)

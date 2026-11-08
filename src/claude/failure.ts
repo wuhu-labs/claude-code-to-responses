@@ -2,14 +2,7 @@ import { GatewayError, serverError } from '../errors.ts'
 import { rateLimitError, type RateLimitInfo } from '../usage.ts'
 import type { Frame } from './process.ts'
 
-const TRANSIENT_TRANSPORT_RESULTS = new Set(['Request timed out', 'API Error: Connection dropped (ECONNRESET)'])
-
-/** Status-less first-byte stalls carry `api_error: no_response` on the synthetic assistant, not the result. */
-export function isNoResponseFrame(f: Frame): boolean {
-  return f.type === 'assistant' && f.is_api_error_message === true && f.error === 'server_error' &&
-    f.api_error === 'no_response' && f.message?.model === '<synthetic>'
-}
-export function resultError(f: Frame, rateLimit: RateLimitInfo | null, noResponse = false): GatewayError {
+export function resultError(f: Frame, rateLimit: RateLimitInfo | null): GatewayError {
   const text = String(f.result ?? f.errors?.join?.('; ') ?? 'Claude Code reported an error')
   // the local blocking limit, or the backend refusing the prompt as too long ("prompt is too long: N tokens > M maximum")
   if (f.terminal_reason === 'blocking_limit' || /prompt is too long/i.test(text)) {
@@ -23,8 +16,9 @@ export function resultError(f: Frame, rateLimit: RateLimitInfo | null, noRespons
     if (status >= 400 && status < 500) return new GatewayError(400, 'invalid_request_error', 'upstream_invalid_request', text)
     return new GatewayError(502, 'server_error', 'upstream_error', text)
   }
-  if (f.terminal_reason === 'api_error' && f.api_error_status == null && (noResponse || TRANSIENT_TRANSPORT_RESULTS.has(text))) {
-    return serverError('server_error', text)
+  // no status means no response ever arrived, whatever Claude Code's wording
+  if (f.terminal_reason === 'api_error' && f.api_error_status == null) {
+    return new GatewayError(502, 'server_error', 'upstream_unreachable', text)
   }
   return serverError('claude_code_error', `Claude Code ended the turn with an error (${f.terminal_reason ?? 'unknown'}): ${text}`)
 }

@@ -1,33 +1,30 @@
 import { assert, assertEquals } from '@std/assert'
-import { isNoResponseFrame, resultError } from '../src/claude/failure.ts'
+import { resultError } from '../src/claude/failure.ts'
 import { call, text } from './fake.ts'
-import { sameRequest, send, user } from './harness.ts'
+import { freePort, sameRequest, send, user } from './harness.ts'
 import { INSTRUCTIONS, MODEL, Run, TOOLS } from './scenario.ts'
 
-Deno.test('only recognized upstream result failures use the kernel retry code', () => {
+Deno.test('a status-less api_error is upstream_unreachable whatever its text; a 5xx is server_error', () => {
   for (const status of [500, 502, 503, 504, 529, 599]) {
     assertEquals(resultError({ terminal_reason: 'api_error', api_error_status: status, result: 'API Error' }, null).code, 'server_error')
   }
-  for (const result of ['Request timed out', 'API Error: Connection dropped (ECONNRESET)']) {
-    assertEquals(resultError({ terminal_reason: 'api_error', api_error_status: null, result }, null).code, 'server_error')
+  for (
+    const result of [
+      'Request timed out',
+      'API Error: Connection dropped (ECONNRESET)',
+      'API Error: No response from API (waited 3m1s). …',
+      'API Error: Connection refused (ECONNREFUSED)',
+      'API Error: arbitrary failure',
+      'Request timed out\nuser text',
+    ]
+  ) {
+    assertEquals(resultError({ terminal_reason: 'api_error', api_error_status: null, result }, null).code, 'upstream_unreachable')
+    assertEquals(resultError({ terminal_reason: 'api_error', result }, null).code, 'upstream_unreachable')
   }
-  const synthetic = { type: 'assistant', is_api_error_message: true, error: 'server_error', api_error: 'no_response', message: { model: '<synthetic>' } }
-  assertEquals(isNoResponseFrame(synthetic), true)
-  for (const change of [{ type: 'result' }, { is_api_error_message: false }, { error: 'unknown' }, { api_error: 'other' }, { message: { model: MODEL } }]) {
-    assertEquals(isNoResponseFrame({ ...synthetic, ...change }), false)
-  }
-  assertEquals(
-    resultError({ terminal_reason: 'api_error', api_error_status: null, result: 'API Error: No response from API (waited 3m1s). …' }, null, true).code,
-    'server_error',
-  )
   for (
     const frame of [
       { terminal_reason: 'unknown', result: 'Request timed out' },
-      { terminal_reason: 'api_error', result: 'Something else timed out' },
-      { terminal_reason: 'api_error', result: 'API Error: arbitrary failure' },
-      { terminal_reason: 'api_error', result: 'Request timed out\nuser text' },
       { terminal_reason: 'api_error', api_error_status: '500', result: 'Request timed out' },
-      { terminal_reason: 'api_error', result: 'API Error: No response from API (unrecognized without its marker)' },
     ]
   ) assertEquals(resultError(frame, null).code, 'claude_code_error')
   for (
@@ -109,10 +106,11 @@ for (const transport of ['sse', 'websocket'] as const) {
 }
 
 for (const transport of ['sse', 'websocket'] as const) {
-  for (const failure of ['timeout', 'reset', 'no-response'] as const) {
-    Deno.test(`${transport}: real Claude Code ${failure} maps to server_error and a fresh retry succeeds`, async () => {
+  for (const failure of ['timeout', 'reset', 'refused', 'no-response'] as const) {
+    Deno.test(`${transport}: real Claude Code ${failure} maps to upstream_unreachable and a fresh retry succeeds`, async () => {
       const run = new Run(`transport-failure-${transport}-${failure}`, false)
       const listener = failure === 'reset' ? Deno.listen({ hostname: '127.0.0.1', port: 0 }) : null
+      const closedPort = failure === 'refused' ? freePort() : null
       let closing = false
       const resetter = listener
         ? (async () => {
@@ -128,6 +126,7 @@ for (const transport of ['sse', 'websocket'] as const) {
       run.backend = () => ({
         ...normalBackend(),
         ...(listener ? { ANTHROPIC_BASE_URL: `http://127.0.0.1:${listener.addr.port}` } : {}),
+        ...(closedPort ? { ANTHROPIC_BASE_URL: `http://127.0.0.1:${closedPort}` } : {}),
         ...(failure === 'timeout' ? { API_TIMEOUT_MS: '1000' } : {}),
         ...(failure === 'no-response'
           ? { _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL: 'true', CLAUDE_ENABLE_BYTE_WATCHDOG: 'true', CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS: '10000' }
@@ -138,13 +137,13 @@ for (const transport of ['sse', 'websocket'] as const) {
           const ws = transport === 'websocket' ? run.tg.websocket() : null
           const body = { ...base, input: 'fresh request' }
           const request = () => ws ? ws.send(body) : send(run.tg.client, body)
-          if (failure !== 'reset') run.fake.reply({ blocks: [text('too late')], delayMs: failure === 'timeout' ? 3500 : 14000 })
+          if (failure === 'timeout' || failure === 'no-response') run.fake.reply({ blocks: [text('too late')], delayMs: failure === 'timeout' ? 3500 : 14000 })
           const failed = await request()
-          assertEquals([failed.status, failed.response.error.code], ['failed', 'server_error'])
+          assertEquals([failed.status, failed.response.error.code], ['failed', 'upstream_unreachable'])
           assertEquals(failed.events.map((e) => e.type), ['response.created', 'response.in_progress', 'response.failed'])
           assertEquals(run.tg.gw.store.has(failed.response.id), false)
           assertEquals(run.tg.gw.lanes.size, 0)
-          if (failure === 'reset') run.tg.gw.config.backendEnv.ANTHROPIC_BASE_URL = run.fake.url
+          if (listener || closedPort) run.tg.gw.config.backendEnv.ANTHROPIC_BASE_URL = run.fake.url
           run.fake.reply({ blocks: [text('recovered')] })
           const retried = await request()
           assertEquals([retried.status, retried.response.previous_response_id], ['completed', null])

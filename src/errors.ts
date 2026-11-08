@@ -36,6 +36,7 @@ export const ERROR_CODES = [
   'usage_unsupported',
   'server_error',
   'upstream_error',
+  'upstream_unreachable',
   'upstream_stream_cut',
   'malformed_model_message',
   'unexpected_block',

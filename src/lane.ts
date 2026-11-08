@@ -7,7 +7,7 @@ import type { FnTool, InItem, Part } from './api/request.ts'
 import { type EventSink, newId, type ResponseState, usageObject, type UsageTotals } from './api/stream.ts'
 import { type Bridge, type BridgeTarget, McpCallError, StaleEpoch } from './bridge.ts'
 import { userContentBlocks } from './claude/entries.ts'
-import { isNoResponseFrame, resultError } from './claude/failure.ts'
+import { resultError } from './claude/failure.ts'
 import { ClaudeProcess, executableIdentity, type Frame } from './claude/process.ts'
 import type { CallAliases } from './call_ids.ts'
 import { type LaunchSpec, logPath, MAX_RESULT_CHARS, MCP_PREFIX, mcpConfigJson, projectDir, settingsJson, systemPrompt } from './claude/pins.ts'
@@ -89,7 +89,6 @@ export class Active {
   ownsTurn = false
   /** The turn's result arrived. */
   turnEnded = false
-  noResponse = false
   /** Its record is being cut from the log. */
   finishing = false
   constructor(
@@ -612,9 +611,6 @@ export class Lane implements BridgeTarget {
   private onFrame(f: Frame): void {
     if (this.dead) return
     switch (f.type) {
-      case 'assistant':
-        if (this.active?.ownsTurn && isNoResponseFrame(f)) this.active.noResponse = true
-        break
       case 'transcript_mirror':
         for (const e of f.entries ?? []) this.mirror(e)
         break
@@ -679,7 +675,7 @@ export class Lane implements BridgeTarget {
     const a = this.active
     // a result can only end the active response's own turn, never the previous one's
     if (!a || a.finished || !a.ownsTurn) return
-    if (f.is_error) return this.fail(resultError(f, this.rateLimit, a.noResponse))
+    if (f.is_error) return this.fail(resultError(f, this.rateLimit))
     if (!a.msg?.stopped) {
       return this.fail(serverError('turn_ended_without_message', `Claude Code ended its turn without a model message: ${String(f.result ?? '').slice(0, 300)}`))
     }
