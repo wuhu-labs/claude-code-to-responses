@@ -127,7 +127,7 @@ reads `~/.claude`.
   | `unexpected_control_request` | Claude Code asked the host something (a permission prompt) it should never need. |
   | `claude_code_exited`, `claude_code_killed`, `claude_code_stdin`, `claude_code_error` | The process exited, was killed, could not be written to, or ended the turn with an error of its own. |
   | `internal_error` | A bug in the gateway; the process is killed and the next request rebuilds. |
-- **Wuhu retry policy.** The gateway's error-code classification is honored on **WebSocket only**: `upstream_unreachable` is an outage, retried with backoff (at most 300 s apart) until it works, without an attempt limit; `server_error` is transient and bounded to **eight failed attempts** in a row, then the session is marked errored; an unrecognized code is terminal. On **SSE**, Wuhu currently treats every `response.failed` as transient regardless of its error code, including `upstream_unreachable` and `claude_code_error`, with the same eight-attempt bound.
+- **Wuhu retry policy.** Wuhu classifies the gateway's error code the same way on SSE and WebSocket, before or after output has streamed: `upstream_unreachable` is an outage, retried with backoff (at most 300 s apart) until it works, without an attempt limit; `server_error` is transient and bounded to **eight failed attempts** in a row, then the session is marked errored; an unrecognized code is terminal.
 - Events are the standard streaming events: `response.created`, `response.in_progress`, `response.output_item.added`
   / `.done`, `response.content_part.added` / `.done`, `response.output_text.delta` / `.done`,
   `response.reasoning_text.delta` / `.done`, `response.function_call_arguments.delta` / `.done`, and one final
@@ -151,9 +151,8 @@ reads `~/.claude`.
   memory. A 429 after output has streamed (a second inference inside one response) still ends it with
   `response.failed`, with `response.error.status: 429`, `response.error.headers["retry-after"]` holding the same
   capped seconds string as a pre-output 429, and the same `limit_type` and `resets_at`. This shape is identical on
-  SSE and WebSocket. The Wuhu kernel reads these error fields only over WebSocket, where it can classify the
-  failure and read its wait after output. Its SSE parser reads only `response.status` and discards `response.error`,
-  so an after-output 429 over SSE is treated as transient. Over HTTP/SSE the stream
+  SSE and WebSocket, and the Wuhu kernel reads these error fields on both, so it classifies the failure and reads
+  its wait after output too. Over HTTP/SSE the stream
   carries only standard Responses events: usage reports (`codex.rate_limits`) go to WebSocket clients alone, since
   an SSE stream ends with its response and the report often arrives just after (see below).
 - Each response object carries `x_gateway`: how it reached Claude Code (`new`, `live`, `store`, `history`), how many
