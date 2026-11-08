@@ -128,8 +128,8 @@ for (
       assertEquals(order, ['persist', 'terminal', 'kill'])
       assertEquals(terminal.length, 1)
       const isMalformed = MALFORMED_REASONS.includes(c.reason as MalformedReason)
-      assertEquals(terminal[0].error.code, isMalformed ? 'malformed_model_message' : c.reason)
-      assertEquals(terminal[0].error.reason, isMalformed ? c.reason : undefined)
+      assertEquals(terminal[0].error.code, isMalformed ? 'server_error' : c.reason)
+      assertEquals(terminal[0].error.reason, undefined)
       assert(atKill)
       const d = atKill as FailureDiagnostic
       assertEquals([d.response_id, d.previous_response_id, d.claude_session_id, d.message_id], [state.id, 'resp_previous', 'session_safe', 'msg_safe'])
@@ -201,7 +201,7 @@ Deno.test('failure diagnostics: log survives reopening, rotates with bounded byt
       previous_response_id: null,
       claude_session_id: 'session_safe',
       message_id: 'msg_safe',
-      code: 'malformed_model_message',
+      code: 'server_error',
       reason: 'name_charset',
       block_index: 0,
       failed_field: 'name',
@@ -250,7 +250,7 @@ for (const transport of ['sse', 'websocket'] as const) {
         run.fake.reply({ blocks: [{ type: 'tool_use', id: 'toolu_bad', name: 'private/tool', input: { 'PRIVATE-KEY': 'PRIVATE-VALUE' } }] })
         const failed = await run.send([user('PRIVATE-PROMPT')])
         await lane.gone
-        assertEquals([failed.status, failed.response.error.code, failed.response.error.reason], ['failed', 'malformed_model_message', 'name_charset'])
+        assertEquals([failed.status, failed.response.error.code], ['failed', 'server_error'])
         assert(atKill)
         const raw = atKill as string
         const record = JSON.parse(raw)
@@ -290,7 +290,7 @@ for (const transport of ['sse', 'websocket'] as const) {
       run.fake.reply({ blocks: [{ type: 'tool_use', id: 'toolu_bad', name: 'private/tool', input: {} }] })
       const failed = await run.send([user('go')])
       await lane.gone
-      assertEquals(failed.response.error.reason, 'name_charset')
+      assertEquals(failed.response.error.code, 'server_error')
       assertEquals(failed.response.error.diagnostic_error, 'failure_diagnostics_write_failed')
       assertEquals(run.tg.gw.lanes.size, 0)
       assertEquals(run.fake.main().length, 2, 'no automatic regeneration/fallback')
@@ -330,7 +330,7 @@ for (const transport of ['sse', 'websocket'] as const) {
         const failed = await run.send([user('go')])
         await run.tg.waitEvent('kill', (d) => d.session === failed.response.x_gateway.session)
         assertEquals(writes, 2)
-        assertEquals(failed.response.error.reason, 'name_charset')
+        assertEquals(failed.response.error.code, 'server_error')
         assertEquals(failed.response.error.diagnostic_error, 'failure_diagnostics_write_failed')
         assertEquals(Deno.readTextFileSync(path), baseline, 'incomplete append was rolled back without damaging earlier records')
         assertEquals(journal.length, 1)
@@ -362,7 +362,7 @@ Deno.test('failure diagnostics: append recovers an unterminated suffix, includin
       previous_response_id: null,
       claude_session_id: 'session_safe',
       message_id: 'msg_safe',
-      code: 'malformed_model_message',
+      code: 'server_error',
       reason: 'name_charset',
       block_index: 0,
       failed_field: 'name',

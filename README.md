@@ -110,19 +110,18 @@ reads `~/.claude`.
   | `websocket_response_in_progress` | `409`: a second create arrived before the socket's active response ended. |
   | `response_too_large` | `413`: an outbound message or terminal batch exceeds its byte limit; reports required/allowed bytes, closes `1009`, and is nonretryable without changing input. |
   | `websocket_message_too_large` | `413`: an inbound message exceeds 128 MiB; the socket closes with `1009`. |
-  | `websocket_backpressure` | `429`: buffered outbound bytes exceed 128 MiB, or output makes no draining progress for 5 s; the socket closes with `1013`. |
   | `not_found`, `response_not_in_progress` | Cancel of an unknown response, or of one that is no longer streaming. |
   | `shutting_down` | `503`: the gateway is stopping. |
   | `cancelled` | The response was cancelled (by the cancel route or a client that went away). |
   | `context_length_exceeded` | Claude Code hit its blocking context limit; auto-compaction is off, so compaction is the client's job. |
   | `usage_limit_reached` | `429`: the subscription's usage limit, with a known reset (Claude Code's `rate_limit_event` said `rejected` with `resetsAt`). `Retry-After: min(reset − now, 3600)` seconds; the error object adds `limit_type` (Claude Code's `rateLimitType`: `five_hour`, `seven_day`, `seven_day_opus`, …, or `null` if unreported) and `resets_at` (the exact reset, epoch seconds). |
   | `upstream_invalid_request`, `upstream_authentication_error`, `rate_limit_exceeded`, `upstream_error` | The backend answered 4xx, 401/403, 429, or an unrecognized status. Claude Code's own retries are off: the client's retry policy is the only one. A 429 without a known reset is `rate_limit_exceeded`, without `Retry-After`: Claude Code 2.1.284 passes no backend `retry-after` to the gateway (probed). |
-  | `server_error` | Retryable upstream failure on SSE and WebSocket: an integer 500–599 status (including overloaded 529). The gateway emits `response.failed` with `response.error.code: server_error`, the code Wuhu already retries; it never retries Claude Code itself. Wuhu's transport-specific retry behavior is described below. |
+  | `server_error` | Retryable upstream failure on SSE and WebSocket: an integer 500–599 status (including overloaded 529). The gateway emits `response.failed` with `response.error.code: server_error`, the code Wuhu already retries; it never retries Claude Code itself. Wuhu's transport-specific retry behavior is described below. Also a `500` for a malformed model tool call (see below) and for a WebSocket client that doesn't drain (buffered outbound bytes over 128 MiB, or no draining progress for 5 s; the socket closes with `1011`). |
   | `upstream_unreachable` | `502`: Claude Code ended the turn with an `api_error` and no HTTP status, so no response from the backend ever arrived: a refused or reset connection, a DNS or TLS failure, `Request timed out`, or a first-byte stall (`API Error: No response from API (waited …). …`). Only the missing status decides; Claude Code's wording is not a contract and is never matched. `probe/upstream_probe_test.ts` pins the timeout, reset and first-byte-stall shapes on 2.1.284, including the default three-minute first-byte window; the fake endpoint uses a test-only first-party switch to enable that watchdog on loopback. The gateway never retries Claude Code itself. |
   | `unexpected_rate_limit_event` | Claude Code reported its usage in a shape 2.1.284 does not produce; the response fails rather than guess what a later 429 means. |
   | `usage_unsupported` | `404` on `GET /v1/usage`: the backend is not a subscription (`CLAUDE_CODE_OAUTH_TOKEN`), and Claude Code reports usage for none other. |
   | `upstream_stream_cut` | The model stream broke mid-message; streamed output cannot be withdrawn. |
-  | `malformed_model_message`, `unexpected_block` | The model stopped for tool use without a tool call, sent a malformed tool-use id/name or non-object arguments, or sent a block type the subset doesn't carry. |
+  | `unexpected_block` | The model sent a block type the subset doesn't carry. |
   | `turn_ended_without_message`, `notice_undelivered`, `record_incomplete` | Claude Code ended a turn without a model message, did not acknowledge a queued notice within 5 seconds (or a second unacknowledged write was attempted), or did not log what it streamed. |
   | `unexpected_control_request` | Claude Code asked the host something (a permission prompt) it should never need. |
   | `claude_code_exited`, `claude_code_killed`, `claude_code_stdin`, `claude_code_error` | The process exited, was killed, could not be written to, or ended the turn with an error of its own. |
@@ -160,20 +159,8 @@ reads `~/.claude`.
 
 ## Malformed model failures and durable diagnostics
 
-`malformed_model_message` stays the top-level error code. The separate optional `response.error.reason` string identifies the first failed validation,
-identically on HTTP/SSE and WebSocket. It does **not** replace `code`:
-
-```json
-{
-  "type": "response.failed",
-  "response": {
-    "status": "failed",
-    "error": { "code": "malformed_model_message", "message": "The model sent a malformed tool_use block.", "reason": "name_charset" }
-  }
-}
-```
-
-(The example omits other response fields.) Reasons:
+A model that stops for tool use without a tool call, or sends a malformed tool-use id/name/input or non-object arguments, fails as a plain
+`500 server_error`. Which validation failed goes only to the durable diagnostics below, never to the wire. Reasons:
 
 | Reason                       | Failed field / condition                                                       |
 | ---------------------------- | ------------------------------------------------------------------------------ |
@@ -208,8 +195,7 @@ null). No keys or values are retained. For argument failures, `field` describes 
 charset **and** 1–64 length checks pass. Otherwise only its type, length, and the first 16 hex digits of SHA-256 over its UTF-8 bytes are retained; non-string
 names have no hash or value. Never argument values, text/thinking, prompts, raw model frames, tool ids, credentials, or backend error messages.
 
-If storage/fsync fails, the journal line adds `diagnostic_error: "failure_diagnostics_write_failed"`, as does the wire error (retaining the original `code` and
-`reason`). The failure still terminates and kills its lane; a missing durable record is explicit, not a silent detour or a stranded response. Repair the state
+If storage/fsync fails, the journal line adds `diagnostic_error: "failure_diagnostics_write_failed"`, as does the wire error (retaining the original `code`). The failure still terminates and kills its lane; a missing durable record is explicit, not a silent detour or a stranded response. Repair the state
 storage before continuing.
 
 `test/failure_diagnostics_test.ts` drives every malformed failure site with raw frames, asserts persistence before terminal emission and kill, checks value-free
@@ -294,7 +280,7 @@ On WebSocket only, provider-record reasoning `encrypted_content` is sent once, o
 
 The entire final batch (provider-record events plus terminal) is serialized and checked against the message and
 buffer budgets **before success is committed**. A rejected final enqueue cancels the attempt, removes its record,
-and preserves the previous chain head. A deterministic `response_too_large` (413, close 1009) reports required/allowed bytes and must not be retried unchanged; only transient peer backpressure is retryable. HTTP/SSE uses the same boundary: a terminal batch must be
+and preserves the previous chain head. A deterministic `response_too_large` (413, close 1009) reports required/allowed bytes and must not be retried unchanged; a peer that doesn't drain gets a retryable `500 server_error` instead. HTTP/SSE uses the same boundary: a terminal batch must be
 accepted by its stream before the response becomes a continuation point. After acceptance, a later disconnect
 retains the completed response on either transport; enqueue is not an acknowledgement that the peer read or
 parsed the bytes. Overflow before that boundary cancels active work. Fatal size/backpressure errors get one small best-effort typed error followed by

@@ -393,8 +393,8 @@ Deno.test('WebSocket writer bounds buffered bytes and outbound message size with
   socket.bufferedAmount = WS_MAX_BUFFERED_BYTES
   assertEquals(writer.send({ type: 'event' }), false)
   await Promise.resolve()
-  assertEquals(events[0].error.code, 'websocket_backpressure')
-  assertEquals(closes, [1013])
+  assertEquals(events[0].error.code, 'server_error')
+  assertEquals(closes, [1011])
   assertEquals(cancelled, 1)
   writer.disconnect()
   await Promise.resolve()
@@ -410,8 +410,8 @@ Deno.test('WebSocket writer drain deadline closes a slow peer even after the res
   const writer = new SocketWriter(socket as unknown as WebSocket)
   writer.send({ type: 'response.completed' })
   await new Promise((r) => setTimeout(r, WS_DRAIN_TIMEOUT_MS + 100))
-  assertEquals(events.at(-1).error.code, 'websocket_backpressure')
-  assertEquals(closes, [1013])
+  assertEquals(events.at(-1).error.code, 'server_error')
+  assertEquals(closes, [1011])
   assertEquals(writer.isClosed, true)
 })
 

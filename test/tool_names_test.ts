@@ -106,7 +106,7 @@ for (const name of ['mcp__fn__echo', 'echo', 'not_available']) {
     await run.run(async () => {
       run.fake.reply({ blocks: [bare('toolu_bad', name, ['not an object'])] })
       const r = await run.send([user('go')])
-      assertEquals([r.status, r.response.error?.code], ['failed', 'malformed_model_message'])
+      assertEquals([r.status, r.response.error?.code], ['failed', 'server_error'])
     })
   })
 }
@@ -225,7 +225,7 @@ for (
         }
         const failed = await run.send([user('bad header')])
         assert(injected, 'the malformed header reached the lane')
-        assertEquals([failed.status, failed.response.error?.code], ['failed', 'malformed_model_message'])
+        assertEquals([failed.status, failed.response.error?.code], ['failed', 'server_error'])
         assertStringIncludes(failed.response.error.message, 'malformed tool_use block')
         assertEquals(run.drv.calls(failed), [])
         assertEquals(run.tg.events('hold'), [])

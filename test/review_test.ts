@@ -318,7 +318,7 @@ Deno.test('a model message that stops for tool use without calling one fails the
     await run.turn('one')
     const lane = [...run.tg.gw.lanes.values()][0]
     const r = await run.send([user('two')])
-    assertEquals([r.status, r.response.error.code, r.response.error.reason], ['failed', 'malformed_model_message', 'tool_use_without_tool'])
+    assertEquals([r.status, r.response.error.code], ['failed', 'server_error'])
     // Claude Code can issue its native empty-tool recovery before the gateway observes stdout and fsyncs
     // the failure. Do not let that rejected child consume the fixture intended for the client's retry.
     await lane.gone

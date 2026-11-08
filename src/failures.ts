@@ -58,6 +58,7 @@ export interface MalformedDetails {
   input: Shape | null
 }
 
+/** A plain `500 server_error` on the wire; its reason and details go only to `failures.jsonl`. */
 export class MalformedModelError extends GatewayError {
   constructor(readonly reason: MalformedReason, readonly details: MalformedDetails) {
     const message = details.failed_field === 'arguments'
@@ -65,7 +66,7 @@ export class MalformedModelError extends GatewayError {
       : details.failed_field === 'stop_reason'
       ? 'The model stopped for tool use without calling a tool.'
       : 'The model sent a malformed tool_use block.'
-    super(500, 'server_error', 'malformed_model_message', message, null, { extra: { reason } })
+    super(500, 'server_error', 'server_error', message)
   }
 }
 

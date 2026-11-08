@@ -3,7 +3,7 @@ import { Buffer } from 'node:buffer'
 // OpenAI Responses WebSocket subset: one create in flight, text JSON events, no cancel message.
 import { parseRequest } from './api/request.ts'
 import { type EventSink, GatedSink, type SinkEvent } from './api/stream.ts'
-import { asGatewayError, GatewayError, invalid, unsupported } from './errors.ts'
+import { asGatewayError, GatewayError, invalid, serverError, unsupported } from './errors.ts'
 import type { Gateway } from './gateway.ts'
 
 type Json = any
@@ -78,7 +78,7 @@ export class SocketWriter {
 
   private hasCapacity(size: number): boolean {
     if (size + this.socket.bufferedAmount <= WS_MAX_BUFFERED_BYTES) return true
-    this.fail(new GatewayError(429, 'server_error', 'websocket_backpressure', 'The client is not draining the bounded WebSocket output buffer.'), 1013)
+    this.fail(serverError('server_error', 'The client is not draining the bounded WebSocket output buffer.'), 1011)
     return false
   }
 
@@ -93,7 +93,7 @@ export class SocketWriter {
         } else if (buffered < this.lastBuffered) {
           this.pendingSince = Date.now()
         } else if (Date.now() - this.pendingSince! >= WS_DRAIN_TIMEOUT_MS) {
-          this.fail(new GatewayError(429, 'server_error', 'websocket_backpressure', 'The client did not drain WebSocket output within 5 seconds.'), 1013)
+          this.fail(serverError('server_error', 'The client did not drain WebSocket output within 5 seconds.'), 1011)
         }
         this.lastBuffered = buffered
       }, 25)

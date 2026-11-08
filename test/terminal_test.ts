@@ -72,8 +72,8 @@ Deno.test('terminal batch preflight rejects aggregate WebSocket backpressure bef
   const prepare = writer.prepare([{ type: 'response.output_item.done', item: 'x'.repeat(40) }, { type: 'response.completed', response: 'y'.repeat(40) }])
   assertEquals(prepare, null)
   assertEquals(sent.map((e) => e.type), ['error'])
-  assertEquals(sent[0].error.code, 'websocket_backpressure')
-  assertEquals(closes, [1013])
+  assertEquals(sent[0].error.code, 'server_error')
+  assertEquals(closes, [1011])
 })
 
 Deno.test('SSE cancellation exactly between terminal preflight and enqueue rolls back disk and preserves the previous head', async () => {
