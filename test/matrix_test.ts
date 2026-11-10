@@ -309,7 +309,7 @@ scenarioTest('typed errors: the subset, unknown ids, wrong outputs, a busy chain
     assertEquals(done.status, 'completed')
 
     // the blocking context limit: auto-compaction is off, so Claude Code refuses and the gateway says so
-    run.fake.reply({ blocks: [text('huge')], usage: { input_tokens: 960_000 } })
+    run.fake.reply({ blocks: [text('huge')], usage: { input_tokens: 990_000 } })
     const big = await send(run.tg.client, { ...base, input: 'L1' })
     assertEquals(big.status, 'completed')
     const over = await send(run.tg.client, { ...base, previous_response_id: big.response.id, input: 'L2' })

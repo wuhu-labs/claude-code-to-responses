@@ -50,6 +50,8 @@ export interface ProbeOpts {
   /** A log to write before resuming. */
   log?: string[]
   systemPrompt?: string
+  /** `--model`; the gateway passes the request's model. Default claude-opus-5-5. */
+  model?: string
 }
 
 export class ProbeRun {
@@ -76,7 +78,7 @@ export class ProbeRun {
       binary: CLAUDE,
       sessionId: o.sessionId ?? crypto.randomUUID(),
       resume: o.resume ?? false,
-      model: 'claude-opus-5-5',
+      model: o.model ?? 'claude-opus-5-5',
       effort: 'high',
       systemPromptPath: `${root}/${o.name}.system-prompt.txt`,
       workDir: Deno.realPathSync(workDir),

@@ -741,7 +741,7 @@ function deliveryFor(head: Head | null, input: InItem[], isNew = true): Delivery
       notice = { parts: [{ type: 'text', text }] }
     }
   }
-  // G$ on 2.1.284 checks the LAST block after trim(), not the renderer or the first text.
+  // Claude Code's queue check (2.1.322) looks at the LAST block after trim(), not the renderer or the first text.
   // Such queued inputs are skipped in the current drain and run as their own turn afterwards.
   // Synthesized history uses attachments directly and never goes through that live drain.
   const last = notice ? userContentBlocks(notice.parts).at(-1) : undefined

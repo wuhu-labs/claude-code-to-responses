@@ -1,6 +1,6 @@
 // Subscription usage: a backend 429 that says when the limit resets, and `codex.rate_limits` on the WebSocket.
 // Claude Code reports usage (`rate_limit_event`) only with a subscription token, so these runs use a fake OAuth token
-// against the fake endpoint (probe/probe_test.ts pins what 2.1.284 makes of each response).
+// against the fake endpoint (probe/probe_test.ts pins what 2.1.322 makes of each response).
 import { assert, assertEquals, assertThrows } from '@std/assert'
 import {
   codexRateLimits,
@@ -59,7 +59,7 @@ function kernelParse(event: Json): { primary?: Json; secondary?: Json; plan?: st
 
 // ---- units -------------------------------------------------------------------------------------------
 
-Deno.test('rate_limit_event: the shapes 2.1.284 produces parse; anything else is a RateLimitShapeError', () => {
+Deno.test('rate_limit_event: the shapes 2.1.322 produces parse; anything else is a RateLimitShapeError', () => {
   assertEquals(parseRateLimitEvent({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed', isUsingOverage: false } }), {
     status: 'allowed',
     resetsAt: null,
@@ -75,7 +75,7 @@ Deno.test('rate_limit_event: the shapes 2.1.284 produces parse; anything else is
       isUsingOverage: false,
       unifiedWindows: {
         five_hour: { utilization: 0.25, resetsAt: 1759990000 },
-        seven_day: { utilization: 1.07, resetsAt: 1760000000 },
+        seven_day: { utilization: 1.07, resetsAt: 1760000000, status: 'allowed_warning', surpassedThreshold: 0.9 },
         seven_day_overage_included: { utilization: 0.6, resetsAt: 1760000000 },
       },
     },
@@ -238,7 +238,7 @@ Deno.test('the 429 mapping: a reported reset is usage_limit_reached with a cappe
     windows: {},
     ...w,
   })
-  const e = rateLimitError("You've hit your session limit", rejected({ resetsAt: 1_760_000_600 }), t)
+  const e = rateLimitError("You've hit your 5-hour limit", rejected({ resetsAt: 1_760_000_600 }), t)
   assertEquals([e.status, e.code, e.headers], [429, 'usage_limit_reached', { 'retry-after': '600' }])
   const body: Json = e.toJSON().error
   assertEquals([body.limit_type, body.resets_at], ['five_hour', 1_760_000_600])
@@ -316,7 +316,7 @@ for (const transport of ['sse', 'websocket'] as const) {
         `Retry-After ${retryAfter}`,
       )
       assertEquals([error.code, error.type, error.limit_type, error.resets_at], ['usage_limit_reached', 'server_error', 'five_hour', reset])
-      assert(error.message.includes("You've hit your session limit"), error.message)
+      assert(error.message.includes("You've hit your 5-hour limit"), error.message)
       if (transport === 'websocket') {
         // refused as a request: nothing of the response went out, only the usage report before the error
         assertEquals(events.map((e) => e.type), ['codex.rate_limits', 'error'])

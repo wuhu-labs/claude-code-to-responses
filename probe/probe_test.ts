@@ -56,8 +56,8 @@ probe(
     assertEquals(first.body.model, 'claude-opus-5-5')
     assertEquals(first.body.output_config, { effort: 'high' })
     assertEquals(first.headers['authorization'], 'Bearer probe-key')
-    // only the conversation's own requests reach the backend (plus Claude Code's /api/hello)
-    assertEquals(fake.exchanges.filter((e) => e.kind !== 'main').map((e) => e.path), ['/api/hello'])
+    // only the conversation's own requests reach the backend (CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: no /api/hello)
+    assertEquals(fake.exchanges.filter((e) => e.kind !== 'main').map((e) => e.path), [])
     assertEquals(t.calls.map((c) => c.id), ['toolu_b1'])
   },
 )
@@ -92,7 +92,7 @@ probe('--tools "": no native tools, no Skill tool (paired with --tools default)'
   assert(native.includes('Read') && native.length > 2, native.join(','))
 })
 
-probe('2.1.284: bare and unknown tool names receive native errors and continue with only MCP tools', async (p, fake) => {
+probe('2.1.322: bare and unknown tool names receive native errors and continue with only MCP tools', async (p, fake) => {
   const t = new ProbeTarget(['send_message'])
   const r = p.launch({ name: 'unknown-names', fake, target: t })
   fake.reply({
@@ -199,14 +199,27 @@ probe('ENABLE_TOOL_SEARCH=false: MCP tools load eagerly (paired with true, which
   assert(on.raw.includes('defer_loading'), 'tool search defers tools when enabled')
 })
 
+probe('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1: no /api/hello preconnect to the backend (paired)', async (p, fake) => {
+  for (const [label, v] of [['traffic-off', '1'], ['traffic-on', undefined]] as const) {
+    const from = fake.exchanges.length
+    fake.reply({ blocks: [text('a')] })
+    const r = p.launch({ name: label, fake, target: new ProbeTarget(), env: { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: v } })
+    await r.turn('x')
+    await new Promise((res) => setTimeout(res, 1000))
+    await r.kill()
+    const others = fake.exchanges.slice(from).filter((e) => e.kind !== 'main').map((e) => e.path)
+    assertEquals(others, v === undefined ? ['/api/hello'] : [], label)
+  }
+})
+
 probe('DISABLE_AUTO_COMPACT=1: at the limit the turn ends as blocking_limit, no compaction (paired)', async (p, fake) => {
-  fake.reply({ blocks: [text('huge')], usage: { input_tokens: 960_000 } })
+  fake.reply({ blocks: [text('huge')], usage: { input_tokens: 990_000 } })
   const r = p.launch({ name: 'compact-off', fake, target: new ProbeTarget() })
   await r.turn('one')
   const res = await r.turn('two')
   assertEquals([res.is_error, res.terminal_reason, res.result], [true, 'blocking_limit', 'Prompt is too long'])
   assertEquals(fake.exchanges.filter((e) => e.kind !== 'other').length, 1, 'no second request, no compaction request')
-  fake.reply({ blocks: [text('huge')], usage: { input_tokens: 960_000 } })
+  fake.reply({ blocks: [text('huge')], usage: { input_tokens: 990_000 } })
   const r2 = p.launch({ name: 'compact-on', fake, target: new ProbeTarget(), env: { DISABLE_AUTO_COMPACT: undefined } })
   await r2.turn('one')
   const from = r2.frames.length
@@ -215,13 +228,15 @@ probe('DISABLE_AUTO_COMPACT=1: at the limit the turn ends as blocking_limit, no 
   assert(r2.frames.slice(from).some((f) => f.type === 'system' && f.status === 'compacting'), 'without the pin Claude Code compacts')
 })
 
-probe('CLAUDE_CODE_TOTAL_TOKENS_REMINDER=off: no token counts in the prompt (paired)', async (p, fake) => {
+// Unset, the reminder's default is per model: of the catalog's current models only claude-fable-5-1 gets it.
+probe('CLAUDE_CODE_TOTAL_TOKENS_REMINDER=off: no token counts in the prompt (paired, on a model that shows them by default)', async (p, fake) => {
+  const model = 'claude-fable-5-1'
   fake.reply({ blocks: [call('toolu_t', 'echo', {})] }, { blocks: [text('a')] })
-  await p.launch({ name: 'tokens-off', fake, target: new ProbeTarget() }).turn('x')
+  await p.launch({ name: 'tokens-off', fake, target: new ProbeTarget(), model }).turn('x')
   assert(!reqText(fake).includes('<total_tokens>'))
   const n = fake.main().length
   fake.reply({ blocks: [call('toolu_t2', 'echo', {})] }, { blocks: [text('a')] })
-  await p.launch({ name: 'tokens-on', fake, target: new ProbeTarget(), env: { CLAUDE_CODE_TOTAL_TOKENS_REMINDER: undefined } }).turn('x')
+  await p.launch({ name: 'tokens-on', fake, target: new ProbeTarget(), model, env: { CLAUDE_CODE_TOTAL_TOKENS_REMINDER: undefined } }).turn('x')
   assert(fake.main().slice(n).some((e) => e.raw.includes('<total_tokens>')))
 })
 
@@ -254,26 +269,42 @@ probe('anthropic/maxResultSizeChars + MAX_MCP_OUTPUT_TOKENS: results up to 500,0
   }
 })
 
-probe('CLAUDE_CODE_MAX_RETRIES=0 and the error result: an upstream error ends the turn at once as api_error with its status (paired)', async (p, fake) => {
-  const cases: [number, string][] = [[400, 'invalid_request_error'], [401, 'authentication_error'], [429, 'rate_limit_error'], [500, 'api_error'], [
-    529,
-    'overloaded_error',
-  ]]
-  for (const [status, type] of cases) {
-    const n = fake.main().length
-    fake.reply({ blocks: [text('never')], error: { status, type, message: `probe ${status}` } })
-    const res = await p.launch({ name: `err-${status}`, fake, target: new ProbeTarget() }).turn('x')
-    assertEquals([res.is_error, res.terminal_reason, res.api_error_status], [true, 'api_error', status], String(status))
-    assertStringIncludes(res.result, 'API Error')
-    assertEquals(fake.main().length - n, 1, `${status}: no retry`)
-  }
-  // without the pin Claude Code retries by itself
-  fake.fallback = () => ({ blocks: [text('never')], error: { status: 529, type: 'overloaded_error', message: 'probe' } })
-  const r = p.launch({ name: 'err-retrying', fake, target: new ProbeTarget(), env: { CLAUDE_CODE_MAX_RETRIES: undefined } })
-  await r.user('x')
-  const retry = await r.until((f) => f.type === 'system' && f.subtype === 'api_retry', 20000)
-  assertEquals(retry.error_status, 529)
-})
+probe(
+  'CLAUDE_CODE_MAX_RETRIES=0 and the error result: an upstream error ends the turn as api_error with its status, a 400 after two beta-shedding resends (paired)',
+  async (p, fake) => {
+    const cases: [number, string][] = [[400, 'invalid_request_error'], [401, 'authentication_error'], [429, 'rate_limit_error'], [500, 'api_error'], [
+      529,
+      'overloaded_error',
+    ]]
+    for (const [status, type] of cases) {
+      const n = fake.main().length
+      const reply = { blocks: [text('never')], error: { status, type, message: `probe ${status}` } }
+      fake.reply(...Array(status === 400 ? 3 : 1).fill(reply))
+      const res = await p.launch({ name: `err-${status}`, fake, target: new ProbeTarget() }).turn('x')
+      assertEquals([res.is_error, res.terminal_reason, res.api_error_status], [true, 'api_error', status], String(status))
+      assertStringIncludes(res.result, 'API Error')
+      const sent = fake.main().slice(n)
+      if (status !== 400) {
+        assertEquals(sent.length, 1, `${status}: no retry`)
+        continue
+      }
+      // A 400 (or 422) that is not prompt-too-long is sent twice more whatever MAX_RETRIES says, each time with less:
+      // without the thinking-token-count beta, then also without thinking.display and its beta. Same messages.
+      const betas = sent.map((e) => String(e.headers['anthropic-beta']).split(','))
+      assertEquals(sent.length, 3, '400: two beta-shedding resends')
+      assertEquals([betas[0].includes('thinking-token-count-2026-05-13'), betas[1].includes('thinking-token-count-2026-05-13')], [true, false])
+      assertEquals([betas[1].includes('thinking-display-updates-2026-08-18'), betas[2].includes('thinking-display-updates-2026-08-18')], [true, false])
+      assertEquals(sent.map((e) => e.body.thinking?.display), ['updates', 'updates', undefined])
+      assertEquals(new Set(sent.map((e) => JSON.stringify(e.body.messages))).size, 1)
+    }
+    // without the pin Claude Code retries by itself
+    fake.fallback = () => ({ blocks: [text('never')], error: { status: 529, type: 'overloaded_error', message: 'probe' } })
+    const r = p.launch({ name: 'err-retrying', fake, target: new ProbeTarget(), env: { CLAUDE_CODE_MAX_RETRIES: undefined } })
+    await r.user('x')
+    const retry = await r.until((f) => f.type === 'system' && f.subtype === 'api_retry', 20000)
+    assertEquals(retry.error_status, 529)
+  },
+)
 
 probe(
   'MAX_MCP_OUTPUT_TOKENS lifts the 25,000-token cap on MCP results (paired, without the size annotation); with the annotation it is a backstop only',
@@ -415,6 +446,29 @@ probe('a resumed log without the atis-latch line gets one written outside the mi
   }
 })
 
+probe(
+  'CLAUDE_CODE_ELEGANT_MEADOW=0: the log holds only mirrored lines; unset, request-replay lines copying the request are written outside the mirror (paired)',
+  async (p, fake) => {
+    for (const [label, v] of [['meadow-off', '0'], ['meadow-on', undefined]] as const) {
+      fake.reply({ blocks: [call(`toolu_${label.replace('-', '')}`, 'echo', {})] }, { blocks: [text('a')] })
+      const r = p.launch({ name: label, fake, target: new ProbeTarget(), env: { CLAUDE_CODE_ELEGANT_MEADOW: v } })
+      await r.turn('x')
+      await new Promise((res) => setTimeout(res, 300))
+      await r.kill()
+      const mirrored = r.frames.filter((f) => f.type === 'transcript_mirror').flatMap((f) => f.entries.map((e: Json) => JSON.stringify(e)))
+      const extra = r.log().filter((l) => !mirrored.includes(l))
+      if (v !== undefined) {
+        assertEquals(r.log(), mirrored, label)
+        continue
+      }
+      assert(extra.length > 0 && extra.every((l) => JSON.parse(l).type.startsWith('api-request')), extra.map((l) => JSON.parse(l).type).join(','))
+      // the system prompt and tools, every message not already in the log (the environment block), the request params
+      assertEquals([...new Set(extra.map((l) => JSON.parse(l).type))], ['api-request-shape', 'api-request-blob', 'api-request'])
+      assert(extra.some((l) => l.includes('You are a probe.') && l.includes('mcp__fn__echo')), 'the shape line copies the prompt and tools')
+    }
+  },
+)
+
 probe('TZ decides the date Claude Code announces', async (p, fake) => {
   for (const tz of ['Etc/GMT+12', 'Etc/GMT-14']) {
     fake.reply({ blocks: [text('a')] })
@@ -439,7 +493,7 @@ probe('MCP server timeout 2147483647: a call held 65 s still returns (the HTTP d
   assertStringIncludes(fake.main().at(-1)!.raw, 'AFTER 65 S')
 })
 
-probe('2.1.284: images in an appended user log entry resume as real base64 image blocks immediately after tool results', async (p, fake) => {
+probe('2.1.322: images in an appended user log entry resume as real base64 image blocks immediately after tool results', async (p, fake) => {
   const t = new ProbeTarget(['hold'])
   fake.reply({ blocks: [call('toolu_img', 'hold', {})] })
   const a = p.launch({ name: 'image-a', fake, target: t })
@@ -765,6 +819,8 @@ probe(
       '5h-reset': String(r5),
       '7d-utilization': '1.07',
       '7d-reset': String(r7),
+      '7d-status': 'allowed_warning',
+      '7d-surpassed-threshold': '0.9',
       '7d_oi-utilization': '0.6',
       '7d_oi-reset': String(r7),
     })
@@ -796,7 +852,8 @@ probe(
     assertEquals([reports[0].status, reports[0].rateLimitType, reports[0].resetsAt, reports[0].utilization], ['allowed_warning', 'seven_day', r7, 1.07])
     assertEquals(reports[0].unifiedWindows, {
       five_hour: { utilization: 0.3, resetsAt: r5 },
-      seven_day: { utilization: 1.07, resetsAt: r7 },
+      // a window's own status and threshold, when its headers carry them (src/usage.ts reads neither)
+      seven_day: { utilization: 1.07, resetsAt: r7, status: 'allowed_warning', surpassedThreshold: 0.9 },
       seven_day_overage_included: { utilization: 0.6, resetsAt: r7 },
     })
     const types = r.frames.map((f) => f.type === 'stream_event' ? f.event.type : f.type)
@@ -820,10 +877,10 @@ probe(
     const now = Math.floor(Date.now() / 1000), r5 = now + 3600, r7 = now + 4 * 86400
     const cases: { name: string; headers: Record<string, string>; info: Json; result: RegExp }[] = [
       {
-        name: 'session',
+        name: 'five-hour',
         headers: unified({ status: 'rejected', reset: String(r5), 'representative-claim': 'five_hour', '5h-utilization': '1', '5h-reset': String(r5) }),
         info: { status: 'rejected', resetsAt: r5, rateLimitType: 'five_hour', unifiedWindows: { five_hour: { utilization: 1, resetsAt: r5 } } },
-        result: /^You've hit your session limit · resets /,
+        result: /^You've hit your 5-hour limit · resets /,
       },
       {
         name: 'weekly',
@@ -841,7 +898,7 @@ probe(
         name: 'no-reset',
         headers: { ...unified({ status: 'rejected', 'representative-claim': 'five_hour' }), 'retry-after': '98765' },
         info: { status: 'rejected', rateLimitType: 'five_hour' },
-        result: /^You've hit your session limit$/,
+        result: /^You've hit your 5-hour limit$/,
       },
       {
         name: 'bare',

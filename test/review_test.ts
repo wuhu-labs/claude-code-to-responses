@@ -410,7 +410,9 @@ Deno.test('upstream errors map to typed failures, at once: the client owns retri
     ]
     for (const [label, error, code] of cases) {
       const before = run.fake.main().length
-      run.fake.reply({ blocks: [text('never')], error })
+      // Claude Code resends a 400 twice with fewer betas whatever CLAUDE_CODE_MAX_RETRIES says (probe/probe_test.ts)
+      const resends = error.status === 400 ? 2 : 0
+      run.fake.reply(...Array(1 + resends).fill({ blocks: [text('never')], error }))
       const t0 = Date.now()
       if (error.status === 429) {
         // a 429 before any output is refused as a request (test/usage_test.ts covers it on both transports)
@@ -421,7 +423,7 @@ Deno.test('upstream errors map to typed failures, at once: the client owns retri
         assertEquals([r.status, r.response.error.code], ['failed', code], label)
       }
       assert(Date.now() - t0 < 5000, `${label} took ${Date.now() - t0} ms`)
-      assert(run.fake.main().length - before <= 2, `${label}: ${run.fake.main().length - before} requests`)
+      assert(run.fake.main().length - before <= 2 + resends, `${label}: ${run.fake.main().length - before} requests`)
     }
     run.fake.reply({ blocks: [text('fine')] })
     assertEquals((await run.send([user('and now it works')])).status, 'completed')

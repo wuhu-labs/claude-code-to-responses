@@ -2,7 +2,7 @@
 // README.md documents each with the version it was measured on; probe/probe_test.ts asserts each.
 
 /** The only Claude Code version these pins were measured on. Any other version is refused. */
-export const CLAUDE_CODE_VERSION = '2.1.284'
+export const CLAUDE_CODE_VERSION = '2.1.322'
 
 /** MCP server name; the model sees each client tool as `mcp__fn__<name>`. */
 export const MCP_SERVER = 'fn'
@@ -20,7 +20,8 @@ export function systemPrompt(instructions: string): string {
 /** Anthropic tool names are at most 64 characters, so client tool names get what the prefix leaves. */
 export const MAX_TOOL_NAME = 64 - MCP_PREFIX.length
 
-/** Claude Code's ceiling for a per-tool `anthropic/maxResultSizeChars` (2.1.284: rxe=500000).
+/** Claude Code's ceiling for a per-tool `anthropic/maxResultSizeChars` (2.1.322: an annotation of 2,000,000 still moves
+ * a 500,001-character result to a file).
  * Results up to this many characters stay inline; the gateway refuses longer ones. */
 export const MAX_RESULT_CHARS = 500_000
 
@@ -100,6 +101,9 @@ export function launchEnv(s: LaunchSpec): Record<string, string> {
     CLAUDE_CODE_SILENT_TURN_REMINDER: '0',
     MAX_MCP_OUTPUT_TOKENS,
     CLAUDE_CODE_MAX_RETRIES: '0',
+    // 2.1.322 otherwise writes disk-only request-replay lines (api-request-shape/-blob, api-request) that copy every
+    // message, images included, into the log and so into the provider records.
+    CLAUDE_CODE_ELEGANT_MEADOW: '0',
     ...(s.maxOutputTokens != null ? { CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(s.maxOutputTokens) } : {}),
     ...(s.interruptedTurn ? { CLAUDE_CODE_RESUME_INTERRUPTED_TURN: '1' } : {}),
     ...s.backendEnv,

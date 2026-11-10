@@ -1,7 +1,7 @@
 // Subscription usage as Claude Code reports it (`rate_limit_event`), and what the gateway makes of it: a 429 that says
 // when the limit resets, the `codex.rate_limits` WebSocket event Wuhu's kernel puts on its usage board, and the saved
 // windows `GET /v1/usage` serves in the same shape.
-// Measured on 2.1.284 against the fake endpoint (probe/probe_test.ts, "rate_limit_event …").
+// Measured on 2.1.322 against the fake endpoint (probe/probe_test.ts, "rate_limit_event …").
 import { GatewayError } from './errors.ts'
 
 // deno-lint-ignore no-explicit-any
@@ -21,7 +21,8 @@ export interface UsageWindow {
   resetsAt: number
 }
 
-/** The part of 2.1.284's `rate_limit_info` the gateway reads. Everything else in the frame is left alone. */
+/** The part of 2.1.322's `rate_limit_info` the gateway reads. Everything else in the frame (a window's `status` and
+ * `surpassedThreshold` included) is left alone. */
 export interface RateLimitInfo {
   status: 'allowed' | 'allowed_warning' | 'rejected'
   resetsAt: number | null
@@ -37,7 +38,7 @@ const WINDOW_MINUTES: Record<string, number | null> = {
 }
 
 const STATUSES = new Set(['allowed', 'allowed_warning', 'rejected'])
-/** 2.1.284's `rateLimitType` enum. */
+/** 2.1.322's `rateLimitType` enum (the same as 2.1.284's). */
 const LIMIT_TYPES = new Set(['five_hour', 'seven_day', 'seven_day_opus', 'seven_day_sonnet', 'seven_day_overage_included', 'overage'])
 
 export class RateLimitShapeError extends Error {}
@@ -54,7 +55,7 @@ function window(w: Json, name: string): UsageWindow {
 }
 
 /**
- * Reads a `rate_limit_event` frame. A shape 2.1.284 does not produce is a RateLimitShapeError, never a guess: the
+ * Reads a `rate_limit_event` frame. A shape 2.1.322 does not produce is a RateLimitShapeError, never a guess: the
  * lane turns it into the typed `unexpected_rate_limit_event`.
  */
 export function parseRateLimitEvent(frame: Json): RateLimitInfo {
@@ -169,7 +170,7 @@ export function retryAfterSeconds(resetsAt: number, nowMs = Date.now()): number 
 /**
  * A backend 429. With Claude Code's latest report saying `rejected` with a reset time, it is the subscription's usage
  * limit: `usage_limit_reached`, the limit type and exact reset in the body, and a capped `Retry-After`. Otherwise it
- * stays `rate_limit_exceeded`, without `Retry-After`: Claude Code 2.1.284 surfaces no backend `retry-after` (probed).
+ * stays `rate_limit_exceeded`, without `Retry-After`: Claude Code 2.1.322 surfaces no backend `retry-after` (probed).
  */
 export function rateLimitError(text: string, latest: RateLimitInfo | null, nowMs = Date.now()): GatewayError {
   if (latest?.status === 'rejected' && latest.resetsAt !== null) {

@@ -59,7 +59,7 @@ export function contentBlocks(parts: Part[]): Json[] {
 }
 
 /**
- * 2.1.284 dispatches a command-shaped slash token in the LAST user content block (also on interrupted
+ * 2.1.322 dispatches a command-shaped slash token in the LAST user content block (also on interrupted
  * resume), even after other text/images. One ASCII space disables dispatch without hiding the text.
  * Leading whitespace, paths/punctuation and an image-ending message already bypass dispatch.
  * Do not use this for tool results, assistant blocks or hook context: none is command input.
@@ -84,7 +84,7 @@ export function toolResultEntry(ctx: LogContext, callId: string, parts: Part[], 
 }
 
 /**
- * Claude Code's own answer to a call of a tool it doesn't have, as 2.1.284 logs it the moment the call streams in.
+ * Claude Code's own answer to a call of a tool it doesn't have, as 2.1.322 logs it the moment the call streams in.
  * Used only when eviction leaves a native call unanswered after a held client call; preserve its actual name.
  */
 export function unknownToolEntry(ctx: LogContext, callId: string, mcpName: string, assistantUuid: string | null): Json {

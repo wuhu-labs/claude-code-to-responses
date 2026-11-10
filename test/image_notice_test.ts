@@ -44,7 +44,8 @@ for (const path of ['live', 'evicted', 'history'] as const) {
       assert(JSON.stringify(content).includes('after image'))
       const rec = await decodeRecord(r.response.output.at(-1).encrypted_content)
       assertExists(rec)
-      const noticeEntries = replayLog(rec, run.tg.gw.store).filter((e) => e.includes('NOTICE before image'))
+      // live, the queue's `remove` entry carries the notice text too (2.1.322); the model sees the attachment
+      const noticeEntries = replayLog(rec, run.tg.gw.store).filter((e) => e.includes('NOTICE before image') && JSON.parse(e).type !== 'queue-operation')
       assertEquals(noticeEntries.length, 1)
       assertEquals(JSON.parse(noticeEntries[0]).attachment.type, 'queued_command')
       await run.disrupt('idle')

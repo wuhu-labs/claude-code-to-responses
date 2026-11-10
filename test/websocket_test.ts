@@ -419,7 +419,9 @@ Deno.test('WebSocket model failures use response.failed and leave the connection
   const run = new Run('ws-terminals', false)
   await run.run(async () => {
     const ws = run.tg.websocket()
-    run.fake.reply({ blocks: [], error: { status: 400, type: 'invalid_request_error', message: 'context too long: 250000 tokens > 200000' } })
+    // three: Claude Code resends a 400 twice with fewer betas before it gives up
+    const refused = { blocks: [], error: { status: 400, type: 'invalid_request_error', message: 'context too long: 250000 tokens > 200000' } }
+    run.fake.reply(refused, refused, refused)
     const b = await ws.send({ ...base, input: 'context overflow' })
     assertEquals(b.events.at(-1).type, 'response.failed')
     assertEquals(b.response.error.code, 'upstream_invalid_request')

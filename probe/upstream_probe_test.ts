@@ -16,7 +16,7 @@ const cases = [
 ] as const
 
 for (const c of cases) {
-  Deno.test(`upstream ${c.name}: pin Claude Code 2.1.284 result and synthetic assistant, then classify`, async () => {
+  Deno.test(`upstream ${c.name}: pin Claude Code 2.1.322 result and synthetic assistant, then classify`, async () => {
     const p = new Probe()
     const fake = new FakeAnthropic(freePort())
     const listener = c.name === 'reset' ? Deno.listen({ hostname: '127.0.0.1', port: freePort() }) : null
@@ -58,8 +58,9 @@ for (const c of cases) {
       assertEquals(assistant[0].message.content, [{ type: 'text', text: result.result }])
       if ('status' in c) assertStringIncludes(result.result, `API Error: ${c.status} probe ${c.status}. This is a server-side issue, usually temporary`)
       else if (c.name === 'timeout') assertEquals(result.result, 'Request timed out')
-      else if (c.name === 'reset') assertEquals(result.result, 'API Error: Connection dropped (ECONNRESET)')
-      else {
+      else if (c.name === 'reset') {
+        assertEquals(result.result, 'API Error: Connection dropped (ECONNRESET). Check the gateway set in ANTHROPIC_BASE_URL, then try again.')
+      } else {
         assertEquals(assistant[0].api_error, 'no_response')
         assertStringIncludes(result.result, STALL_ADVICE)
         if (c.name === 'no-response-short') assertEquals(result.result, `API Error: No response from API (waited 11s). ${STALL_ADVICE}`)

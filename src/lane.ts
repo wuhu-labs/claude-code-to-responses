@@ -464,7 +464,8 @@ export class Lane implements BridgeTarget {
   }
 
   /** A single stdin writer, with at most one unacknowledged mid-turn write. Queue-operation entries
-   * have no content/id in 2.1.284: the next mirrored enqueue acknowledges this write. Earlier turn
+   * enqueue entries have no content/id in 2.1.322 (only the later remove does): the next mirrored enqueue
+   * acknowledges this write. Earlier turn
    * enqueues precede the assistant mirror that completed the head; no other writer can race it.
    * Do not publish results before the ack: even an MCP call arriving during the write must wait. */
   async release(outputs: Map<string, Part[]>, notices: Part[] | null): Promise<void> {
@@ -632,7 +633,7 @@ export class Lane implements BridgeTarget {
 
   /**
    * Claude Code's usage report: on every change, a normal success included (see src/usage.ts). It decides what a later
-   * 429 is, and goes to a WebSocket client as `codex.rate_limits`. A shape 2.1.284 does not produce fails the active
+   * 429 is, and goes to a WebSocket client as `codex.rate_limits`. A shape 2.1.322 does not produce fails the active
    * response; at rest it is noted, and the lane forgets what it knew rather than keep a report it cannot trust.
    */
   private onRateLimit(f: Frame): void {
@@ -644,7 +645,7 @@ export class Lane implements BridgeTarget {
       this.rateLimit = null
       const detail = `${e.message}: ${JSON.stringify(f.rate_limit_info ?? null).slice(0, 300)}`
       this.events.note('unexpected_rate_limit_event', { session: this.sessionId, message: detail })
-      this.fail(serverError('unexpected_rate_limit_event', `Claude Code reported its usage in a shape 2.1.284 does not produce (${detail}).`))
+      this.fail(serverError('unexpected_rate_limit_event', `Claude Code reported its usage in a shape 2.1.322 does not produce (${detail}).`))
       return
     }
     this.rateLimit = info

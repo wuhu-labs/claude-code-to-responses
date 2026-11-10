@@ -5,14 +5,14 @@ A stateful OpenAI Responses API server in front of Claude Code. A client sends n
 calls until the client posts their outputs, and can kill and rebuild that process without losing the prompt cache.
 To the client it is just another Responses endpoint.
 
-Measured on **Claude Code 2.1.284**, the only version the gateway accepts (it checks `claude --version` at startup).
+Measured on **Claude Code 2.1.322**, the only version the gateway accepts (it checks `claude --version` at startup).
 
 ## Run it
 
 ```sh
 CLAUDE_CODE_OAUTH_TOKEN=… deno run -A src/main.ts \
   --state-dir ~/.local/state/claude-code-to-responses \
-  --claude ~/.wuhu/vendors/claude/2.1.284/claude
+  --claude ~/.wuhu/vendors/claude/2.1.322/claude
 # or: deno task compile, then .state/bin/claude-code-to-responses with the same options
 ```
 
@@ -23,7 +23,7 @@ CLAUDE_CODE_OAUTH_TOKEN=… deno run -A src/main.ts \
 | `--state-dir` | required | Response store (`responses/`, `tails/`), the gateway's Claude Code config folder and scratch home (`claude/config`, `claude/home`), its device id (`device-id`), the account's last usage report (`usage.json`), per-process files (`run/`), sanitized failure diagnostics (`failures.jsonl`, one rotated archive `failures.jsonl.1`). |
 | `--work-dir` | `/tmp/claude-code-to-responses` | The one working folder of every session. Keep it the same absolute path on every machine; it must be outside any git repository (checked at startup). Claude Code reports its real path (`/private/tmp/…` on macOS). |
 | `--device-id` | generated once into `<state-dir>/device-id` | The Claude Code device id every session sends in `metadata.user_id` (also `CLAUDE_CODE_TO_RESPONSES_DEVICE_ID`). 64 lowercase hex digits, or a startup error. Give the same id to every gateway that should share a backend cache. |
-| `--claude` | required | The Claude Code 2.1.284 binary. |
+| `--claude` | required | The Claude Code 2.1.322 binary. |
 | `--bridge-port` | any free port | Loopback port Claude Code calls for MCP tools. |
 | `--tz` | `UTC` | `TZ` of every Claude Code process. |
 | `--idle-timeout` | 1800 s | Kill a process that sits at a finished turn this long. |
@@ -64,7 +64,7 @@ reads `~/.claude`.
   byte, else `400 previous_response_not_found`; a full create is how the client starts a changed chain. Older records
   without a saved prompt still work with explicit instructions; if the live chain is also gone, omission gives
   `previous_response_not_found`, never an invented prompt or automatic detour.
-- **Output cap.** `max_output_tokens` becomes `CLAUDE_CODE_MAX_OUTPUT_TOKENS` on every launch/rebuild. On 2.1.284
+- **Output cap.** `max_output_tokens` becomes `CLAUDE_CODE_MAX_OUTPUT_TOKENS` on every launch/rebuild. On 2.1.322
   the paired fake-endpoint probe measures upstream `max_tokens`: unset = 128000, 4096 = 4096, 8192 = 8192.
   Positive safe integers are accepted; absent or `null` leaves Claude Code’s default. The cap is fixed per chain:
   changing it, adding it, or removing it with `previous_response_id` gives `400 previous_response_not_found` before
@@ -115,10 +115,10 @@ reads `~/.claude`.
   | `cancelled` | The response was cancelled (by the cancel route or a client that went away). |
   | `context_length_exceeded` | Claude Code hit its blocking context limit; auto-compaction is off, so compaction is the client's job. |
   | `usage_limit_reached` | `429`: the subscription's usage limit, with a known reset (Claude Code's `rate_limit_event` said `rejected` with `resetsAt`). `Retry-After: min(reset − now, 3600)` seconds; the error object adds `limit_type` (Claude Code's `rateLimitType`: `five_hour`, `seven_day`, `seven_day_opus`, …, or `null` if unreported) and `resets_at` (the exact reset, epoch seconds). |
-  | `upstream_invalid_request`, `upstream_authentication_error`, `rate_limit_exceeded`, `upstream_error` | The backend answered 4xx, 401/403, 429, or an unrecognized status. Claude Code's own retries are off: the client's retry policy is the only one. A 429 without a known reset is `rate_limit_exceeded`, without `Retry-After`: Claude Code 2.1.284 passes no backend `retry-after` to the gateway (probed). |
+  | `upstream_invalid_request`, `upstream_authentication_error`, `rate_limit_exceeded`, `upstream_error` | The backend answered 4xx, 401/403, 429, or an unrecognized status. Claude Code's own retries are off: the client's retry policy is the only one, with one exception no variable turns off: a 400 or 422 that is not a too-long prompt is sent twice more, each time with fewer betas, before the turn fails (see `CLAUDE_CODE_MAX_RETRIES` under the pins). A 429 without a known reset is `rate_limit_exceeded`, without `Retry-After`: Claude Code 2.1.322 passes no backend `retry-after` to the gateway (probed). |
   | `server_error` | Retryable upstream failure on SSE and WebSocket: an integer 500–599 status (including overloaded 529). The gateway emits `response.failed` with `response.error.code: server_error`, the code Wuhu already retries; it never retries Claude Code itself. Wuhu's transport-specific retry behavior is described below. Also a `500` for a malformed model tool call (see below) and for a WebSocket client that doesn't drain (buffered outbound bytes over 128 MiB, or no draining progress for 5 s; the socket closes with `1011`). |
-  | `upstream_unreachable` | `502`: Claude Code ended the turn with an `api_error` and no HTTP status, so no response from the backend ever arrived: a refused or reset connection, a DNS or TLS failure, `Request timed out`, or a first-byte stall (`API Error: No response from API (waited …). …`). Only the missing status decides; Claude Code's wording is not a contract and is never matched. `probe/upstream_probe_test.ts` pins the timeout, reset and first-byte-stall shapes on 2.1.284, including the default three-minute first-byte window; the fake endpoint uses a test-only first-party switch to enable that watchdog on loopback. The gateway never retries Claude Code itself. |
-  | `unexpected_rate_limit_event` | Claude Code reported its usage in a shape 2.1.284 does not produce; the response fails rather than guess what a later 429 means. |
+  | `upstream_unreachable` | `502`: Claude Code ended the turn with an `api_error` and no HTTP status, so no response from the backend ever arrived: a refused or reset connection, a DNS or TLS failure, `Request timed out`, or a first-byte stall (`API Error: No response from API (waited …). …`). Only the missing status decides; Claude Code's wording is not a contract and is never matched. `probe/upstream_probe_test.ts` pins the timeout, reset and first-byte-stall shapes on 2.1.322, including the default three-minute first-byte window; the fake endpoint uses a test-only first-party switch to enable that watchdog on loopback. The gateway never retries Claude Code itself. |
+  | `unexpected_rate_limit_event` | Claude Code reported its usage in a shape 2.1.322 does not produce; the response fails rather than guess what a later 429 means. |
   | `usage_unsupported` | `404` on `GET /v1/usage`: the backend is not a subscription (`CLAUDE_CODE_OAUTH_TOKEN`), and Claude Code reports usage for none other. |
   | `upstream_stream_cut` | The model stream broke mid-message; streamed output cannot be withdrawn. |
   | `unexpected_block` | The model sent a block type the subset doesn't carry. |
@@ -241,7 +241,7 @@ the shape Wuhu's kernel parses (`codexSocketUsage`): the 5-hour window is `prima
 `secondary` (10080). All reported timed windows also appear under `rate_limits.windows`, keyed by their original Claude names (including `seven_day_overage_included`), in the same `{used_percent, window_minutes, reset_at}` shape. The aliases remain unchanged for older servers. Each report logs the raw window names, utilization and reset numbers only. `used_percent` is Claude Code's utilization × 100, capped at 100 (utilization may run past the
 cap); `reset_at` is the window's reset in epoch seconds. Only windows Claude Code reported are sent, and a report
 without any timed window sends no event. `overage` is a credit window without a fixed length: it is validated and logged, but not forwarded as a timed window.
-There is no `plan_type`: Claude Code 2.1.284 reports no plan. The event is outside the response's sequence (no
+There is no `plan_type`: Claude Code 2.1.322 reports no plan. The event is outside the response's sequence (no
 `sequence_number`) and may come at any time: during a response, before its `error`, or in the idle window after
 `response.completed` (Claude Code reports usage after the model's `message_stop`, and a tool-call response
 completes there). It goes to the socket of the last response the Claude Code process served, while that socket is
@@ -363,7 +363,8 @@ calls released. A call racing with the write still waits. Claude Code drains thi
 in the very next model step, without a hook's 10,000-character cap. There is no hook fallback and no image eviction.
 With no held calls, new messages go through stdin as an ordinary user turn.
 
-Queue-operation entries on 2.1.284 carry neither content nor an id. Correlation is the first mirrored enqueue
+Enqueue entries on 2.1.322 carry neither content nor an id (the `remove` entry logged when the queue drains carries
+the notice text, a `commandUuid` and a `deliveryId`, too late to acknowledge the write). Correlation is the first mirrored enqueue
 after the write: the lane is the sole stdin writer, permits only one unacknowledged queue write, and earlier turn
 enqueues precede the assistant mirror that completed the held head. No ack within 5 seconds fails with typed
 `notice_undelivered` and kills the lane; a failed write is `claude_code_stdin`. Neither publishes tool results.
@@ -394,7 +395,7 @@ byte for 40 KB text and image notices. A hold resumed **without** notices retain
 No queue environment knob is needed; `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1` still enables interrupted resumes.
 
 **Slash-command safety.** Client text is model input, never a Claude Code command; `/compact` is client-owned.
-Claude Code 2.1.284 dispatches a slash command from the **last content block** of stdin user input or the last
+Claude Code 2.1.322 dispatches a slash command from the **last content block** of stdin user input or the last
 appended user entry on an interrupted-turn resume, even when earlier blocks contain text or images. For a final
 text block beginning with a command-shaped token (`/^\/\w[\w:-]*(?=\s|$)/`), the gateway prepends **one ASCII
 space** to that block only: `/compact` becomes ` /compact`. The text is not dropped or escaped, and all other
@@ -413,7 +414,7 @@ records keep the actual transformed log bytes, so evictions and lost-store rebui
 **Native unknown-tool recovery.** Only a declared client tool called by its exact MCP name (`mcp__fn__<name>`)
 is surfaced as a `function_call` and held for the client's output. Every other well-formed name—including a bare
 client name such as `send_message`, an undefined bare name, and an undefined MCP-prefixed name—is hidden from the
-client and answered by Claude Code 2.1.284 itself with
+client and answered by Claude Code 2.1.322 itself with
 `<tool_use_error>Error: No such tool available: …</tool_use_error>` (`is_error: true`). The gateway does not fail
 or end that response: Claude Code infers again in the same response. A later correctly prefixed client call is
 held and released normally. The model can instead finish with text; retrying with the correct name is the model's
@@ -429,7 +430,7 @@ is therefore the client's `instructions` byte for byte, then `\n\n`, then one co
 The tools this prompt names, such as send_message, are available as mcp__fn__send_message and so on.
 ```
 
-Measured on Claude Code 2.1.284: it reaches the model as the end of `system[2].text`, after the client's bytes. Nothing in
+Measured on Claude Code 2.1.322: it reaches the model as the end of `system[2].text`, after the client's bytes. Nothing in
 the client's text is rewritten. The line is the same for every chain and tool set, so it never moves a chain's cache
 prefix; a chain started on a gateway without the line pays one cache miss when it is rebuilt on one with it. Records,
 the chain key and the response's `instructions` hold the client's prompt alone. `test/tool_name_line_test.ts` asserts
@@ -498,10 +499,10 @@ response is attached, so simultaneous requests never rebuild it twice. The next 
   rejected (`410`), so it can never reach the process that replaced it. An MCP call for a tool_use id the model never
   produced is refused; a duplicate call of one id gets the same output.
 
-## Claude Code pins (measured on 2.1.284)
+## Claude Code pins (measured on 2.1.322)
 
 Every pin in this table is asserted by the per-release probe (`deno task probe`, `probe/probe_test.ts`), most of them
-paired with a run that drops the pin to show its effect; three more variables are set without being verified (below
+paired with a run that drops the pin to show its effect; two more variables are set without being verified (below
 the table). The source of truth is `src/claude/pins.ts`.
 
 | Flag or variable | Value | Why | Probe |
@@ -523,13 +524,15 @@ the table). The source of truth is `src/claude/pins.ts`.
 | `.claude.json` `userID` in the config folder | the gateway's device id, seeded | Claude Code uses it as `metadata.user_id`'s `device_id` instead of generating one | a device id seeded as userID … (paired with a fresh folder) |
 | `TZ` | `--tz` | Decides the date Claude Code announces | TZ decides the date … |
 | `ENABLE_TOOL_SEARCH` | `false` | MCP tools load eagerly, in every request | ENABLE_TOOL_SEARCH=false … (paired with `true`) |
-| `DISABLE_AUTO_COMPACT` | `1` | The client is the only compactor; at the limit the turn ends as `blocking_limit` | DISABLE_AUTO_COMPACT=1 … (paired) |
-| `CLAUDE_CODE_TOTAL_TOKENS_REMINDER` | `off` | No usage-dependent `<total_tokens>` lines in the prompt | CLAUDE_CODE_TOTAL_TOKENS_REMINDER=off … (paired) |
+| `DISABLE_AUTO_COMPACT` | `1` | The client is the only compactor; at the limit the turn ends as `blocking_limit`. The current models' window is 1M tokens: a previous turn that reported 975,000 input tokens passes, 977,000 blocks the next turn (2.1.284 blocked near 177,000, a 200k window) | DISABLE_AUTO_COMPACT=1 … (paired) |
+| `CLAUDE_CODE_TOTAL_TOKENS_REMINDER` | `off` | No usage-dependent `<total_tokens>` lines in the prompt. Unset, the default is per model: of the current models only `claude-fable-5-1` gets them (on 2.1.284 every model did) | CLAUDE_CODE_TOTAL_TOKENS_REMINDER=off … (paired, on `claude-fable-5-1`) |
 | `CLAUDE_CODE_SILENT_TURN_REMINDER` | `0` | No "The user hasn't heard from you in a while" after silent tool rounds | CLAUDE_CODE_SILENT_TURN_REMINDER=0 … (paired) |
 | `MAX_MCP_OUTPUT_TOKENS` | `1000000` | Lifts Claude Code's 25,000-token cap on MCP results. With the size annotation a 500,000-character result stays inline even without it, so it is a backstop | MAX_MCP_OUTPUT_TOKENS … (paired, without the annotation) |
 | `CLAUDE_CODE_RESUME_INTERRUPTED_TURN` | `1` on the held-call resume only | Resumes the turn from tool results + user content with nothing foreign | CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1 … (paired) |
 | `CLAUDE_CODE_MAX_OUTPUT_TOKENS` | request cap, else unset | Fixed per chain, reapplied on every rebuild; changes upstream `max_tokens` | CLAUDE_CODE_MAX_OUTPUT_TOKENS … (paired: unset, 4096, 8192) |
-| `CLAUDE_CODE_MAX_RETRIES` | `0` | An upstream error ends the turn at once as `terminal_reason: api_error` with `api_error_status`; the client owns retries | CLAUDE_CODE_MAX_RETRIES=0 … (paired: unset retries) |
+| `CLAUDE_CODE_MAX_RETRIES` | `0` | An upstream error ends the turn at once as `terminal_reason: api_error` with `api_error_status`; the client owns retries. Not for a 400 or 422 that is not a too-long prompt: whatever this says, Claude Code sends the same messages twice more, first without the `thinking-token-count-2026-05-13` beta, then also without `thinking.display` and the `thinking-display-updates-2026-08-18` beta, and only then ends the turn. A resend that succeeds keeps the shed betas for the rest of the process; the next turn after a failure sends them all again | CLAUDE_CODE_MAX_RETRIES=0 … (paired: unset retries) |
+| `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` | `1` | Only the conversation's own requests reach the backend: no `HEAD /api/hello` preconnect. It also turns off telemetry, the model catalog, plugin downloads and auto-updates from fixed Anthropic hosts, which never go to `ANTHROPIC_BASE_URL` | CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 … (paired) |
+| `CLAUDE_CODE_ELEGANT_MEADOW` | `0` | The log holds only the lines the mirror carries. Otherwise (the default since 2.1.322) Claude Code also writes request-replay lines (`api-request-shape`, `api-request-blob`, `api-request`) outside the mirror, copying the system prompt, tools, request parameters and messages, images included, into the log and so into a rebuilt process's log and the provider records | CLAUDE_CODE_ELEGANT_MEADOW=0 … (paired) |
 
 Set but **not verified** by the probe:
 
@@ -537,18 +540,15 @@ Set but **not verified** by the probe:
   cleared. Nothing the gateway uses spawns one (no native tools; MCP is HTTP), and with `PATH` unset the
   model sees the same prompt (measured), so there is no effect to assert.
 
-- `DISABLE_AUTOUPDATER=1`. In 2.1.284 the updater fetches from a fixed `https://downloads.claude.ai/claude-code-releases`
+- `DISABLE_AUTOUPDATER=1`. In 2.1.322 the updater fetches from a fixed `https://downloads.claude.ai/claude-code-releases`
   that no flag or variable redirects, so no test can offer it an update without letting Claude Code reach Anthropic.
-- `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`. The fake endpoint sees the same requests with or without it (measured:
-  the conversation's own and one `GET /api/hello`); what it turns off in 2.1.284 (telemetry, the model catalog and
-  plugin downloads from fixed Anthropic hosts, and auto-updates as well) never goes to `ANTHROPIC_BASE_URL`.
 
-All three are hygiene only; nothing in the gateway depends on them.
+Both are hygiene only; nothing in the gateway depends on them.
 
 Claude Code internals the gateway also relies on, asserted by the probe: the log a process mirrored resumes into a
 byte-identical request (`a log rebuilt from the mirrored entries …`), and a resumed log missing the `atis-latch` line
 gets one written outside the mirror, so synthesized logs include it (`a resumed log without the atis-latch line …`).
-The `2.1.284: images in an appended user log entry …` probe asserts that a user entry appended after held-tool
+The `2.1.322: images in an appended user log entry …` probe asserts that a user entry appended after held-tool
 results sends actual base64 PNG image blocks (correct media type and unchanged payload) immediately after the
 results in the same user turn, retains the prior request’s prefix and leaves the appended log bytes unchanged.
 The large-image probe shows that Claude Code can resize/re-encode appended images, even over its nominal API
@@ -573,25 +573,27 @@ the `anthropic-ratelimit-unified-5h-*`, `-7d-*` and `-7d_oi-*` headers (`utiliza
 `resetsAt` and `rateLimitType` from `-unified-reset` and `-unified-representative-claim` (a window past its warning
 threshold makes Claude Code report `allowed_warning` naming that window). A 429 with
 `-unified-status: rejected` reports `status: "rejected"` with them and ends the turn as `api_error`, status 429,
-"You've hit your session limit · resets …" (weekly: "your weekly limit", `seven_day_opus`: "your Opus limit"). Any
+"You've hit your 5-hour limit · resets …" (2.1.284: "your session limit"; weekly: "your weekly limit",
+`seven_day_opus`: "your Opus limit"). A window's `-status` and `-surpassed-threshold` headers add `status` and
+`surpassedThreshold` to that window (new in 2.1.322; the gateway reads neither). The gateway never matches these texts. Any
 other 429 reports a bare `{"status":"rejected"}` and "Server is temporarily limiting requests (not your usage
 limit)"; a backend `retry-after` reaches nothing. The report precedes the turn's `result`, after the stream's
 `message_stop`.
 
 Not pinned on purpose: `CLAUDE_CODE_RESUME_INTERRUPTED_TURN_MAX_AGE_MS` (unset means no age limit on resuming a
-held call in 2.1.284), `CLAUDE_CODE_OVERRIDE_DATE` (no effect in 2.1.284), the prompt-cache TTL variables.
+held call in 2.1.322), `CLAUDE_CODE_OVERRIDE_DATE` (no effect in 2.1.322), the prompt-cache TTL variables.
 
 ## Tests
 
 ```sh
 deno task test        # the gateway on the fake Anthropic endpoint (no network, no secrets)
-deno task probe       # the per-release probe of every pin (about 80 s; one test holds a call for 65 s)
+deno task probe       # the per-release probe of every pin (about 5.5 min; one test holds a call for 65 s, one waits out the 3-minute first-byte window)
 deno task test:deepseek   # real tool rounds on DeepSeek's Anthropic-compatible endpoint; needs DEEPSEEK_API_KEY
 ```
 
-Tests launch the real Claude Code 2.1.284 at `~/.wuhu/vendors/claude/2.1.284/claude` by default; set `CLAUDE_BINARY`
-to use a different install (for example `CLAUDE_BINARY=$PWD/.state/vendors/claude/2.1.284/claude deno task test`).
-The probes use the same setting. The binary must still be 2.1.284. Gateway tests isolate state under `.state/`, with
+Tests launch the real Claude Code 2.1.322 at `~/.wuhu/vendors/claude/2.1.322/claude` by default; set `CLAUDE_BINARY`
+to use a different install (for example `CLAUDE_BINARY=$PWD/.state/vendors/claude/2.1.322/claude deno task test`).
+The probes use the same setting. The binary must still be 2.1.322. Gateway tests isolate state under `.state/`, with
 working folders under `/tmp/cc2r-test`. Each probe owns a unique `/tmp/cc2r-probe-*` root for its configuration, logs
 and working folders; cleanup removes only that root. Tests use ports 18300-18399 and fail if any Claude Code process outlives them.
 
@@ -670,7 +672,7 @@ Whether Anthropic's own cache depends on `metadata` is unknown: no request in th
   resize/re-encode them (including on an appended-log resume), so arbitrary image payloads need not reach the
   model unchanged. It does not rewrite the appended log entry. Image validity and any tighter model-specific
   limits are Claude Code’s and the backend’s responsibility.
-- Image notices require an eviction/resume and therefore cost a process restart. Claude Code 2.1.284 sends the real
+- Image notices require an eviction/resume and therefore cost a process restart. Claude Code 2.1.322 sends the real
   images, then adds its own `[Image: source: …/images/N.png]` text labels. These are not replacements for the images.
   User/notice-image label paths are deterministic for the same OS user, working folder and session (the rebuild
   tests check them). Native MCP tool-output image labels instead depend on Claude Code’s configuration directory

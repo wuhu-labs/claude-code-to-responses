@@ -61,7 +61,7 @@ async function* lines(path: string): AsyncGenerator<string> {
   if (rest) yield rest
 }
 
-/** Claude Code 2.1.284's own answer to a call of a tool it doesn't have: an error result whose whole content is this
+/** Claude Code 2.1.322's own answer to a call of a tool it doesn't have: an error result whose whole content is this
  * string (src/claude/entries.ts `unknownToolEntry`, probe/probe_test.ts). A result that merely quotes it is no hit. */
 const NATIVE_ERROR = /^<tool_use_error>Error: No such tool available: (\S+)<\/tool_use_error>$/
 
