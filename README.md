@@ -59,8 +59,8 @@ reads `~/.claude`.
   removed from conversation history and passed exactly as top-level instructions would be. Both prompt sources
   together are `400 invalid_request` (`param: instructions`), even if they agree. Other prompt parts, a system/developer
   message after any other item, or any system/developer input message in a continuation are typed `400 unsupported`.
-  A continuation may omit `instructions`; its resolved prompt is retained in the response’s provider record/store
-  and inherited across process eviction or gateway restart. Explicit continuation instructions must match byte for
+  A continuation may omit `instructions`; the prompt is stored at the chain head and recovered by following `prev`
+  links after process eviction or gateway restart. Explicit continuation instructions must match byte for
   byte, else `400 previous_response_not_found`; a full create is how the client starts a changed chain. Older records
   without a saved prompt still work with explicit instructions; if the live chain is also gone, omission gives
   `previous_response_not_found`, never an invented prompt or automatic detour.
