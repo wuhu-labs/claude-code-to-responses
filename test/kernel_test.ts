@@ -1,4 +1,4 @@
-import { assert, assertEquals, assertRejects, assertThrows } from '@std/assert'
+import { assert, assertEquals, assertExists, assertRejects, assertThrows } from '@std/assert'
 import { parseRequest } from '../src/api/request.ts'
 import { systemPrompt } from '../src/claude/pins.ts'
 import { GatewayError } from '../src/errors.ts'
@@ -187,7 +187,66 @@ Deno.test('legacy record without saved instructions inherits its live lane promp
     assertEquals(second.response.x_gateway.session, first.response.x_gateway.session)
     assertEquals(run.tg.events('spawn').length, 1)
     assertPrefix(run.fake.main()[0], run.fake.main()[1])
-    assertEquals(run.tg.gw.store.get(second.response.id)!.instructions, 'You are helpful.')
+  })
+})
+
+Deno.test('only the chain head carries instructions; cold deltas and full history restore the conversation', async () => {
+  const run = new Run('kernel-head-instructions', false)
+  await run.run(async () => {
+    const body = base()
+    let ws = run.tg.websocket()
+    const history = [body.input[0]]
+    let headItem: Json
+    let prev: string | null = null
+    for (const turn of ['Hello', 'two', 'three']) {
+      const input = [user(turn)]
+      run.fake.reply({ blocks: [text(`reply ${turn}`)] })
+      const response = await ws.send(prev === null ? body : { ...body, previous_response_id: prev, input })
+      assertEquals(response.status, 'completed')
+      const item = response.response.output.at(-1)
+      const record = await decodeRecord(item.encrypted_content)
+      assertExists(record)
+      assertEquals(record.prev, prev)
+      assertEquals(Object.hasOwn(record, 'instructions'), prev === null)
+      if (prev === null) {
+        assertEquals(record.instructions, 'You are helpful.')
+        headItem = item
+      }
+      history.push(...input, ...response.response.output)
+      prev = response.response.id
+    }
+
+    await run.disrupt('restart')
+    ws = run.tg.websocket()
+    const input = [user('four')]
+    run.fake.reply({ blocks: [text('reply four')] })
+    const resumed = await ws.send({ ...body, previous_response_id: prev, input })
+    assertEquals([resumed.status, resumed.response.instructions, resumed.response.x_gateway.path], ['completed', 'You are helpful.', 'store'])
+    assertPrefix(run.fake.main()[2], run.fake.main()[3])
+
+    await run.disrupt('restart-lost-store')
+    ws = run.tg.websocket()
+    run.fake.reply({ blocks: [text('reply four')] })
+    const replayed = await ws.send({ ...body, input: [...history, ...input] })
+    const gateway = replayed.response.x_gateway
+    assertEquals([replayed.status, gateway.path, gateway.records, gateway.synthesized_groups], ['completed', 'history', 3, 0])
+    assertEquals(run.fake.main()[4].raw, run.fake.main()[3].raw)
+
+    // Keep every conversational item and omit only the head's provider record.
+    await run.disrupt('restart-lost-store')
+    ws = run.tg.websocket()
+    run.fake.reply({ blocks: [text('reply four')] })
+    const rebuilt = await ws.send({ ...body, input: [...history.filter((item) => item !== headItem), ...input] })
+    const { path, records, synthesized_groups } = rebuilt.response.x_gateway
+    assertEquals([rebuilt.status, path, records, synthesized_groups], ['completed', 'history', 0, 3])
+    const newHead = await decodeRecord(rebuilt.response.output.at(-1).encrypted_content)
+    assertExists(newHead)
+    assertEquals([newHead.prev, newHead.instructions], [null, 'You are helpful.'])
+    const upstream = run.fake.main().at(-1)!.body
+    assertEquals(upstream.system[2].text, systemPrompt('You are helpful.'))
+    const seen = upstream.messages.flatMap((m: Json) => typeof m.content === 'string' ? [m.content] : m.content.map((b: Json) => b.text))
+    const turns = ['Hello', 'reply Hello', 'two', 'reply two', 'three', 'reply three', 'four']
+    assertEquals(seen.filter((text: string) => turns.includes(text)), turns)
   })
 })
 
