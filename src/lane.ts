@@ -923,7 +923,7 @@ export class Lane implements BridgeTarget {
       id: a.state.id,
       prev: a.prevId,
       chain: this.chain.key,
-      instructions: this.chain.instructions,
+      ...(a.prevId === null ? { instructions: this.chain.instructions } : {}),
       callAliases: this.callAliases,
       ...(a.nativeCalls.length ? { nativeCalls: a.nativeCalls } : {}),
       session: this.sessionId,

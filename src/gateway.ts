@@ -173,16 +173,29 @@ export class Gateway {
     return sink.stream
   }
 
+  private instructionsFor(prev: string): string {
+    const record = this.store.get(prev)
+    if (!record) throw previousResponseNotFound(prev, "it is not in this gateway's store")
+    const instructions = record.instructions ?? this.lanes.get(record.session)?.chain.instructions
+    if (instructions !== undefined) return instructions
+
+    const seen = new Set([prev])
+    let id = record.prev
+    while (id !== null && !seen.has(id)) {
+      seen.add(id)
+      const ancestor = this.store.get(id)
+      if (!ancestor) break
+      if (ancestor.instructions !== undefined) return ancestor.instructions
+      id = ancestor.prev
+    }
+    throw previousResponseNotFound(prev, 'its chain has no stored instructions')
+  }
+
   /** Both transports use the same validation, reservations, processes and durable response store. */
   async createInto(req: NormRequest, sink: EventSink): Promise<void> {
     this.assertOpen()
     if (req.instructions === null) {
-      const prev = req.previousResponseId!
-      const rec = this.store.get(prev)
-      if (!rec) throw previousResponseNotFound(prev, "it is not in this gateway's store")
-      const instructions = rec.instructions ?? this.lanes.get(rec.session)?.chain.instructions
-      if (instructions === undefined) throw previousResponseNotFound(prev, 'this older record requires explicit instructions')
-      req = { ...req, instructions }
+      req = { ...req, instructions: this.instructionsFor(req.previousResponseId!) }
     }
     // Preserve keys of pre-cap chains; an explicit cap is a process property, never an ignored request hint.
     const properties: unknown[] = [req.model, req.effort, req.instructions, req.tools]
@@ -382,6 +395,7 @@ export class Gateway {
       const recs = (await Promise.all(encrypted.map((e) => clientRecord(e, gi)))).filter((r) => r !== null)
       if (recs.length === 0) continue
       const r = recs[recs.length - 1]!
+      // Continuation records omit instructions: the chain key already covers them.
       const candidate = recs.length === 1 && r.chain === chain.key && (r.instructions === undefined || r.instructions === chain.instructions) &&
         r.prev === headId &&
         (session === null || r.session === session)

@@ -24,7 +24,7 @@ export interface ProviderRecord {
   prev: string | null
   /** Chain key: instructions, tools, model, effort and an explicit output cap. */
   chain: string
-  /** Resolved chain instructions for continuations that omit the prompt (older records may lack it). */
+  /** Resolved instructions, written on the chain head only. */
   instructions?: string
   /** Client call ids bound to the original provider ids; every pair is one-to-one. */
   callAliases?: CallAliases
