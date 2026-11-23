@@ -9,6 +9,7 @@ interface InputRef {
   image?: true
   prefix?: string
   json?: true
+  keyOrder?: string[][]
 }
 interface Ref extends Partial<InputRef> {
   hash: string
@@ -24,6 +25,33 @@ export interface PayloadStore {
 }
 const marker = '$cc2r_input'
 const hash = (value: Json): string => createHash('sha256').update(JSON.stringify(value)).digest('hex')
+
+// Only synthesized tool inputs use JSON sidecars. Retain their object key order so equivalent input can
+// restore their exact bytes even if both the store and sidecars were lost.
+function jsonKeyOrder(value: Json): string[][] {
+  const order: string[][] = []
+  JSON.stringify(value, (_, child) => {
+    if (child !== null && typeof child === 'object' && !Array.isArray(child)) order.push(Object.keys(child))
+    return child
+  })
+  return order
+}
+
+function restoreJsonOrder(value: Json, order: string[][]): Json {
+  let at = 0
+  const visit = (child: Json): Json => {
+    if (Array.isArray(child)) return child.map(visit)
+    if (child === null || typeof child !== 'object') return child
+    const keys = order[at++]
+    if (!keys || keys.length !== Object.keys(child).length || keys.some((key) => !Object.hasOwn(child, key))) {
+      throw new RecordError('input argument key order does not match')
+    }
+    return Object.fromEntries(keys.map((key) => [key, visit(child[key])]))
+  }
+  const restored = visit(value)
+  if (at !== order.length) throw new RecordError('unused input argument key order')
+  return restored
+}
 
 export class ReplayIndex {
   private refs = new Map<string, InputRef>()
@@ -72,7 +100,7 @@ export class ReplayIndex {
       }
       if (value.type === 'tool_use' && value.input && typeof value.input === 'object') {
         const ref = this.refs.get(hash(value.input))
-        if (ref) return { ...value, input: { [marker]: { hash: store.putPayload(value.input), ...ref } } }
+        if (ref) return { ...value, input: { [marker]: { hash: store.putPayload(value.input), ...ref, keyOrder: jsonKeyOrder(value.input) } } }
       }
       const result: Json = {}
       for (const [key, child] of Object.entries(value)) {
@@ -127,7 +155,10 @@ export function checkReplay(replay: Json, entries: number): void {
       if (
         Object.keys(value).length !== 1 || !r || typeof r !== 'object' || typeof r.hash !== 'string' || !/^[0-9a-f]{64}$/.test(r.hash) ||
         (r.path !== undefined && (!Array.isArray(r.path) || r.path.length < 1 || r.path.length > 8 || r.path.some((i) => !Number.isSafeInteger(i) || i < 0))) ||
-        (r.image !== undefined && r.image !== true) || (r.json !== undefined && r.json !== true) || (r.prefix !== undefined && r.prefix !== ' ')
+        (r.image !== undefined && r.image !== true) || (r.json !== undefined && r.json !== true) || (r.prefix !== undefined && r.prefix !== ' ') ||
+        (r.keyOrder !== undefined &&
+          (!r.json || !Array.isArray(r.keyOrder) ||
+            r.keyOrder.some((keys) => !Array.isArray(keys) || keys.some((key) => typeof key !== 'string') || new Set(keys).size !== keys.length)))
       ) throw new RecordError('bad input reference')
       return
     }
@@ -174,6 +205,7 @@ export function replayLog(record: ProviderRecord, store: PayloadStore, items?: I
           throw new RecordError('input arguments are not JSON')
         }
         if (!original || typeof original !== 'object' || Array.isArray(original)) throw new RecordError('input arguments are not an object')
+        if (r.keyOrder !== undefined) original = restoreJsonOrder(original, r.keyOrder)
       } else {
         if (typeof original !== 'string') throw new RecordError('input text reference does not resolve')
         original = (r.prefix ?? '') + original

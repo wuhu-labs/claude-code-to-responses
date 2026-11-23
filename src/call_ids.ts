@@ -1,6 +1,6 @@
 import { recordLogTemplates } from './replay.ts'
 import type { InItem } from './api/request.ts'
-import { digestItems, type ProviderRecord } from './records.ts'
+import { ItemDigest, type ProviderRecord } from './records.ts'
 
 export type CallAliases = [string, string][]
 
@@ -34,5 +34,6 @@ export async function matchRecordItems(items: InItem[], record: ProviderRecord, 
   for (let i = 0; i < calls.length; i++) if (!bind(map, reverse, calls[i].callId, original[i])) return null
   if (items.some((it) => it.kind === 'function_call_output' && !map.has(it.callId))) return null
   const next = [...map.entries()]
-  return record.digest === await digestItems(remapItems(items, next)) ? next : null
+  const { digest, jsonArgumentDigest } = new ItemDigest(remapItems(items, next)).finish()
+  return record.digest === digest || (record.jsonArgumentDigest !== undefined && record.jsonArgumentDigest === jsonArgumentDigest) ? next : null
 }

@@ -1,5 +1,5 @@
 // Validation of POST /v1/responses bodies against the supported subset. Anything outside it is a typed 400.
-import { invalid, unsupported } from '../errors.ts'
+import { invalid, previousResponseNotFound, unsupported } from '../errors.ts'
 import { DEFAULT_EFFORT, EFFORTS, MAX_TOOL_NAME } from '../claude/pins.ts'
 
 // deno-lint-ignore no-explicit-any
@@ -48,6 +48,7 @@ const ACCEPTED = new Set([
   'reasoning',
   'include',
   'metadata',
+  'client_metadata',
   'text',
   'truncation',
   'user',
@@ -63,14 +64,41 @@ const ACCEPTED = new Set([
 
 const isObj = (v: unknown): v is Record<string, Json> => typeof v === 'object' && v !== null && !Array.isArray(v)
 
+export const WARMUP_ID_STEM = 'resp_warmup'
+
+export interface WarmupPrefix {
+  input: unknown[]
+  instructions?: string
+}
+
+type WebSocketCreate = { kind: 'generate'; req: NormRequest } | { kind: 'warmup'; req: NormRequest; prefix: WarmupPrefix }
+
+export function parseWebSocketCreate(body: Record<string, Json>, previous: WarmupPrefix | undefined): WebSocketCreate {
+  const { generate, ...request } = body
+  if ('generate' in body && typeof generate !== 'boolean') throw invalid('generate', "'generate' must be a boolean.")
+  if (previous) {
+    request.input = [...previous.input, ...inputItems(request.input)]
+    if (!('instructions' in request) && previous.instructions !== undefined) request.instructions = previous.instructions
+    delete request.previous_response_id
+  }
+  const req = normalizeRequest(request, 'websocket', generate === false)
+  if (generate !== false) return { kind: 'generate', req }
+  return { kind: 'warmup', req, prefix: { input: inputItems(request.input), instructions: request.instructions } }
+}
+
 export function parseRequest(body: unknown, transport: 'sse' | 'websocket' = 'sse'): NormRequest {
+  return normalizeRequest(body, transport, false)
+}
+
+function normalizeRequest(body: unknown, transport: 'sse' | 'websocket', warmup: boolean): NormRequest {
   if (!isObj(body)) throw invalid(null, 'The request body must be a JSON object.')
   for (const k of Object.keys(body)) {
     if (!ACCEPTED.has(k)) throw unsupported(k, `Field '${k}' is not supported by this gateway.`)
   }
   if (transport === 'websocket') {
-    if ('stream' in body) throw unsupported('stream', "WebSocket responses stream implicitly: omit 'stream'.")
+    if ('stream' in body && body.stream !== true) throw unsupported('stream', "WebSocket responses stream implicitly: omit 'stream' or set it to true.")
   } else if (body.stream !== true) throw unsupported('stream', "Only streaming responses are supported: set 'stream' to true.")
+  if ('client_metadata' in body && !isObj(body.client_metadata)) throw invalid('client_metadata', "'client_metadata' must be an object.")
   if (body.background !== undefined && body.background !== false && body.background !== null) {
     throw unsupported('background', 'Background mode is not supported.')
   }
@@ -175,6 +203,9 @@ export function parseRequest(body: unknown, transport: 'sse' | 'websocket' = 'ss
     if (typeof body.previous_response_id !== 'string' || !body.previous_response_id) {
       throw invalid('previous_response_id', "'previous_response_id' must be a string.")
     }
+    if (body.previous_response_id.startsWith(`${WARMUP_ID_STEM}_`)) {
+      throw previousResponseNotFound(body.previous_response_id, 'it is not a warm-up on this connection')
+    }
     previousResponseId = body.previous_response_id
   }
 
@@ -191,7 +222,7 @@ export function parseRequest(body: unknown, transport: 'sse' | 'websocket' = 'ss
     throw invalid('tool_choice.name', 'A named tool choice must name one of the request’s function tools.')
   }
   const { instructions, input } = parseInstructionsAndInput(body, previousResponseId)
-  if (input.length === 0) throw invalid('input', "'input' must not be empty.")
+  if (!warmup && input.length === 0) throw invalid('input', "'input' must not be empty.")
   return {
     model: body.model,
     instructions,
@@ -205,38 +236,39 @@ export function parseRequest(body: unknown, transport: 'sse' | 'websocket' = 'ss
   }
 }
 
+function inputItems(input: unknown): unknown[] {
+  if (typeof input === 'string') return [{ role: 'user', content: input }]
+  if (Array.isArray(input)) return input
+  throw invalid('input', "'input' must be a string or an array of items.")
+}
+
 function parseInstructionsAndInput(body: Json, previous: string | null): { instructions: string | null; input: InItem[] } {
-  const input = body.input
+  const input = inputItems(body.input)
   const leading: string[] = []
   let first = 0
-  if (Array.isArray(input)) {
-    while (first < input.length) {
-      const it = input[first]
-      if (!isObj(it) || (it.type !== undefined && it.type !== 'message') || (it.role !== 'system' && it.role !== 'developer')) break
-      const p = `input[${first}]`
-      if (previous !== null) throw unsupported(`${p}.role`, 'System/developer input messages are only accepted at the beginning of a full create.')
-      if ('instructions' in body) throw invalid('instructions', 'Use top-level instructions or leading system/developer messages, never both.')
-      if (typeof it.content === 'string') leading.push(it.content)
-      else if (Array.isArray(it.content)) {
-        for (let j = 0; j < it.content.length; j++) {
-          const part = it.content[j]
-          if (!isObj(part) || part.type !== 'input_text') throw unsupported(`${p}.content[${j}].type`, 'Instructions accept only input_text parts.')
-          if (typeof part.text !== 'string') throw invalid(`${p}.content[${j}].text`, 'Instruction text must be a string.')
-          leading.push(part.text)
-        }
-      } else throw invalid(`${p}.content`, 'Instructions must be a string or an array of input_text parts.')
-      first++
-    }
+  while (first < input.length) {
+    const it = input[first]
+    if (!isObj(it) || (it.type !== undefined && it.type !== 'message') || (it.role !== 'system' && it.role !== 'developer')) break
+    const p = `input[${first}]`
+    if (previous !== null) throw unsupported(`${p}.role`, 'System/developer input messages are only accepted at the beginning of a full create.')
+    if ('instructions' in body) throw invalid('instructions', 'Use top-level instructions or leading system/developer messages, never both.')
+    if (typeof it.content === 'string') leading.push(it.content)
+    else if (Array.isArray(it.content)) {
+      for (let j = 0; j < it.content.length; j++) {
+        const part = it.content[j]
+        if (!isObj(part) || part.type !== 'input_text') throw unsupported(`${p}.content[${j}].type`, 'Instructions accept only input_text parts.')
+        if (typeof part.text !== 'string') throw invalid(`${p}.content[${j}].text`, 'Instruction text must be a string.')
+        leading.push(part.text)
+      }
+    } else throw invalid(`${p}.content`, 'Instructions must be a string or an array of input_text parts.')
+    first++
   }
   let instructions: string | null = null
   if ('instructions' in body) {
     if (typeof body.instructions !== 'string' || !body.instructions) throw invalid('instructions', "'instructions' must be a nonempty string.")
     instructions = body.instructions
   } else if (first > 0) instructions = leading.join('')
-  let items: InItem[]
-  if (typeof input === 'string') items = [{ kind: 'message', role: 'user', parts: [{ type: 'text', text: input }] }]
-  else if (Array.isArray(input)) items = input.slice(first).map((it, i) => parseItem(it, `input[${i + first}]`))
-  else throw invalid('input', "'input' must be a string or an array of items.")
+  const items = input.slice(first).map((it, i) => parseItem(it, `input[${i + first}]`))
   if (previous === null && !instructions) {
     throw invalid('instructions', 'The kernel must carry a nonempty session prompt in top-level instructions or leading system/developer text.')
   }

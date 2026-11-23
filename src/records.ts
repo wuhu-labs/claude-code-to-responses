@@ -1,6 +1,6 @@
 import { Buffer } from 'node:buffer'
 import { checkReplay, type ReplayLine } from './replay.ts'
-import { createHash } from 'node:crypto'
+import { createHash, type Hash } from 'node:crypto'
 // Provider records: the Claude Code log entries behind each response, carried opaquely in a reasoning item's
 // encrypted_content and kept in the response store. Replay templates plus sidecars reconstruct input log lines.
 import type { CallAliases } from './call_ids.ts'
@@ -39,6 +39,8 @@ export interface ProviderRecord {
   calls: CallRef[]
   /** Digest of every item this record covers: the inputs since `prev` (any synthesized history too) and the outputs. */
   digest: string
+  /** Same covered items, but with function arguments compared as JSON values. Legacy records match by digest alone. */
+  jsonArgumentDigest?: string
   /** Log lines Claude Code (or the gateway, for rebuilt history and the interrupted-turn resume) wrote since `prev`, verbatim. */
   entries: string[]
   /** Payload-free log templates, interleaved with entries; inputs live in content-addressed sidecars. */
@@ -134,6 +136,7 @@ export function checkRecord(r: any): void {
       r.nativeCalls.some((id: unknown) => typeof id !== 'string' || !CALL_ID.test(id)))
   ) fail('bad native calls')
   if (typeof r.digest !== 'string' || !HEX64.test(r.digest)) fail('bad digest')
+  if (r.jsonArgumentDigest !== undefined && (typeof r.jsonArgumentDigest !== 'string' || !HEX64.test(r.jsonArgumentDigest))) fail('bad JSON argument digest')
   if (typeof r.session !== 'string' || !SESSION_ID.test(r.session)) fail('bad session')
   if (typeof r.device !== 'string' || !DEVICE_ID.test(r.device)) fail('bad device')
   if (r.end !== 'turn' && r.end !== 'calls') fail('bad end')
@@ -187,8 +190,43 @@ export function canonItem(it: InItem): unknown | null {
   }
 }
 
+type ArgumentValue = null | boolean | number | string | ArgumentValue[] | { [key: string]: ArgumentValue }
+
+function canonicalArguments(json: string): string {
+  const tokens: string[] = []
+  const pending: (string | { value: ArgumentValue })[] = [{ value: JSON.parse(json) }]
+  while (pending.length) {
+    const entry = pending.pop()!
+    if (typeof entry === 'string') tokens.push(entry)
+    else {
+      const value = entry.value
+      if (Array.isArray(value)) {
+        tokens.push('[')
+        pending.push(']')
+        for (let i = value.length - 1; i >= 0; i--) {
+          if (i < value.length - 1) pending.push(',')
+          pending.push({ value: value[i] })
+        }
+      } else if (value !== null && typeof value === 'object') {
+        tokens.push('{')
+        pending.push('}')
+        const keys = Object.keys(value).sort()
+        for (let i = keys.length - 1; i >= 0; i--) {
+          if (i < keys.length - 1) pending.push(',')
+          pending.push({ value: value[keys[i]] }, ':', JSON.stringify(keys[i]))
+        }
+      } else {
+        // A JSON exponent can overflow JS's Number; don't collapse infinity to null as JSON.stringify does.
+        tokens.push(typeof value === 'number' ? String(value) : JSON.stringify(value))
+      }
+    }
+  }
+  return tokens.join('')
+}
+
 export class ItemDigest {
   private hash = createHash('sha256').update('[')
+  private jsonArguments: Hash | undefined
   private count = 0
 
   constructor(items: InItem[]) {
@@ -199,19 +237,25 @@ export class ItemDigest {
     for (const item of items) {
       const canon = canonItem(item)
       if (canon === null) continue
-      if (this.count++) this.hash.update(',')
-      this.hash.update(JSON.stringify(canon))
+      if (item.kind === 'function_call') this.jsonArguments ??= this.hash.copy()
+      if (this.count++) {
+        this.hash.update(',')
+        this.jsonArguments?.update(',')
+      }
+      const exact = JSON.stringify(canon)
+      this.hash.update(exact)
+      this.jsonArguments?.update(
+        item.kind === 'function_call' ? JSON.stringify(['c', item.callId, item.name, canonicalArguments(item.arguments)]) : exact,
+      )
     }
   }
 
-  finish(outputs: InItem[] = []): string {
+  finish(outputs: InItem[] = []): Pick<ProviderRecord, 'digest' | 'jsonArgumentDigest'> {
     this.append(outputs)
-    return this.hash.update(']').digest('hex')
+    const digest = this.hash.update(']').digest('hex')
+    const jsonArgumentDigest = this.jsonArguments?.update(']').digest('hex')
+    return jsonArgumentDigest === undefined ? { digest } : { digest, jsonArgumentDigest }
   }
-}
-
-export function digestItems(items: InItem[]): Promise<string> {
-  return Promise.resolve(new ItemDigest(items).finish())
 }
 
 export async function sha256(s: string): Promise<string> {

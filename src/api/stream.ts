@@ -39,7 +39,6 @@ export function usageObject(u: UsageTotals) {
 export type Status = 'in_progress' | 'completed' | 'failed' | 'incomplete' | 'cancelled'
 
 export class ResponseState {
-  readonly id = newId('resp')
   readonly createdAt = Math.floor(Date.now() / 1000)
   status: Status = 'in_progress'
   output: Json[] = []
@@ -51,7 +50,7 @@ export class ResponseState {
 
   readonly req: Omit<NormRequest, 'input'>
 
-  constructor(req: NormRequest) {
+  constructor(req: NormRequest, readonly id = newId('resp')) {
     const { input: _, ...echo } = req
     this.req = echo
   }

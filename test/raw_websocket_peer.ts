@@ -33,7 +33,7 @@ if (import.meta.main) {
           addedId: added.id,
           doneId: done.id,
           terminalId: terminal.id,
-          doneOpaque: 'encrypted_content' in done,
+          doneMatchesAdded: done.encrypted_content === added.encrypted_content,
           terminalOpaque: 'encrypted_content' in terminal,
         }))
         break

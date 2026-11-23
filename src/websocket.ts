@@ -1,9 +1,9 @@
 import { RECORD_PREFIX } from './records.ts'
 import { Buffer } from 'node:buffer'
 // OpenAI Responses WebSocket subset: one create in flight, text JSON events, no cancel message.
-import { parseRequest } from './api/request.ts'
-import { type EventSink, GatedSink, type SinkEvent } from './api/stream.ts'
-import { asGatewayError, GatewayError, invalid, serverError, unsupported } from './errors.ts'
+import { parseWebSocketCreate, WARMUP_ID_STEM, type WarmupPrefix } from './api/request.ts'
+import { type EventSink, GatedSink, newId, ResponseState, type SinkEvent } from './api/stream.ts'
+import { asGatewayError, GatewayError, invalid, previousResponseNotFound, serverError, unsupported } from './errors.ts'
 import type { Gateway } from './gateway.ts'
 
 type Json = any
@@ -161,15 +161,13 @@ class SocketSink implements EventSink {
   prepare(events: SinkEvent[]): (() => boolean) | null {
     if (this.isClosed) return null
     const send = this.writer.prepare(events.map(({ type, data }, i) => {
-      // The kernel retains reasoning from added; repeating opaque records defeats the bounded batch budget.
-      const withoutOpaque = (item: Json): Json => {
-        if (item.type !== 'reasoning' || !item.encrypted_content?.startsWith(RECORD_PREFIX)) return item
-        const { encrypted_content: _, ...rest } = item
-        return rest
-      }
-      if (type === 'response.output_item.done') data = { ...data, item: withoutOpaque(data.item) }
       if (type === 'response.completed' || type === 'response.incomplete') {
-        data = { ...data, response: { ...data.response, output: data.response.output?.map(withoutOpaque) } }
+        const output = data.response.output?.map((item: Json) => {
+          if (item.type !== 'reasoning' || !item.encrypted_content?.startsWith(RECORD_PREFIX)) return item
+          const { encrypted_content: _, ...rest } = item
+          return rest
+        })
+        data = { ...data, response: { ...data.response, output } }
       }
       return { type, sequence_number: this.seq + i, ...data }
     }))
@@ -216,10 +214,13 @@ export function upgradeResponses(req: Request, gw: Gateway): Response {
   }
   const writer = new SocketWriter(socket)
   let active: SocketSink | null = null
+  const warmups = new Map<string, { prefix: WarmupPrefix; bytes: number }>()
+  let warmupBytes = 0
   // Reserve synchronously, before parse/hash/store work yields. Rejected creates never touch a lane.
   const untrack = gw.trackConnection(() => writer.shutdown())
   writer.onDisconnect = () => {
     untrack()
+    warmups.clear()
     active?.cancel()
   }
   socket.onclose = socket.onerror = () => writer.disconnect()
@@ -245,14 +246,40 @@ export function upgradeResponses(req: Request, gw: Gateway): Response {
       if (event.type !== 'response.create') throw unsupported('type', "Only 'response.create' is supported; there is no cancel message.")
       if (active) throw new GatewayError(409, 'conflict_error', 'websocket_response_in_progress', 'One response is already in flight on this connection.')
       const { type: _type, ...body } = event
-      const parsed = parseRequest(body, 'websocket')
+      const previous = warmups.get(body.previous_response_id)
+      const create = parseWebSocketCreate(body, previous?.prefix)
+      if (create.kind === 'warmup') {
+        const { req, prefix } = create
+        if (req.previousResponseId !== null && !gw.store.has(req.previousResponseId)) {
+          throw previousResponseNotFound(req.previousResponseId, "it is not in this gateway's store")
+        }
+        const bytes = size + (previous?.bytes ?? 0)
+        if (warmupBytes + bytes > WS_MAX_MESSAGE_BYTES) {
+          throw new GatewayError(413, 'invalid_request_error', 'warmup_limit_exceeded', 'This connection has reached its warm-up input limit.')
+        }
+        const sink = new SocketSink(writer, () => {})
+        const state = new ResponseState(req, newId(WARMUP_ID_STEM))
+        const started = { ...state.object(), store: false }
+        state.status = 'completed'
+        state.usage = { input: 0, cacheRead: 0, cacheCreation: 0, output: 0 }
+        if (
+          sink.prepare([
+            { type: 'response.created', data: { response: started } },
+            { type: 'response.completed', data: { response: { ...state.object(), store: false } } },
+          ])?.()
+        ) {
+          warmups.set(state.id, { prefix, bytes })
+          warmupBytes += bytes
+        }
+        return
+      }
       const inner = new SocketSink(writer, () => {
         if (active === inner) active = null
       })
       active = inner
       // a 429 before any output is the typed error event, not a response that failed
       const sink = new GatedSink(inner, { refused: (err) => writer.error(err) })
-      void gw.createInto(parsed, sink).catch((e) => {
+      void gw.createInto(create.req, sink).catch((e) => {
         writer.error(asGatewayError(e))
         sink.close()
       })

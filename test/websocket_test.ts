@@ -130,8 +130,9 @@ Deno.test('WebSocket synthesized image history commits a slim record and replays
     const added = first.events.find((e) => e.type === 'response.output_item.added' && e.item.id === item.id)
     const done = first.events.find((e) => e.type === 'response.output_item.done' && e.item.id === item.id)
     assertEquals(added.item.encrypted_content, item.encrypted_content)
-    assertEquals(done.item, { type: item.type, id: item.id, summary: item.summary })
-    assertEquals(first.events.at(-1).response.output.at(-1), done.item)
+    assertEquals(done.item, item)
+    const { encrypted_content: _, ...terminalItem } = item
+    assertEquals(first.events.at(-1).response.output.at(-1), terminalItem)
     const images = (entries: string[]) => entries.flatMap((line) => JSON.parse(line).message?.content ?? []).filter((b: Json) => b.type === 'image')
     assertEquals(images(replayLog(record, run.tg.gw.store)).length, 60)
     const upstreamImages = run.fake.main()[0].body.messages.flatMap((m: Json) => m.content).filter((b: Json) => b.type === 'image')
@@ -207,10 +208,8 @@ Deno.test('WebSocket misuse is typed, has no fallback, and a recoverable error p
         ['[]', 'invalid_request', null],
         [JSON.stringify({ type: 'response.cancel' }), 'unsupported', 'type'],
         [JSON.stringify({ type: 'response.interrupt' }), 'unsupported', 'type'],
-        [JSON.stringify({ type: 'response.create', ...base, input: 'x', stream: true }), 'unsupported', 'stream'],
         [JSON.stringify({ type: 'response.create', ...base, input: 'x', stream: false }), 'unsupported', 'stream'],
         [JSON.stringify({ type: 'response.create', ...base, input: 'x', stream_id: 'lane' }), 'unsupported', 'stream_id'],
-        [JSON.stringify({ type: 'response.create', ...base, input: 'x', generate: false }), 'unsupported', 'generate'],
         [JSON.stringify({ type: 'response.create', ...base, input: 'x', store: 'false' }), 'invalid_request', 'store'],
         [
           JSON.stringify({ type: 'response.create', ...base, input: 'x', previous_response_id: 'resp_missing' }),
@@ -689,7 +688,7 @@ Deno.test('WebSocket real native tool framing produces a record above 42 MiB wit
     assertEquals(result.recordBytes, opaque!.length)
     assertEquals(result.addedId, result.doneId)
     assertEquals(result.addedId, result.terminalId)
-    assertEquals(result.doneOpaque, false)
+    assertEquals(result.doneMatchesAdded, true)
     assertEquals(result.terminalOpaque, false)
     assertEquals(record.nativeCalls, ['toolu_native_record'])
   })
