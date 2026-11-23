@@ -89,10 +89,11 @@ Deno.test('WebSocket warm-up is validated and socket-local, with no process, bac
     const missing = [400, 'previous_response_not_found', 'previous_response_id']
     assertEquals(await httpError(run, continuation), missing)
     assertEquals(await wsError(run.tg.websocket(), continuation), missing)
-    for (const previous_response_id of [null, 'resp_missing', warm.response.id]) {
+    for (const previous_response_id of ['resp_missing', warm.response.id]) {
       assertEquals(await wsError(ws, { ...body, previous_response_id }), [400, 'unsupported', 'previous_response_id'])
     }
-    const replacement = await ws.send({ ...body, input: [developer('New warm-up.')] })
+    const replacement = await ws.send({ ...body, previous_response_id: null, input: [developer('New warm-up.')] })
+    assertEquals([replacement.status, replacement.response.previous_response_id], ['completed', null])
     assert(warm.response.id !== replacement.response.id)
     assertEquals(await wsError(ws, continuation), missing)
     await ws.close()

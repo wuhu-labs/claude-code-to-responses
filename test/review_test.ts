@@ -33,9 +33,6 @@ Deno.test('a client record whose session is a path is refused before any file is
       const r = await post(run.tg.url, { model: MODEL, instructions: INSTRUCTIONS, tools: TOOLS, stream: true, input: [...history, user('two')] })
       assertEquals([r.status, r.body?.error?.code], [400, 'invalid_provider_record'])
     }
-    const badKeyOrder = (keyOrder: unknown, json?: true) => ({
-      replay: [{ at: 0, line: JSON.stringify({ input: { $cc2r_input: { hash: '0'.repeat(64), path: [0, 3], json, keyOrder } } }) }],
-    })
     for (
       const bad of [
         { device: '../x' },
@@ -48,8 +45,6 @@ Deno.test('a client record whose session is a path is refused before any file is
         },
         { end: 'calls', calls: [] },
         { jsonArgumentDigest: 'not-64-hex' },
-        badKeyOrder([['a', 'a']], true),
-        badKeyOrder([['a']]),
       ]
     ) {
       item.encrypted_content = await encodeRecord({ ...rec, ...bad } as Json)
@@ -60,6 +55,30 @@ Deno.test('a client record whose session is a path is refused before any file is
   })
   Deno.removeSync(victim, { recursive: true })
 })
+
+for (
+  const [label, fields] of [
+    ['duplicate JSON keys', { json: true, keyOrder: [['a', 'a']] }],
+    ['key order on a text reference', { keyOrder: [['a', 'b']] }],
+  ] as const
+) {
+  Deno.test(`a resolvable provider record reference rejects ${label}`, async () => {
+    const run = new Run('invalid-replay-key-order', false)
+    await run.run(async () => {
+      await run.turn('{"a":1,"b":2}')
+      const history = structuredClone(run.drv.history)
+      const item = history.find((i: Json) => i.type === 'reasoning' && i.encrypted_content?.startsWith('cc2r.record.'))
+      const record = (await decodeRecord(item.encrypted_content))!
+      const [first, ...rest] = record.replay!
+      const ref = { hash: '0'.repeat(64), path: [0, 2, 0, 1], ...fields }
+      const line = JSON.stringify({ ...JSON.parse(first.line), fixture: { $cc2r_input: ref } })
+      item.encrypted_content = await encodeRecord({ ...record, replay: [{ ...first, line }, ...rest] })
+      await run.disrupt('restart-lost-store')
+      const r = await post(run.tg.url, { model: MODEL, instructions: INSTRUCTIONS, tools: TOOLS, stream: true, input: [...history, user('two')] })
+      assertEquals([r.status, r.body?.error?.code], [400, 'invalid_provider_record'])
+    })
+  })
+}
 
 Deno.test('an MCP call whose body finishes after its process was killed is fenced, never dispatched', async () => {
   const { Bridge } = await import('../src/bridge.ts')

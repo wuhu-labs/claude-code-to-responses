@@ -76,7 +76,7 @@ type WebSocketCreate = { kind: 'generate'; req: NormRequest } | { kind: 'warmup'
 export function parseWebSocketCreate(body: Record<string, Json>, previous: WarmupPrefix | undefined): WebSocketCreate {
   const { generate, ...request } = body
   if ('generate' in body && typeof generate !== 'boolean') throw invalid('generate', "'generate' must be a boolean.")
-  if (generate === false && 'previous_response_id' in request) {
+  if (generate === false && request.previous_response_id !== undefined && request.previous_response_id !== null) {
     throw unsupported('previous_response_id', 'A warm-up must start a new chain.')
   }
   if (previous) {
