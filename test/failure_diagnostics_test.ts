@@ -19,8 +19,8 @@ import {
 } from '../src/failures.ts'
 import { Active, Lane } from '../src/lane.ts'
 import { ResponseStore } from '../src/store.ts'
-import { type Json, text } from './fake.ts'
-import { sameRequest, user } from './harness.ts'
+import { type Exchange, type Json, text } from './fake.ts'
+import { user } from './harness.ts'
 import { INSTRUCTIONS, MODEL, Run, TOOLS } from './scenario.ts'
 
 const good = { type: 'tool_use', id: 'toolu_safe', name: 'mcp__fn__echo', input: { 'PRIVATE-KEY': 'PRIVATE-VALUE' } }
@@ -247,7 +247,11 @@ for (const transport of ['sse', 'websocket'] as const) {
         error(...args)
       }
       try {
-        run.fake.reply({ blocks: [{ type: 'tool_use', id: 'toolu_bad', name: 'private/tool', input: { 'PRIVATE-KEY': 'PRIVATE-VALUE' } }] })
+        const attempts: { failed?: Exchange; resumed?: Exchange } = {}
+        run.fake.reply((exchange) => {
+          attempts.failed = exchange
+          return { blocks: [{ type: 'tool_use', id: 'toolu_bad', name: 'private/tool', input: { 'PRIVATE-KEY': 'PRIVATE-VALUE' } }] }
+        })
         const failed = await run.send([user('PRIVATE-PROMPT')])
         await lane.gone
         assertEquals([failed.status, failed.response.error.code], ['failed', 'server_error'])
@@ -258,10 +262,15 @@ for (const transport of ['sse', 'websocket'] as const) {
         assertEquals(journalAtKill, [`failure ${raw.trim()}`])
         for (const value of ['private/tool', 'PRIVATE-KEY', 'PRIVATE-VALUE', 'PRIVATE-PROMPT']) assert(!raw.includes(value))
         assertEquals(run.tg.gw.store.has(failed.response.id), false)
-        run.fake.reply({ blocks: [text('retry')] })
+        run.fake.reply((exchange) => {
+          attempts.resumed = exchange
+          return { blocks: [text('retry')] }
+        })
         const retry = await run.send([user('PRIVATE-PROMPT')])
-        assertEquals([retry.status, retry.response.x_gateway.path], ['completed', 'store'])
-        assert(sameRequest(run.fake.main()[1], run.fake.main()[2]))
+        assertEquals([retry.status, retry.response.x_gateway.path, run.drv.text(retry)], ['completed', 'store', 'retry'])
+        assert(attempts.failed && attempts.resumed)
+        assertEquals(record.message_id, `msg_fake_${attempts.failed.n}`)
+        assertEquals(attempts.resumed.raw, attempts.failed.raw)
         assertEquals(Deno.readTextFileSync(run.tg.gw.failures.path), raw, 'retained after retry overwrites the failed attempt log')
         await run.disrupt('restart')
         assertEquals(Deno.readTextFileSync(run.tg.gw.failures.path), atKill)

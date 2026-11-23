@@ -692,6 +692,7 @@ Whether Anthropic's own cache depends on `metadata` is unknown: no request in th
 
 ## Known limits
 
+- After a failed turn, Claude Code can get one more model request out while the gateway is killing its process. The extra inference’s output is discarded.
 - Image input is limited to PNG, JPEG, GIF and WebP base64 data URLs, each at most 5,242,880 base64 characters.
   The limit applies at turn starts, to notices, and to images inside tool outputs. Remote URLs and other formats
   are refused, never downloaded or silently dropped. The gateway does not transcode images; Claude Code may
