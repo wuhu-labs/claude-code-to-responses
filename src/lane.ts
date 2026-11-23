@@ -930,7 +930,7 @@ export class Lane implements BridgeTarget {
       device: this.config.deviceId!,
       end,
       calls,
-      digest: a.digest.finish(a.outputs),
+      ...a.digest.finish(a.outputs),
       entries: compact.entries,
       ...(compact.replay.length ? { replay: compact.replay } : {}),
     }

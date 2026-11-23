@@ -1,7 +1,7 @@
 import { assert, assertEquals } from '@std/assert'
 import { type InItem } from '../src/api/request.ts'
 import { matchRecordItems, remapItems } from '../src/call_ids.ts'
-import { digestItems, type ProviderRecord } from '../src/records.ts'
+import { ItemDigest, type ProviderRecord } from '../src/records.ts'
 import { call, type Json, text } from './fake.ts'
 import { assertPrefix, user } from './harness.ts'
 import { IMAGE } from './images.ts'
@@ -69,7 +69,7 @@ async function sample() {
     { kind: 'function_call_output', callId: 'provider-b', parts: [{ type: 'text', text: 'B' }] },
   ]
   const record = {
-    digest: await digestItems(items),
+    ...new ItemDigest(items).finish(),
     entries: items.filter((it) => it.kind === 'function_call').map((it) =>
       JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id: it.callId }] } })
     ),
@@ -92,13 +92,18 @@ Deno.test('record matching permits only a consistent bijection, including refere
   ) assertEquals(await matchRecordItems(bad, record, []), null)
   assertEquals(await matchRecordItems(client, record, [['uuid-a', 'other-provider']]), null)
   assertEquals(await matchRecordItems(client, record, [['old-client', 'provider-a']]), null)
+  const serialized = client.map((it) => it.kind === 'function_call' ? { ...it, arguments: ` ${it.arguments} ` } : it)
+  assertEquals(await matchRecordItems(serialized, record, []), aliases)
+  const { jsonArgumentDigest: _, ...legacy } = record
+  assertEquals(await matchRecordItems(client, legacy, []), aliases)
+  assertEquals(await matchRecordItems(serialized, legacy, []), null)
 })
 
-Deno.test('record matching never ignores changes to names, argument bytes, output bytes, text, images or order', async () => {
+Deno.test('record matching never ignores changes to names, argument values, output bytes, text, images or order', async () => {
   const { client, record } = await sample()
   const changes = [
     client.map((it) => it.kind === 'function_call' ? { ...it, name: 'changed' } : it),
-    client.map((it) => it.kind === 'function_call' ? { ...it, arguments: '{ "text": "a" }' } : it),
+    client.map((it) => it.kind === 'function_call' ? { ...it, arguments: '{ "text": "different" }' } : it),
     client.map((it) => it.kind === 'function_call_output' ? { ...it, parts: [{ type: 'text' as const, text: 'changed' }] } : it),
     client.map((it) => it.kind === 'message' ? { ...it, parts: [{ type: 'text' as const, text: 'changed' }] } : it),
     client.map((it) =>

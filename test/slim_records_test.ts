@@ -73,7 +73,7 @@ Deno.test('slim synthesized tool history retains framing and does not compound r
     let ws = run.tg.websocket()
     const input = [
       user('historical request'),
-      { type: 'function_call', call_id: 'client-old', name: 'echo', arguments: '{"text":"old"}' },
+      { type: 'function_call', call_id: 'client-old', name: 'echo', arguments: '{ "text": "old", "nested": [{ "b": 2, "a": 1 }] }' },
       { type: 'function_call_output', call_id: 'client-old', output: 'OLD' },
       { role: 'assistant', content: 'historical answer' },
       user('now'),
@@ -91,7 +91,10 @@ Deno.test('slim synthesized tool history retains framing and does not compound r
     await run.disrupt('restart-lost-store')
     ws = run.tg.websocket()
     run.fake.reply({ blocks: [text('next done')] })
-    const recovered = await ws.send({ ...base, input: [...input, ...first.response.output, ...outputs, ...second.response.output, user('next')] })
+    const reordered = input.map((item) =>
+      'type' in item && item.type === 'function_call' ? { ...item, arguments: '{"nested":[{"a":1,"b":2}],"text":"old"}' } : item
+    )
+    const recovered = await ws.send({ ...base, input: [...reordered, ...first.response.output, ...outputs, ...second.response.output, user('next')] })
     assertEquals([recovered.status, recovered.response.x_gateway.records, recovered.response.x_gateway.synthesized_groups], ['completed', 2, 0])
     assertEquals(run.fake.main()[3].raw, live)
     assert(recovered.response.output.at(-1).encrypted_content.length < 16 * 1024)

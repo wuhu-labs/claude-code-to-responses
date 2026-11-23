@@ -45,12 +45,13 @@ reads `~/.claude`.
 - `POST /v1/responses` with `stream: true`. Accepted: `model`, `instructions` (or a leading input system/developer prompt on a full create), `tools` (function tools),
   `input` (a string, or `message`, `function_call`, `function_call_output` and `reasoning` items), `previous_response_id`,
   `reasoning.effort` (`low`, `medium`, `high`, `xhigh`, `max`; default `high`), `reasoning.summary: "auto"`,
-  `max_output_tokens` (a positive safe integer or `null`), `metadata`, `store` (boolean),
+  `max_output_tokens` (a positive safe integer or `null`), `metadata`, `client_metadata` (object), `store` (boolean),
   `tool_choice` (`auto` or a named function), and the neutral values of `parallel_tool_calls`, `truncation`, `text`, `include` (`reasoning.encrypted_content`),
   `service_tier`, `user`, `prompt_cache_key`, `safety_identifier`.
 - Anything else is a `400` with `code: unsupported` and the offending `param`: other tool types, `strict: true`,
   `background: true`, `temperature`, `top_p`, non-text output formats, misplaced `system` or
   `developer` messages, item references, images outside base64 data URLs or formats other than PNG, JPEG, GIF and WebP.
+- **Client metadata.** Top-level `client_metadata` must be a JSON object on HTTP and WebSocket. Its contents are ignored, not stored, not echoed, and never affect chain identity. Other types (including `null`) produce `400 invalid_request`, `param: client_metadata`. This is separate from the echoed `metadata` field.
 - **Instructions.** A full create (no `previous_response_id`) requires either nonempty top-level `instructions` or
   a nonempty prompt from the maximal leading run of `system`/`developer` input messages (`type: "message"` or
   omitted `type`). Each message’s content is a string or an array of `input_text` parts. Flatten all these strings
@@ -108,7 +109,7 @@ reads `~/.claude`.
   | `unsupported_notice_command` | `400`: the final written block of a new queued notice is text whose trimmed value starts with `/`. Claude Code would defer it to a separate turn; send an ordinary user turn instead. No client text is relabeled. |
   | `conversation_busy` | `409`: another response of the conversation is streaming or starting. |
   | `websocket_response_in_progress` | `409`: a second create arrived before the socket's active response ended. |
-  | `response_too_large` | `413`: an outbound message or terminal batch exceeds its byte limit; reports required/allowed bytes, closes `1009`, and is nonretryable without changing input. |
+  | `response_too_large` | `413`: an outbound message or terminal batch exceeds its byte limit; reports required/allowed bytes, closes `1009`, and is nonretryable without changing input. A provider record counts twice against the WebSocket terminal batch. |
   | `websocket_message_too_large` | `413`: an inbound message exceeds 128 MiB; the socket closes with `1009`. |
   | `not_found`, `response_not_in_progress` | Cancel of an unknown response, or of one that is no longer streaming. |
   | `shutting_down` | `503`: the gateway is stopping. |
@@ -210,7 +211,7 @@ A bad credential refuses the upgrade with HTTP `401 invalid_api_key`, not a sock
 No beta header is required.
 
 Send one **JSON text message** per request, with `type: "response.create"` and the ordinary fields accepted above,
-but **omit `stream`** (even `stream: false` is unsupported). Streaming is implicit:
+with `stream` omitted or `stream: true`. Streaming is implicit; `stream: false` is unsupported:
 
 ```json
 {"type":"response.create","model":"claude-opus-5-5","instructions":"Answer briefly.","input":"Hello"}
@@ -220,7 +221,7 @@ Each server text message is one of the same JSON streaming events as SSE, includ
 `sequence_number` starting at zero for each response. Finish a turn at `response.completed`, `response.failed`
 or `response.incomplete`, **not at socket EOF**. The socket stays open for later turns. Resend tools and other request properties on every create; they are not socket configuration. Instructions may be
 omitted in a continuation to inherit the chain’s prompt; if present they must match it exactly. Do not resend a
-system/developer input message in a continuation.
+system/developer input message in a continuation of a generated response.
 
 ```json
 {"type":"response.create","model":"claude-opus-5-5","instructions":"Answer briefly.","previous_response_id":"resp_…","input":[{"role":"user","content":"And another question"}]}
@@ -251,17 +252,17 @@ open.
 Ordinary validation errors leave the connection usable; after generation has started, model errors still arrive
 as `response.failed`, exactly as on SSE. This includes a process-start/rebuild exception after the response is
 attached: it terminates that response, kills any partially started process, discards the attempt's tail and releases
-the conversation and socket single-flight slot, so the previous completed response can be retried. Unknown client events, binary JSON, `stream_id`, `generate` (including
-warm-up), steering and interrupt/cancel messages are typed `unsupported` errors. There is no automatic recovery
+the conversation and socket single-flight slot, so the previous completed response can be retried. Unknown client events, binary JSON, `stream_id`, steering and interrupt/cancel messages are typed `unsupported` errors. There is no automatic recovery
 or transport fallback: after `previous_response_not_found`, the client may explicitly resend full history on the
 same WebSocket.
 
-HTTP and WebSocket use **one durable response store and one set of Claude Code chains**. A response created over
+HTTP and WebSocket use **one durable response store and one set of Claude Code chains**. A generated response created over
 either transport can be continued over the other, or over a new connection, with the same eviction/rebuild and
 provider-record behavior. Unlike OpenAI's connection-local `store: false` mode, every response here is retained
 regardless of `store: false`, `store: true` or an absent `store`: the flag does not change gateway retention.
-Named lanes, concurrent responses on one socket, warm-up/steering, OpenAI's
-60-minute connection expiry and its full Responses feature set are not implemented.
+Named lanes, concurrent responses on one socket, steering, OpenAI's 60-minute connection expiry and its full Responses feature set are not implemented.
+
+**Warm-up.** WebSocket `generate: false` must start a chain; a non-null `previous_response_id` is `400 unsupported`. It validates the create (a prompt-only input is allowed) and replies with `response.created` then `response.completed` with a new id, empty output and zero usage, without starting Claude Code or calling the backend. Only the originating socket can use that id. A create naming it is a full create with the warm-up input prepended to its input (which may be `[]` if the combined input is sufficient). Leading system/developer messages are interpreted together, just as in one full create. Top-level `instructions` on the new create override warm-up `instructions`; either source still conflicts with leading system/developer messages. All other fields come from the new create. Each socket keeps only its latest warm-up, in memory until replaced or the socket closes. A replaced id, or one used from another socket or HTTP, is `400 previous_response_not_found`. WebSocket `generate: true` is the same as omitting it. HTTP does not support `generate`.
 
 Closing or losing a socket **mid-response** cancels that response and kills its process, just like the HTTP cancel
 endpoint. Continue from the last completed response, never the cancelled id. A socket closed **after a completed
@@ -276,7 +277,7 @@ Application messages/events are limited to **128 MiB of UTF-8 bytes** (binary me
 Deno reassembles inbound frames before this application limit is checked; this is not a wire-level frame or
 preallocation limit. The writer never waits on a client from the Claude Code lane: it caps buffered outbound bytes
 at **128 MiB** and closes if they make no draining progress for **5 seconds**, even after a response's terminal event.
-On WebSocket only, provider-record reasoning `encrypted_content` is sent once, on `response.output_item.added`; `response.output_item.done` and the terminal response retain the same item id/type/summary without repeating the opaque bytes. Consumers retain the added item by id. HTTP/SSE is unchanged and includes opaque content in all three events.
+WebSocket provider-record reasoning includes the same `encrypted_content` on `response.output_item.added` and `response.output_item.done`; the terminal response retains the same item id/type/summary without the opaque content. HTTP/SSE includes opaque content in all three events. On WebSocket the record counts twice against the unchanged terminal batch budget, so the largest record that fits is about half the previous limit (less than 64 MiB after accounting for the other event bytes).
 
 The entire final batch (provider-record events plus terminal) is serialized and checked against the message and
 buffer budgets **before success is committed**. A rejected final enqueue cancels the attempt, removes its record,
@@ -286,6 +287,31 @@ retains the completed response on either transport; enqueue is not an acknowledg
 parsed the bytes. Overflow before that boundary cancels active work. Fatal size/backpressure errors get one small best-effort typed error followed by
 close; a client that never reads cannot be guaranteed to see that error. No output is silently dropped to keep an
 inference running.
+
+## Codex CLI
+
+Codex CLI 0.171.0 can connect directly using WebSocket. For example, put this in `config.toml` under `CODEX_HOME` and set `GATEWAY_TOKEN` to the gateway's bearer token (or a placeholder if the gateway does not require one):
+
+```toml
+model = "claude-haiku-5-5"
+model_provider = "claude_gateway"
+model_reasoning_effort = "low"
+web_search = "disabled"
+
+[model_providers.claude_gateway]
+name = "Claude Code gateway"
+base_url = "http://127.0.0.1:18330/v1"
+env_key = "GATEWAY_TOKEN"
+wire_api = "responses"
+supports_websockets = true
+
+[features]
+multi_agent = false
+```
+
+The last two tool settings prevent Codex from adding `web_search` and `namespace` tools. Those tools are still rejected, not silently dropped. Codex 0.171.0 warns that `multi_agent` is deprecated; this configuration was verified with that release.
+
+In a direct run with Codex 0.171.0 and Claude Code 2.1.322 against a fake Anthropic endpoint, `codex exec` sent a developer-only warm-up, referenced its id on the same socket, received two `exec_command` calls, then sent their results using the generated response id (`x_gateway.path: live`). `codex exec resume --last` opened a new socket, warmed up, and sent history with both records recovered from `response.output_item.done` (`x_gateway.path: history`, `records: 2`, `synthesized_groups: 0`). The regression tests compare the upstream bytes of split and single full creates and replay finalized items from a tool round on a new socket.
 
 ## Wuhu kernel request compatibility
 
@@ -297,7 +323,7 @@ InferenceKit’s executor/catalog. The `responses` dialect is not the `codex` di
 |---|---|
 | `type: "response.create"` | WebSocket envelope, required; removed before shared request validation. |
 | `model` | Required, forwarded to Claude Code, fixed per chain. |
-| `stream: true` | HTTP/SSE only; kernel removes it on WebSocket (sending it there is unsupported). |
+| `stream: true` | Required on HTTP/SSE and accepted on WebSocket; the kernel still omits it on WebSocket. |
 | `store: false` | Accepted; records still retained; response reports actual `store: true`. |
 | Leading `{role:"system",content:"…"}` | Full create’s chain instructions, removed from history. Leading developer/text-part variants obey the literal-concatenation rule above. |
 | Nil or empty session prompt | The builder omits the system message. The kernel must carry a nonempty session prompt for a full create; otherwise the gateway returns `400 invalid_request`, `param: instructions`. No default prompt is invented. |
@@ -465,7 +491,7 @@ disk; `--session-mirror` only tells the gateway when to read the file. A turn co
 
 Records live under `<state-dir>/responses` and travel as `encrypted_content` (gzip + base64, not encrypted). Existing fat v1 records remain readable and replay
 verbatim. New records use optional payload-free replay templates within the v1 envelope. Client records, template positions and input references are validated
-before file access. Their digest must match the covered input/output items before recovery resolves references.
+before file access. Their digest must match the covered input/output items before recovery resolves references. New records also match reserialized function arguments by JSON value (including reordered object keys); old records still match their original argument strings. Replay retains the recorded argument order and model bytes.
 
 Losing the response store alone does not change model bytes while payload sidecars survive. If both the store and sidecars are lost, a full-history create
 regenerates referenced payloads from its input items. Native re-encoded images become the original input images in that rare case, causing a one-time image
@@ -483,15 +509,15 @@ response is attached, so simultaneous requests never rebuild it twice. The next 
   chain and session, `prev` link, and a digest of the items it covers). The longest such run is written verbatim;
   items without a usable record are **synthesized** as plain log entries, which makes that request a cold cache miss
   (expected). The next response's digest covers the synthesized part, but only small templates/references enter its record; later rebuilds restore the log from input and sidecars without retransmitting that history inside opaque records.
-  Record matching permits one difference: a consistent **one-to-one renaming of `call_id` across the whole history**,
+  Record matching permits a consistent **one-to-one renaming of `call_id` across the whole history**,
   as when Wuhu commits provider calls under kernel UUIDs. The gateway derives the original ordered tool ids from
-  each record's unchanged framing, binds the client ids bijectively, then verifies the existing digest after changing
-  only those ids. Item order, names, argument-string bytes, outputs, text and images must still match exactly.
+  each record's unchanged framing, binds the client ids bijectively, then verifies the digest after translating
+  those ids. Apart from the argument reserialization above, item order, names, outputs, text and images must still match exactly.
   Conflicting/many-to-one ids or any content mismatch prevent record reuse; that history is synthesized and
   `x_gateway.records` / `synthesized_groups` expose the path. On a match the original session, provider ids and image labels are retained. Log bytes are replayed verbatim while sidecars exist (or from an older fat record); full-loss native image regeneration has the one-time cache break described above. Input results are translated to provider ids before delivery, and
   aliases are saved in subsequent provider records so they survive another process eviction, retained-store restart
   or lost-store history rebuild. Provider ids remain the ids in Responses output; the kernel still translates warm
-  deltas normally. Already-issued records work too: no alternate digest or new-record-only matching is required.
+  deltas normally. Already-issued records still support the same call-id aliasing.
 - When the log stops at held calls, the gateway appends tool results and the queued notice/empty anchor described above,
   or the fixed line `Continue from where you left off.` without notices, then resumes with
   `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1`. These entries land in the response's record and replay exactly.
@@ -666,6 +692,7 @@ Whether Anthropic's own cache depends on `metadata` is unknown: no request in th
 
 ## Known limits
 
+- After a failed turn, Claude Code can get one more model request out while the gateway is killing its process. The extra inference’s output is discarded.
 - Image input is limited to PNG, JPEG, GIF and WebP base64 data URLs, each at most 5,242,880 base64 characters.
   The limit applies at turn starts, to notices, and to images inside tool outputs. Remote URLs and other formats
   are refused, never downloaded or silently dropped. The gateway does not transcode images; Claude Code may
