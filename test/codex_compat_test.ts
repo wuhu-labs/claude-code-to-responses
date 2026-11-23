@@ -89,8 +89,14 @@ Deno.test('WebSocket warm-up is validated and socket-local, with no process, bac
     const missing = [400, 'previous_response_not_found', 'previous_response_id']
     assertEquals(await httpError(run, continuation), missing)
     assertEquals(await wsError(run.tg.websocket(), continuation), missing)
+    for (const previous_response_id of [null, 'resp_missing', warm.response.id]) {
+      assertEquals(await wsError(ws, { ...body, previous_response_id }), [400, 'unsupported', 'previous_response_id'])
+    }
+    const replacement = await ws.send({ ...body, input: [developer('New warm-up.')] })
+    assert(warm.response.id !== replacement.response.id)
+    assertEquals(await wsError(ws, continuation), missing)
     await ws.close()
-    assertEquals(await wsError(run.tg.websocket(), continuation), missing)
+    assertEquals(await wsError(run.tg.websocket(), { ...continuation, previous_response_id: replacement.response.id }), missing)
     assertEquals(run.fake.exchanges.length, 0)
   })
 })
@@ -112,6 +118,12 @@ Deno.test('WebSocket warm-up plus continuation sends the same upstream bytes as 
     const [a, b] = run.fake.main()
     assertEquals(run.normalize(a.raw), run.normalize(b.raw))
 
+    assertEquals(await wsError(ws, { ...actual, previous_response_id: warm.response.id, input: suffix, instructions: 'Conflict.' }), [
+      400,
+      'invalid_request',
+      'instructions',
+    ])
+
     const top = await ws.send({ ...base, instructions: INSTRUCTIONS, generate: false, input: 'Already sent during warm-up.' })
     const delta = { ...base, previous_response_id: top.response.id }
     assertEquals(await wsError(ws, { ...delta, input: [developer('Too late.')] }), [400, 'unsupported', 'input[1].role'])
@@ -121,11 +133,6 @@ Deno.test('WebSocket warm-up plus continuation sends the same upstream bytes as 
     const replaced = await ws.send({ ...delta, input: [], instructions: 'New instructions.' })
     assertEquals(replaced.status, 'completed')
     assertEquals(replaced.response.instructions, 'New instructions.')
-    assertEquals(await wsError(ws, { ...actual, previous_response_id: warm.response.id, input: suffix, instructions: 'Conflict.' }), [
-      400,
-      'invalid_request',
-      'instructions',
-    ])
   })
 })
 

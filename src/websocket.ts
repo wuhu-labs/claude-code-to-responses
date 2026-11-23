@@ -3,7 +3,7 @@ import { Buffer } from 'node:buffer'
 // OpenAI Responses WebSocket subset: one create in flight, text JSON events, no cancel message.
 import { parseWebSocketCreate, WARMUP_ID_STEM, type WarmupPrefix } from './api/request.ts'
 import { type EventSink, GatedSink, newId, ResponseState, type SinkEvent } from './api/stream.ts'
-import { asGatewayError, GatewayError, invalid, previousResponseNotFound, serverError, unsupported } from './errors.ts'
+import { asGatewayError, GatewayError, invalid, serverError, unsupported } from './errors.ts'
 import type { Gateway } from './gateway.ts'
 
 type Json = any
@@ -214,13 +214,12 @@ export function upgradeResponses(req: Request, gw: Gateway): Response {
   }
   const writer = new SocketWriter(socket)
   let active: SocketSink | null = null
-  const warmups = new Map<string, { prefix: WarmupPrefix; bytes: number }>()
-  let warmupBytes = 0
+  let warmup: { id: string; prefix: WarmupPrefix } | undefined
   // Reserve synchronously, before parse/hash/store work yields. Rejected creates never touch a lane.
   const untrack = gw.trackConnection(() => writer.shutdown())
   writer.onDisconnect = () => {
     untrack()
-    warmups.clear()
+    warmup = undefined
     active?.cancel()
   }
   socket.onclose = socket.onerror = () => writer.disconnect()
@@ -246,17 +245,10 @@ export function upgradeResponses(req: Request, gw: Gateway): Response {
       if (event.type !== 'response.create') throw unsupported('type', "Only 'response.create' is supported; there is no cancel message.")
       if (active) throw new GatewayError(409, 'conflict_error', 'websocket_response_in_progress', 'One response is already in flight on this connection.')
       const { type: _type, ...body } = event
-      const previous = warmups.get(body.previous_response_id)
-      const create = parseWebSocketCreate(body, previous?.prefix)
+      const previous = warmup && warmup.id === body.previous_response_id ? warmup.prefix : undefined
+      const create = parseWebSocketCreate(body, previous)
       if (create.kind === 'warmup') {
         const { req, prefix } = create
-        if (req.previousResponseId !== null && !gw.store.has(req.previousResponseId)) {
-          throw previousResponseNotFound(req.previousResponseId, "it is not in this gateway's store")
-        }
-        const bytes = size + (previous?.bytes ?? 0)
-        if (warmupBytes + bytes > WS_MAX_MESSAGE_BYTES) {
-          throw new GatewayError(413, 'invalid_request_error', 'warmup_limit_exceeded', 'This connection has reached its warm-up input limit.')
-        }
         const sink = new SocketSink(writer, () => {})
         const state = new ResponseState(req, newId(WARMUP_ID_STEM))
         const started = { ...state.object(), store: false }
@@ -268,8 +260,7 @@ export function upgradeResponses(req: Request, gw: Gateway): Response {
             { type: 'response.completed', data: { response: { ...state.object(), store: false } } },
           ])?.()
         ) {
-          warmups.set(state.id, { prefix, bytes })
-          warmupBytes += bytes
+          warmup = { id: state.id, prefix }
         }
         return
       }
