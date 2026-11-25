@@ -1,8 +1,8 @@
 // Responses routes: POST /v1/responses (SSE), GET /v1/responses (WebSocket), POST /v1/responses/{id}/cancel; GET /v1/usage;
 // GET /healthz.
-import { parseRequest } from './api/request.ts'
+import { type InputMode, type NormRequest, parseRequest } from './api/request.ts'
 import { asGatewayError, GatewayError, invalid } from './errors.ts'
-import type { Gateway } from './gateway.ts'
+import type { EventSink } from './api/stream.ts'
 import { upgradeResponses } from './websocket.ts'
 
 function sameToken(given: string, want: string): boolean {
@@ -12,7 +12,20 @@ function sameToken(given: string, want: string): boolean {
   return diff === 0
 }
 
-export function handler(gw: Gateway): (req: Request) => Promise<Response> {
+/** Transport contract shared by the independent provider lanes. */
+export interface ResponsesEndpoint {
+  readonly config: { authToken?: string }
+  readonly lanes: { readonly size: number }
+  readonly inputMode?: InputMode
+  assertOpen(): void
+  trackConnection(close: () => void): () => void
+  usageReport(): unknown
+  create(req: NormRequest): Promise<ReadableStream<Uint8Array>>
+  createInto(req: NormRequest, sink: EventSink): Promise<void>
+  cancel(id: string): unknown
+}
+
+export function handler(gw: ResponsesEndpoint): (req: Request) => Promise<Response> {
   return async (req) => {
     const url = new URL(req.url)
     try {
@@ -31,7 +44,7 @@ export function handler(gw: Gateway): (req: Request) => Promise<Response> {
         } catch {
           throw invalid(null, 'The request body is not valid JSON.')
         }
-        const stream = await gw.create(parseRequest(body))
+        const stream = await gw.create(parseRequest(body, 'sse', gw.inputMode))
         return new Response(stream, { headers: { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache' } })
       }
       const m = /^\/v1\/responses\/([A-Za-z0-9_-]+)\/cancel$/.exec(url.pathname)

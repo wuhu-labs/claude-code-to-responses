@@ -10,8 +10,11 @@ export const MAX_IMAGE_BASE64_CHARS = 5 * 1024 * 1024
 
 export type Part = { type: 'text'; text: string } | { type: 'image'; mediaType: string; data: string }
 
+export type InputMode = 'claude' | 'agy'
+type MessageRole = 'user' | 'assistant' | 'developer' | 'system'
+
 export type InItem =
-  | { kind: 'message'; role: 'user' | 'assistant'; parts: Part[] }
+  | { kind: 'message'; role: MessageRole; parts: Part[] }
   | { kind: 'function_call'; callId: string; name: string; arguments: string }
   | { kind: 'function_call_output'; callId: string; parts: Part[] }
   | { kind: 'reasoning'; encrypted: string | null }
@@ -27,6 +30,7 @@ export interface NormRequest {
   instructions: string | null
   maxOutputTokens: number | null
   tools: FnTool[]
+  toolsSpecified?: boolean
   effort: string
   previousResponseId: string | null
   input: InItem[]
@@ -73,7 +77,7 @@ export interface WarmupPrefix {
 
 type WebSocketCreate = { kind: 'generate'; req: NormRequest } | { kind: 'warmup'; req: NormRequest; prefix: WarmupPrefix }
 
-export function parseWebSocketCreate(body: Record<string, Json>, previous: WarmupPrefix | undefined): WebSocketCreate {
+export function parseWebSocketCreate(body: Record<string, Json>, previous: WarmupPrefix | undefined, mode: InputMode = 'claude'): WebSocketCreate {
   const { generate, ...request } = body
   if ('generate' in body && typeof generate !== 'boolean') throw invalid('generate', "'generate' must be a boolean.")
   if (generate === false && request.previous_response_id !== undefined && request.previous_response_id !== null) {
@@ -84,16 +88,16 @@ export function parseWebSocketCreate(body: Record<string, Json>, previous: Warmu
     if (!('instructions' in request) && previous.instructions !== undefined) request.instructions = previous.instructions
     delete request.previous_response_id
   }
-  const req = normalizeRequest(request, 'websocket', generate === false)
+  const req = normalizeRequest(request, 'websocket', generate === false, mode)
   if (generate !== false) return { kind: 'generate', req }
   return { kind: 'warmup', req, prefix: { input: inputItems(request.input), instructions: request.instructions } }
 }
 
-export function parseRequest(body: unknown, transport: 'sse' | 'websocket' = 'sse'): NormRequest {
-  return normalizeRequest(body, transport, false)
+export function parseRequest(body: unknown, transport: 'sse' | 'websocket' = 'sse', mode: InputMode = 'claude'): NormRequest {
+  return normalizeRequest(body, transport, false, mode)
 }
 
-function normalizeRequest(body: unknown, transport: 'sse' | 'websocket', warmup: boolean): NormRequest {
+function normalizeRequest(body: unknown, transport: 'sse' | 'websocket', warmup: boolean, mode: InputMode): NormRequest {
   if (!isObj(body)) throw invalid(null, 'The request body must be a JSON object.')
   for (const k of Object.keys(body)) {
     if (!ACCEPTED.has(k)) throw unsupported(k, `Field '${k}' is not supported by this gateway.`)
@@ -224,13 +228,14 @@ function normalizeRequest(body: unknown, transport: 'sse' | 'websocket', warmup:
   if (isObj(body.tool_choice) && !tools.some((t) => t.name === body.tool_choice.name)) {
     throw invalid('tool_choice.name', 'A named tool choice must name one of the request’s function tools.')
   }
-  const { instructions, input } = parseInstructionsAndInput(body, previousResponseId)
+  const { instructions, input } = parseInstructionsAndInput(body, previousResponseId, mode)
   if (!warmup && input.length === 0) throw invalid('input', "'input' must not be empty.")
   return {
     model: body.model,
     instructions,
     maxOutputTokens,
     tools,
+    ...(mode === 'agy' ? { toolsSpecified: body.tools != null } : {}),
     effort,
     previousResponseId,
     input,
@@ -245,16 +250,18 @@ function inputItems(input: unknown): unknown[] {
   throw invalid('input', "'input' must be a string or an array of items.")
 }
 
-function parseInstructionsAndInput(body: Json, previous: string | null): { instructions: string | null; input: InItem[] } {
+function parseInstructionsAndInput(body: Json, previous: string | null, mode: InputMode): { instructions: string | null; input: InItem[] } {
   const input = inputItems(body.input)
   const leading: string[] = []
   let first = 0
-  while (first < input.length) {
+  while (first < input.length && (mode === 'claude' || previous === null)) {
     const it = input[first]
     if (!isObj(it) || (it.type !== undefined && it.type !== 'message') || (it.role !== 'system' && it.role !== 'developer')) break
     const p = `input[${first}]`
     if (previous !== null) throw unsupported(`${p}.role`, 'System/developer input messages are only accepted at the beginning of a full create.')
-    if ('instructions' in body) throw invalid('instructions', 'Use top-level instructions or leading system/developer messages, never both.')
+    if (mode === 'claude' && 'instructions' in body) {
+      throw invalid('instructions', 'Use top-level instructions or leading system/developer messages, never both.')
+    }
     if (typeof it.content === 'string') leading.push(it.content)
     else if (Array.isArray(it.content)) {
       for (let j = 0; j < it.content.length; j++) {
@@ -269,25 +276,25 @@ function parseInstructionsAndInput(body: Json, previous: string | null): { instr
   let instructions: string | null = null
   if ('instructions' in body) {
     if (typeof body.instructions !== 'string' || !body.instructions) throw invalid('instructions', "'instructions' must be a nonempty string.")
-    instructions = body.instructions
+    instructions = mode === 'agy' ? body.instructions + leading.join('') : body.instructions
   } else if (first > 0) instructions = leading.join('')
-  const items = input.slice(first).map((it, i) => parseItem(it, `input[${i + first}]`))
+  const items = input.slice(first).map((it, i) => parseItem(it, `input[${i + first}]`, mode))
   if (previous === null && !instructions) {
     throw invalid('instructions', 'The kernel must carry a nonempty session prompt in top-level instructions or leading system/developer text.')
   }
   return { instructions, input: items }
 }
 
-function parseItem(it: unknown, p: string): InItem {
+function parseItem(it: unknown, p: string, mode: InputMode): InItem {
   if (!isObj(it)) throw invalid(p, 'Input items must be objects.')
   const type = it.type ?? (it.role !== undefined ? 'message' : undefined)
   switch (type) {
     case 'message': {
       const role = it.role
-      if (role !== 'user' && role !== 'assistant') {
+      if (role !== 'user' && role !== 'assistant' && !(mode === 'agy' && (role === 'developer' || role === 'system'))) {
         throw unsupported(`${p}.role`, `Message role '${role}' is not supported here: system/developer messages must lead a full create.`)
       }
-      return { kind: 'message', role, parts: parseContent(it.content, `${p}.content`, role) }
+      return { kind: 'message', role, parts: parseContent(it.content, `${p}.content`, role, mode) }
     }
     case 'function_call': {
       if (typeof it.call_id !== 'string' || !it.call_id) throw invalid(`${p}.call_id`, 'function_call items need a call_id.')
@@ -307,7 +314,7 @@ function parseItem(it: unknown, p: string): InItem {
     case 'function_call_output': {
       if (typeof it.call_id !== 'string' || !it.call_id) throw invalid(`${p}.call_id`, 'function_call_output items need a call_id.')
       const out = it.output
-      const parts = typeof out === 'string' ? [{ type: 'text', text: out } as Part] : parseContent(out, `${p}.output`, 'user')
+      const parts = typeof out === 'string' ? [{ type: 'text', text: out } as Part] : parseContent(out, `${p}.output`, 'user', mode)
       return { kind: 'function_call_output', callId: it.call_id, parts }
     }
     case 'reasoning': {
@@ -320,7 +327,7 @@ function parseItem(it: unknown, p: string): InItem {
   }
 }
 
-function parseContent(content: unknown, p: string, role: 'user' | 'assistant'): Part[] {
+function parseContent(content: unknown, p: string, role: MessageRole, mode: InputMode): Part[] {
   if (typeof content === 'string') return [{ type: 'text', text: content }]
   if (!Array.isArray(content)) throw invalid(p, 'Content must be a string or an array of parts.')
   return content.map((c, i) => {
@@ -334,6 +341,7 @@ function parseContent(content: unknown, p: string, role: 'user' | 'assistant'): 
       }
       return { type: 'text', text: c.text }
     }
+    if (c.type === 'input_image' && mode === 'agy') throw unsupported(`${q}.type`, 'The agy gateway accepts text only.')
     if (c.type === 'input_image' && role === 'user') {
       const url = c.image_url
       const m = typeof url === 'string' ? /^data:(image\/(?:png|jpeg|gif|webp));base64,([\s\S]*)$/.exec(url) : null
