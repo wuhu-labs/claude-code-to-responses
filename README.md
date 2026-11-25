@@ -609,6 +609,72 @@ limit)"; a backend `retry-after` reaches nothing. The report precedes the turn's
 Not pinned on purpose: `CLAUDE_CODE_RESUME_INTERRUPTED_TURN_MAX_AGE_MS` (unset means no age limit on resuming a
 held call in 2.1.322), `CLAUDE_CODE_OVERRIDE_DATE` (no effect in 2.1.322), the prompt-cache TTL variables.
 
+## Antigravity (`agy`) gateway
+
+The second executable serves the same Responses SSE and WebSocket routes on loopback. It drives **agy 1.5.17**
+over ACP, not Google's API. Run it as the macOS user already signed in to `agy`; the probe found that the login
+keychain works with the gateway's isolated `--gemini-dir`. Use a dedicated state folder outside any checkout.
+The gateway never reads sign-in files or calls Google itself.
+
+```sh
+deno task start:agy --state-dir ~/.local/state/agy-to-responses --agy ~/.local/bin/agy --port 18331
+# or: deno task compile:agy, then .state/bin/agy-to-responses with the same options
+```
+
+`--agy` defaults to `agy` on `PATH`; the port defaults to `18331`. `--auth-token-env VAR` adds a bearer gate.
+`--allow-untested-agy` overrides the version check, not the wire and fence checks. `--idle-timeout` and
+`--hold-timeout` evict live processes after 1800 and 600 seconds respectively by default. Each state directory
+is exclusive to one gateway; it holds request and response text, the isolated agy state, one workspace per chain,
+and the last usage report. Shutdown and eviction kill the dedicated agy process group, including its stdio and
+hook helpers. Startup reaps old groups by their state path and per-workspace agent name.
+
+Use an exact agy model selection value as `model`, such as `gemini-3.8-flash-low`. The agy model selection owns
+its effort; the Responses `reasoning.effort` and `max_output_tokens` do not configure agy. For Codex CLI, use the
+configuration in [Codex CLI](#codex-cli) with an agy model id and `http://127.0.0.1:18331/v1` as the base URL.
+
+**Tool rounds.** A `function_call` response ends as soon as the first matching MCP call is held, but it contains
+all the client calls from that inference's planner line. The first ID is ACP's `toolCallId`; later calls do not have
+ACP IDs yet, so the gateway assigns stable IDs and checks actual executions against the planned order and
+arguments. Post one output per ID (over either transport, in any order). User messages alongside outputs become
+user turns before the next inference; developer and system messages become system notices. They are queued
+before any result is released. With no pending outputs a new message goes through an ordinary ACP prompt;
+non-user roles are labeled in its text. An image anywhere in the input is `400 unsupported`. Absent or mismatched planner
+lines fall back to one call per response and a diagnostic; usage is absent where it cannot be attributed.
+
+**Restart.** A `previous_response_id` continues the live process or resumes its persisted conversation in the same
+workspace. ACP does not re-issue interrupted tools; after an evicted hold or restart the gateway sends their results
+and any new messages as text in one prompt. On missing native state, changed tools/instructions/model, or a native
+session ahead of the selected response, the gateway starts a fresh native session and renders the recorded client
+history as text. An ACP resume error also takes this path. Without `previous_response_id` it always starts fresh, rendering any supplied history as text.
+This is not byte-identical replay; no Claude provider records are created. An omitted `tools` on a continuation
+inherits the last set; an explicit empty list removes it.
+
+**Usage.** `GET /v1/usage` returns `plan_type` (agy's tier id), `tier` (`name`, `id`), and `tokens` (the last
+attributable input, cache, output and thought counts), or `null` until reported. No quota windows, reset times,
+or `codex.rate_limits` events. A planner row with thinking does not necessarily report its thought-token split;
+unknown counts are `null` rather than inferred from text length.
+
+### agy pins and measurements
+
+The internal report *agy 1.5.17 ACP probe 2 — planner line, errors, steering, usage, restart* (2026-11-26)
+measured the pins below. The earlier report *agy 1.5.16 headless + MCP probe* (2026-11-24) measured
+stream-json restarting with a replayed call, unlike ACP.
+
+| Pin or observed behavior | Evidence |
+|---|---|
+| `agy acp --stdio --gemini-dir <state>/gemini --agent <name>`; `AGY_CLI_DISABLE_AUTO_UPDATE=true`. Fenced agent: `tools: []`, list-of-objects `mcpServers`, `inheritMcp: false`, `inheritCustomizations: true`. Agent body is the client's instructions. | ACP probe §0/A and housekeeping. A failed agent can silently fall back; the gateway reads its own ACP log for the startup/session banners and rejects the fallback warning **before sending a prompt**. The normal and fallback logs were separately inspected. |
+| A single stdio `mcpServers` entry in `<gemini-dir>/config/mcp_config.json`, with `timeoutSeconds: -1`. agy starts the gateway executable in shim mode, with the lane token and loopback origin inherited from agy. Declarations carry `_meta["antigravity/alwaysLoad"] = true`. | §G/H and MCP rig. A session/new server timed out at 180 s; the config-file server held at least 400 s. Stdio inherits env; HTTP tools were lazy. |
+| Permission decisions use the ACP **name** and exact declared `mcp_responses_` tool, never the title. Other permission requests are denied. | §C and `err4` trace: a native shell title contains the command line, and denying a call ends the turn. |
+| `PLANNER_RESPONSE` is visible before the hold; `transcript_full.jsonl` has real JSON values; `transcript.jsonl` stringifies each value. `toolSummary` is agy's added field. ACP supplies the live first-call id and distinct text/thought chunks. | §B/H3 and raw `shape1` trace; 70/70 calls saw the line at first read, and all 30 measured batches issued in listed order. |
+| `PreInvocation` returns `injectSteps` (`{userMessage: string}` / `{systemMessage: {systemMessage: string}}`). A handler fires twice, so only one gets the queue per `invocationNum`. Never send another `session/prompt` during a held turn. | §D/G2. 40 KB arrived whole; ACP's own prompt queue ends the current RPC prematurely. |
+| `session/resume` does not replay interrupted MCP calls. Tier is in `session/new` `_meta`; ACP prompt-result counts are cumulative, and `usage_update` describes context, not quota. | §E/F and `restart1_r` trace. |
+
+The custom agent limits exposed tools but is not an OS sandbox. agy still supplies some base-prompt text and
+may declare a few small built-ins; read-only built-ins need not send a permission request. Tool schemas must
+also be accepted by Gemini (the probe's array without `items` failed). The planner can split client tool rounds
+but does not control agy's internal autonomous inferences. The automated suite exercises the gateway against
+`test/fixtures/fake_agy.ts`, not the real binary; check the pins again before upgrading.
+
 ## Tests
 
 ```sh

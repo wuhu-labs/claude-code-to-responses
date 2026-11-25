@@ -4,7 +4,7 @@ import { Buffer } from 'node:buffer'
 import { parseWebSocketCreate, WARMUP_ID_STEM, type WarmupPrefix } from './api/request.ts'
 import { type EventSink, GatedSink, newId, ResponseState, type SinkEvent } from './api/stream.ts'
 import { asGatewayError, GatewayError, invalid, serverError, unsupported } from './errors.ts'
-import type { Gateway } from './gateway.ts'
+import type { ResponsesEndpoint } from './server.ts'
 
 type Json = any
 
@@ -203,7 +203,7 @@ class SocketSink implements EventSink {
   }
 }
 
-export function upgradeResponses(req: Request, gw: Gateway): Response {
+export function upgradeResponses(req: Request, gw: ResponsesEndpoint): Response {
   gw.assertOpen()
   if (req.headers.get('upgrade')?.toLowerCase() !== 'websocket') throw invalid(null, 'GET /v1/responses requires a WebSocket upgrade.')
   let socket: WebSocket, response: Response
@@ -246,7 +246,7 @@ export function upgradeResponses(req: Request, gw: Gateway): Response {
       if (active) throw new GatewayError(409, 'conflict_error', 'websocket_response_in_progress', 'One response is already in flight on this connection.')
       const { type: _type, ...body } = event
       const previous = warmup && warmup.id === body.previous_response_id ? warmup.prefix : undefined
-      const create = parseWebSocketCreate(body, previous)
+      const create = parseWebSocketCreate(body, previous, gw.inputMode)
       if (create.kind === 'warmup') {
         const { req, prefix } = create
         const sink = new SocketSink(writer, () => {})
