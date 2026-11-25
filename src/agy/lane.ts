@@ -165,15 +165,16 @@ export class Lane {
       signal.throwIfAborted()
       try {
         for await (const file of Deno.readDir(dir)) {
-          if (!file.isFile || !new RegExp(`^acp-server-\\d{8}_\\d{6}-${this.proc.pid}\\.log$`).test(file.name)) continue
+          if (!file.isFile || !/^acp-server-.*\.log$/.test(file.name)) continue
           const path = join(dir, file.name)
           const mtime = (await Deno.stat(path)).mtime
-          if (mtime && mtime.getTime() < this.proc.startedAt - 1000) continue
+          if (!mtime || mtime.getTime() < this.proc.startedAt - 1000) continue
           const log = await Deno.readTextFile(path)
+          if (!log.includes(`Starting ACP server (pid ${this.proc.pid},`)) continue
           if (/session_handlers\.go:\d+\] Agent ".*" not found, falling back to default/.test(log)) {
             throw serverError('upstream_error', 'agy fell back to the default agent; no prompt was sent.')
           }
-          if (log.includes(`Starting ACP server (pid ${this.proc.pid},`) && log.includes(`Starting conversation update stream for ${this.session}`)) return
+          if (log.split('\n').some((line) => line.trimEnd().endsWith(`Starting conversation update stream for ${this.session}`))) return
         }
       } catch (e) {
         if (!(e instanceof Deno.errors.NotFound)) throw e

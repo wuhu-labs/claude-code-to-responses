@@ -631,6 +631,9 @@ hook helpers. Startup reaps old groups by their state path and per-workspace age
 Use an exact agy model selection value as `model`, such as `gemini-3.8-flash-low`. The agy model selection owns
 its effort; the Responses `reasoning.effort` and `max_output_tokens` do not configure agy. For Codex CLI, use the
 configuration in [Codex CLI](#codex-cli) with an agy model id and `http://127.0.0.1:18331/v1` as the base URL.
+The agy gateway accepts both top-level `instructions` and leading developer/system messages on a full create.
+It writes the top-level text first, then those messages in order, without adding separators or changing their bytes.
+Non-function tools (including a Codex `namespace` tool) are still `400 unsupported`, just as on the Claude gateway.
 
 **Tool rounds.** A `function_call` response ends as soon as the first matching MCP call is held, but it contains
 all the client calls from that inference's planner line. The first ID is ACP's `toolCallId`; later calls do not have
@@ -651,8 +654,8 @@ inherits the last set; an explicit empty list removes it.
 
 **Usage.** `GET /v1/usage` returns `plan_type` (agy's tier id), `tier` (`name`, `id`), and `tokens` (the last
 attributable input, cache, output and thought counts), or `null` until reported. No quota windows, reset times,
-or `codex.rate_limits` events. A planner row with thinking does not necessarily report its thought-token split;
-unknown counts are `null` rather than inferred from text length.
+or `codex.rate_limits` events. A planner row with thinking does not necessarily report its thought-token split. A missing split is represented
+as `0` in usage objects, not an estimate from text length.
 
 ### agy pins and measurements
 
@@ -669,11 +672,12 @@ stream-json restarting with a replayed call, unlike ACP.
 | `PreInvocation` returns `injectSteps` (`{userMessage: string}` / `{systemMessage: {systemMessage: string}}`). A handler fires twice, so only one gets the queue per `invocationNum`. Never send another `session/prompt` during a held turn. | §D/G2. 40 KB arrived whole; ACP's own prompt queue ends the current RPC prematurely. |
 | `session/resume` does not replay interrupted MCP calls. Tier is in `session/new` `_meta`; ACP prompt-result counts are cumulative, and `usage_update` describes context, not quota. | §E/F and `restart1_r` trace. |
 
-The custom agent limits exposed tools but is not an OS sandbox. agy still supplies some base-prompt text and
-may declare a few small built-ins; read-only built-ins need not send a permission request. Tool schemas must
-also be accepted by Gemini (the probe's array without `items` failed). The planner can split client tool rounds
-but does not control agy's internal autonomous inferences. The automated suite exercises the gateway against
-`test/fixtures/fake_agy.ts`, not the real binary; check the pins again before upgrading.
+### agy known limits
+
+- Full-history clients that omit `previous_response_id` (such as Codex over HTTP in the trial) start a fresh agy session on each round, forfeiting native session continuity and paying to render and re-ingest the history as text.
+- The custom agent limits exposed tools but is not an OS sandbox. agy still supplies base-prompt text and may declare a few small built-ins; read-only built-ins need not send a permission request. Tool schemas must be accepted by Gemini (the probe's array without `items` failed). The planner does not control agy's internal autonomous inferences.
+- The real Mac trial confirmed the fence, 52 planner lines for 52 responses, long holds, steering, resume, eviction, concurrent conversations and usage on 1.5.17. Codex 0.153 completed a full-history tool conversation in that trial with function tools and neutral trial instructions; its stock identity prompt was not sent to agy. The automated suite uses `test/fixtures/fake_agy.ts`, not the real binary.
+- The real ACP error for a lost native conversation and the behavior of `session/resume` with a missing agent file have not been measured. The fake covers the history rebuild on an ACP resume error. Startup rewrites the agent file and checks the current process's own log for default-agent fallback.
 
 ## Tests
 

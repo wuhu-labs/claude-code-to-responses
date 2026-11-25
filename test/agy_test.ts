@@ -1,6 +1,7 @@
-import { assert, assertEquals, assertMatch } from '@std/assert'
+import { assert, assertEquals, assertMatch, assertRejects } from '@std/assert'
 import { fileURLToPath } from 'node:url'
 import { lines } from '../src/claude/lines.ts'
+import { kernelBody } from './kernel_shapes.ts'
 import { WsClient } from './websocket_client.ts'
 
 const main = fileURLToPath(new URL('../src/agy/main.ts', import.meta.url))
@@ -106,11 +107,17 @@ Deno.test('agy: batch with streamed thought/text, mixed transport, ordered outpu
       batch.map((c: any) => [c.name, JSON.parse(c.arguments)]),
       [0, 1, 2].map((index) => ['lookup', { index, value: ['héllo', { nested: true }, null] }]),
     )
-    assertEquals(first.usage.input_tokens, 120)
-    assertEquals(first.usage.output_tokens, 25)
+    assertEquals(first.usage, {
+      input_tokens: 120,
+      input_tokens_details: { cached_tokens: 20 },
+      output_tokens: 25,
+      output_tokens_details: { reasoning_tokens: 0 },
+      total_tokens: 145,
+    })
     const usage = await (await fetch(`${gw.url}/v1/usage`)).json()
     assertEquals(usage.tier, { id: 'fake-ultra', name: 'Fake Ultra' })
     assertEquals(usage.tokens.output_tokens, 25)
+    assertEquals(usage.tokens.thought_tokens, 0)
     assert(!('rate_limits' in usage))
     const os = outputs(first)
     const image = await gw.post(follow(first, [...os, message('user', [{ type: 'input_image', image_url: 'data:image/png;base64,AA==' }])]))
@@ -262,6 +269,177 @@ Deno.test('agy: parallel lanes list only their own tools; an evicted hold resume
     assertMatch(text(resumed.response), /"name":"second".*"output":"result-2"/)
     await gw.stop()
     await assertStopped(pids(await r.evidence()))
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: Codex instruction sources concatenate, warm-up generates only on follow-up, and namespaces stay unsupported', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start(), ws = new WsClient(new WebSocket(gw.url.replace('http:', 'ws:') + '/v1/responses'))
+    try {
+      const { input: _, ...base } = initial('')
+      const top = 'Top-level prompt.\r\n'
+      const developer = { type: 'message', ...message('developer', [{ type: 'input_text', text: 'Developer: é' }, { type: 'input_text', text: '\n' }]) }
+      const system = message('system', 'System: e\u0301\n ')
+      const input = [developer, system, message('user', 'Start coding.')]
+      const sent = {
+        ...base,
+        instructions: top,
+        input,
+        client_metadata: { turn_id: 'not-for-agy' },
+        store: false,
+        reasoning: { effort: 'low', summary: 'auto' },
+      }
+      const badTools = { ...sent, tools: [{ type: 'namespace', name: 'multi_agent_v1' }] }
+      const bad = await gw.post(badTools)
+      const rejected = await bad.json()
+      assertEquals([bad.status, rejected.error.code, rejected.error.param], [400, 'unsupported', 'tools[0].type'])
+      const wsRejection = await assertRejects(() => ws.send(badTools)) as { status: number; code: string; param: string }
+      assertEquals([wsRejection.status, wsRejection.code, wsRejection.param], [400, 'unsupported', 'tools[0].type'])
+      const expected = top + 'Developer: é\nSystem: e\u0301\n '
+      const http = await gw.create(sent)
+      assertEquals(http.response.instructions, expected)
+      assert(!JSON.stringify(http.events).includes('not-for-agy'))
+      const warm = await ws.send({ ...sent, generate: false, input: [developer] })
+      assertEquals([warm.status, warm.response.output], ['completed', []])
+      assertEquals((await r.evidence()).filter((e) => e.kind === 'prompt').length, 1)
+      const actual = await ws.send({ ...base, instructions: top, previous_response_id: warm.response.id, input: input.slice(1) })
+      assertEquals([actual.status, actual.response.instructions, text(actual.response)], ['completed', expected, 'answer:Start coding.'])
+      const evidence = await r.evidence()
+      // This is read from the file after the agent frontmatter, not from the Responses echo.
+      assertEquals(evidence.filter((e) => e.kind === 'process').map((e) => e.instructions), [expected, expected])
+
+      const history = [developer, system, message('user', 'batch')]
+      const firstRound = await ws.send({ ...sent, input: history })
+      const finalized = firstRound.events.filter((event) => event.type === 'response.output_item.done').map((event) => event.item)
+      assertEquals(calls(firstRound.response).length, 3)
+      const replay = await gw.create({ ...sent, input: [...history, ...finalized, ...outputs(firstRound.response), message('user', 'Use the results.')] })
+      assertEquals([replay.response.x_gateway.path, replay.response.previous_response_id], ['history', null])
+      assertMatch(text(replay.response), /"output":"result-2"\}\n.*"text":"Use the results\."/)
+    } finally {
+      await ws.close()
+    }
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: Wuhu kernel recordings and projected warm tool delta run through the front', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start(), ws = new WsClient(new WebSocket(gw.url.replace('http:', 'ws:') + '/v1/responses'))
+    try {
+      const model = initial('').model
+      for (const name of ['wuhu-full-create', 'wuhu-forced-compact']) {
+        const body = JSON.parse(await Deno.readTextFile(new URL(`./fixtures/${name}.json`, import.meta.url)))
+        const { stream: _, ...wire } = body
+        const conformed = { ...wire, model }
+        const http = await gw.create(conformed)
+        const socket = await ws.send({ ...conformed, max_output_tokens: 4096, prompt_cache_key: 'kernel-session' })
+        assertEquals(http.response.instructions, 'You are a long-running session agent. Keep answers to one sentence.')
+        assertEquals(socket.response.instructions, http.response.instructions)
+        assertEquals(socket.status, 'completed')
+        assertEquals(socket.response.tool_choice, 'auto')
+      }
+      const base = initial('batch')
+      const first = await ws.send(kernelBody({ ...base, input: [message('user', base.input)] }))
+      assertEquals(calls(first.response).length, 3)
+      const next = await ws.send(kernelBody({ ...follow(first.response, outputs(first.response)), tools: base.tools }))
+      assertEquals(next.response.x_gateway.path, 'live')
+      assertEquals(JSON.parse(text(next.response)).results, ['result-0', 'result-1', 'result-2'])
+    } finally {
+      await ws.close()
+    }
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: pi HTTP history accepts reserialized JSON function arguments', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start()
+    const call = { type: 'function_call', call_id: 'call_pi', name: 'echo', arguments: '{ "a": "text", "z": ["a", {"x":true,"y":1}] }' }
+    const { response } = await gw.create({ ...initial('', [tool('echo')]), input: [message('user', 'Use the tool.'), call, result(call, 'Tool output')] })
+    assertEquals(response.x_gateway.path, 'history')
+    const prompt = (await r.evidence()).find((e) => e.kind === 'prompt').text
+    const [, user, replayedCall, replayedResult] = prompt.split('\n')
+    assertEquals(JSON.parse(user), { role: 'user', text: 'Use the tool.' })
+    assertEquals(JSON.parse(replayedCall), { type: 'function_call', id: 'call_pi', name: 'echo', arguments: { z: ['a', { y: 1, x: true }], a: 'text' } })
+    assertEquals(JSON.parse(replayedResult), { type: 'function_call_output', id: 'call_pi', output: 'Tool output' })
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: idle eviction resumes a message-only turn as an ordinary prompt', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start(['--idle-timeout', '0.2'])
+    const first = await gw.create(initial('First plain turn.'))
+    assertEquals(calls(first.response), [])
+    const before = await r.evidence()
+    await assertStopped(pids(before))
+    const second = await gw.create(follow(first.response, [message('user', 'Next plain turn.')]))
+    assertEquals([second.response.x_gateway.path, text(second.response)], ['resume', 'answer:Next plain turn.'])
+    const after = await r.evidence()
+    const prompts = after.filter((e) => e.kind === 'prompt')
+    assertEquals(prompts.map((e) => e.text), ['First plain turn.', 'Next plain turn.'])
+    assertEquals(prompts[0].session, prompts[1].session)
+    assertEquals(after.filter((e) => e.kind === 'resume').length, 1)
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: ACP max_tokens emits response.incomplete with the partial text', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start(), ws = new WsClient(new WebSocket(gw.url.replace('http:', 'ws:') + '/v1/responses'))
+    try {
+      const { response, events } = await ws.send(initial('output-limit'))
+      assertEquals(events.at(-1)?.type, 'response.incomplete')
+      assertEquals([response.status, response.incomplete_details, text(response)], ['incomplete', { reason: 'max_output_tokens' }, 'Partial text.'])
+    } finally {
+      await ws.close()
+    }
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: cancel stops live generation and leaves no continuation point', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start()
+    const res = await gw.post(initial('hold-generation'))
+    assertEquals(res.status, 200)
+    assert(res.body)
+    let id = '', terminal: any
+    for await (const line of lines(res.body)) {
+      if (!line.startsWith('data: ')) continue
+      const ev = JSON.parse(line.slice(6))
+      if (ev.type === 'response.created') id = ev.response.id
+      if (ev.type === 'response.output_text.delta') {
+        assert(id)
+        const stop = await fetch(`${gw.url}/v1/responses/${id}/cancel`, { method: 'POST' })
+        assertEquals(stop.status, 200)
+        assertEquals((await stop.json()).status, 'cancelled')
+      }
+      if (ev.type === 'response.failed') terminal = ev.response
+    }
+    assertEquals([terminal?.id, terminal?.status, terminal?.error.code], [id, 'cancelled', 'cancelled'])
+    await assertStopped(pids(await r.evidence()))
+    const retry = await gw.post(follow(terminal, [message('user', 'Continue?')]))
+    assertEquals([retry.status, (await retry.json()).error.code], [400, 'previous_response_not_found'])
+    await gw.stop()
   } finally {
     await r.dispose()
   }

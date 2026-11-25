@@ -259,7 +259,9 @@ function parseInstructionsAndInput(body: Json, previous: string | null, mode: In
     if (!isObj(it) || (it.type !== undefined && it.type !== 'message') || (it.role !== 'system' && it.role !== 'developer')) break
     const p = `input[${first}]`
     if (previous !== null) throw unsupported(`${p}.role`, 'System/developer input messages are only accepted at the beginning of a full create.')
-    if ('instructions' in body) throw invalid('instructions', 'Use top-level instructions or leading system/developer messages, never both.')
+    if (mode === 'claude' && 'instructions' in body) {
+      throw invalid('instructions', 'Use top-level instructions or leading system/developer messages, never both.')
+    }
     if (typeof it.content === 'string') leading.push(it.content)
     else if (Array.isArray(it.content)) {
       for (let j = 0; j < it.content.length; j++) {
@@ -274,7 +276,7 @@ function parseInstructionsAndInput(body: Json, previous: string | null, mode: In
   let instructions: string | null = null
   if ('instructions' in body) {
     if (typeof body.instructions !== 'string' || !body.instructions) throw invalid('instructions', "'instructions' must be a nonempty string.")
-    instructions = body.instructions
+    instructions = mode === 'agy' ? body.instructions + leading.join('') : body.instructions
   } else if (first > 0) instructions = leading.join('')
   const items = input.slice(first).map((it, i) => parseItem(it, `input[${i + first}]`, mode))
   if (previous === null && !instructions) {

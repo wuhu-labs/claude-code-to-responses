@@ -116,7 +116,8 @@ export class AgyGateway implements ResponsesEndpoint {
   }
 
   usageReport() {
-    return this.usage
+    const { tokens } = this.usage
+    return { ...this.usage, tokens: tokens ? { ...tokens, thought_tokens: tokens.thought_tokens ?? 0 } : null }
   }
 
   private report(tier: Tier | null, tokens: Tokens | null) {

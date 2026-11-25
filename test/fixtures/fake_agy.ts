@@ -30,9 +30,17 @@ const hook = Object.values(hooks)[0] as { PreInvocation: { command: string }[] }
 const logDir = `${app}/log`, conversations = `${app}/conversations`
 await Deno.mkdir(logDir, { recursive: true })
 await Deno.mkdir(conversations, { recursive: true })
-const log = `${logDir}/acp-server-20261126_010101-${Deno.pid}.log`
+// An unrelated recent fallback warning must not be attributed to this process, and the basename is not a PID format.
+await Deno.writeTextFile(
+  `${logDir}/acp-server-other.log`,
+  'Starting ACP server (pid 0, worker=false)\nsession_handlers.go:88] Agent "other" not found, falling back to default\n',
+)
+const log = `${logDir}/acp-server-fixture-${crypto.randomUUID()}.log`
 await Deno.writeTextFile(log, `I1126 01:01:01.000000       1 serve.go:30] Starting ACP server (pid ${Deno.pid}, worker=false, isJetski=false)\n`)
-record('process', { agy: Deno.pid, cwd, instructions: ag.split('\n---\n')[1] })
+const separator = '\n---\n'
+const bodyStart = ag.indexOf(separator)
+if (bodyStart === -1) throw new Error('missing agent frontmatter terminator')
+record('process', { agy: Deno.pid, cwd, instructions: ag.slice(bodyStart + separator.length) })
 const stdout = Deno.stdout.writable.getWriter()
 const encoder = new TextEncoder()
 const write = (writer: WritableStreamDefaultWriter<Uint8Array>, v: unknown) => writer.write(encoder.encode(JSON.stringify(v) + '\n'))
@@ -181,7 +189,11 @@ async function prompt(id: unknown, text: string) {
   record('prompt', { session, text })
   append({ step_index: step, type: 'USER_INPUT', content: text })
   await invoke(0)
-  let answer = `answer:${text}`
+  if (text === 'hold-generation') {
+    await chunk('agent_message_chunk', 'Still generating.')
+    return // Never send the prompt result; the test cancels after seeing the live chunk.
+  }
+  let answer = text === 'output-limit' ? 'Partial text.' : `answer:${text}`
   if (text === 'batch' || text === 'missing-planner') {
     if (!tools.length) throw new Error('no fake tools')
     const name = tools[0],
@@ -212,7 +224,7 @@ async function prompt(id: unknown, text: string) {
   await chunk('agent_message_chunk', text === 'batch' || text === 'missing-planner' ? `\n\n${answer}` : answer)
   prompting = false
   await reply(id, {
-    stopReason: 'end_turn',
+    stopReason: text === 'output-limit' ? 'max_tokens' : 'end_turn',
     usage: { inputTokens: 250, cachedReadTokens: 45, cachedWriteTokens: 0, outputTokens: 35, thoughtTokens: 5, totalTokens: 330 },
   })
 }

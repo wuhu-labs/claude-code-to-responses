@@ -28,7 +28,7 @@ export class Output extends ResponseState {
           input_tokens: input,
           input_tokens_details: { cached_tokens: u.cached_read_tokens },
           output_tokens: u.output_tokens,
-          output_tokens_details: { reasoning_tokens: u.thought_tokens },
+          output_tokens_details: { reasoning_tokens: u.thought_tokens ?? 0 },
           total_tokens: input + u.output_tokens,
         }
         : null,
