@@ -4,6 +4,7 @@
 // lane renders them, the agy lane refuses the request.
 import type { InItem } from './api/request.ts'
 import { type CallAliases, matchItems, remapItems } from './call_ids.ts'
+import { invalid } from './errors.ts'
 
 export interface Group {
   inputs: InItem[]
@@ -75,8 +76,10 @@ export function isOutput(i: InItem): boolean {
 }
 
 /**
- * The longest run of groups whose records chain onto each other and match their items. A record that does not continue
- * the run (another chain, an edited history) is ignored and its group synthesized, unless a later record covers it.
+ * The longest run of groups whose records chain onto each other and match their items. A group no record covers is
+ * synthesized (or refused by a lane that cannot represent it). Positive evidence of a changed prefix is a 400: a linked
+ * record whose items disagree with what it covers, or two readable records whose own `prev` links contradict the order
+ * and grouping they were sent in.
  */
 export async function matchHistory<R extends MatchRecord, S>(
   groups: Group[],
@@ -88,13 +91,19 @@ export async function matchHistory<R extends MatchRecord, S>(
   let head: Head | null = null
   let session: string | null = null
   let aliases: CallAliases = []
-  const reset = (to: number) => {
+  const reset = () => {
     used.length = 0
     aliases = []
     head = null
     session = null
-    pending = groups.slice(0, to)
+    pending = [...groups]
   }
+  /** The aliases each compared record was verified with, by response id, for the records that follow it. */
+  const verified = new Map<string, CallAliases>()
+  /** The group each readable record was sent in; a record's `prev` names one of them. */
+  const groupOf = new Map<string, number>()
+  /** A parent a child was already sent under: a parent cannot come after its child. */
+  const childOf = new Map<string, string>()
   for (let gi = 0; gi < groups.length; gi++) {
     const group = groups[gi]
     pending.push(group)
@@ -102,24 +111,60 @@ export async function matchHistory<R extends MatchRecord, S>(
     const encrypted = [...new Set(group.outputs.filter((i) => i.kind === 'reasoning' && i.encrypted).map((i) => (i as { encrypted: string }).encrypted))]
     const records = (await Promise.all(encrypted.map((e) => o.decode(e, gi)))).filter((r) => r !== null)
     if (records.length === 0) continue
+    // A record sent in the same response group as its parent, or after its own child, contradicts the boundary its own
+    // `prev` link names: the input that separated them is gone. A response sent twice is still one record.
+    for (const record of records) {
+      if (groupOf.has(record.id)) continue
+      const child = childOf.get(record.id)
+      if (child) throw invalid('input', `The history puts response '${child}' before its parent '${record.id}'.`, 'history_mismatch')
+      if (record.prev !== null && groupOf.get(record.prev) === gi) {
+        throw invalid(
+          'input',
+          `The history puts response '${record.id}' in the same response group as its parent '${record.prev}'; the input between them is missing.`,
+          'history_mismatch',
+        )
+      }
+      groupOf.set(record.id, gi)
+      if (record.prev !== null) childOf.set(record.prev, record.id)
+    }
     const record = records[records.length - 1]!
-    const covers = pending.flatMap((x) => [...x.inputs, ...x.outputs])
-    const candidate = records.length === 1 && o.continues(record) && record.prev === (head?.responseId ?? null) &&
-      (session === null || o.session(record) === session)
-    const providerCalls = candidate ? o.providerCalls(record) : null
-    const matched = providerCalls === null ? null : matchItems(covers, record, providerCalls, aliases)
-    if (candidate && matched === null) reset(gi + 1)
-    if (matched === null) continue
+    // The record's parent fixes the span it claims: the groups after that record's own position, or the whole request for
+    // a root. Comparison is separate from reuse: the record's existing digest decides the span, and a changed tool set is
+    // not evidence that the content changed, nor a reason to skip the comparison. A parent the request does not carry is
+    // no evidence at all.
+    const boundary = record.prev === null ? -1 : groupOf.get(record.prev)
+    const comparable = records.length === 1 && boundary !== undefined && boundary < gi
+    const covers = comparable ? groups.slice(boundary + 1, gi + 1).flatMap((x) => [...x.inputs, ...x.outputs]) : []
+    const available = record.prev === null ? [] : verified.get(record.prev) ?? []
+    // An output whose call the request cannot map — a call before the boundary that no compared record bound — makes the
+    // items incomparable; that is not evidence of an edited digest.
+    const callIds = new Set(available.map(([client]) => client))
+    for (const it of covers) if (it.kind === 'function_call') callIds.add(it.callId)
+    const mappable = covers.every((it) => it.kind !== 'function_call_output' || callIds.has(it.callId))
+    const providerCalls = comparable && mappable ? o.providerCalls(record) : null
+    const matched = providerCalls === null ? null : matchItems(covers, record, providerCalls, [...available])
+    if (comparable && mappable && providerCalls !== null && matched === null) {
+      throw invalid(
+        'input',
+        `The history carries the reasoning record of response '${record.id}', but the input it covers is not the input it was issued for. ` +
+          'A changed prefix cannot keep its old reasoning: drop that reasoning item and the later ones, or start a new conversation.',
+        'history_mismatch',
+      )
+    }
+    if (matched !== null) verified.set(record.id, matched)
+    const linked = record.prev === (head?.responseId ?? null)
+    const reusable = linked && matched !== null && o.continues(record) && (session === null || o.session(record) === session)
+    if (!reusable) continue
     aliases = matched
     used.push({ record, state: await o.state(record, covers, aliases) })
     head = { responseId: record.id, end: record.end, calls: record.calls }
     session = o.session(record)
     pending = []
   }
-  const { tail: pure, groups: all } = segment(input)
+  const { tail: pure } = segment(input)
   // an output for a call no function_call in this input names sends the whole history back to synthesis
   const clientCalls = new Set(input.filter((it) => it.kind === 'function_call').map((it) => it.callId))
-  if (pure.some((it) => it.kind === 'function_call_output' && !clientCalls.has(it.callId))) reset(all.length)
+  if (pure.some((it) => it.kind === 'function_call_output' && !clientCalls.has(it.callId))) reset()
   return {
     used,
     aliases,

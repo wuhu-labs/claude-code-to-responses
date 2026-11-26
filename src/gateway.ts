@@ -354,6 +354,22 @@ export class Gateway {
   }
 
   private async fromHistory(req: NormRequest, chain: ChainSpec, state: ResponseState, reservation: Reservation): Promise<Plan> {
+    // A full create's history is replayed as it was returned. A thinking item is content the model saw; one that no
+    // longer decodes cannot be replayed, and dropping it would silently shorten the conversation.
+    req.input.forEach((it, i) => {
+      if (it.kind !== 'reasoning' || !it.encrypted?.startsWith(THINKING_PREFIX)) return
+      const t = decodeThinking(it.encrypted)
+      const replayable = t !== null &&
+        ((typeof t.redacted === 'string' && t.redacted !== '') ||
+          (typeof t.thinking === 'string' && typeof t.signature === 'string' && t.signature !== ''))
+      if (!replayable) {
+        throw invalid(
+          `input[${i}]`,
+          'A gateway thinking item in the history is not a thinking block that can be replayed; replay the items the gateway returned, or drop the reasoning.',
+          'unexpected_reasoning_item',
+        )
+      }
+    })
     const { groups, tail: originalTail } = segment(req.input)
     if (originalTail.length === 0) throw invalid('input', 'The input ends with model output: there is nothing new to respond to.')
     if (groups.length === 0) {

@@ -12,6 +12,7 @@ export const ERROR_CODES = [
   'previous_response_not_found',
   'invalid_function_arguments',
   'invalid_provider_record',
+  'history_mismatch',
   'provider_record_missing',
   'provider_record_foreign',
   'store_mismatch',

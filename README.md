@@ -102,7 +102,8 @@ reads `~/.claude`.
   | `previous_response_not_found` | The id is unknown, or `instructions`, `tools`, `model`, effort or output cap changed (a new Claude Code session): send the full history instead. |
   | `invalid_function_arguments` | A history `function_call` whose arguments are not a JSON object. |
   | `invalid_provider_record` | A malformed provider record in the history. |
-  | `unexpected_reasoning_item` | A reasoning item next to new input that the gateway did not issue in this conversation. |
+  | `history_mismatch` | `400`: a history record's own `prev` link places it after a response the request also carries, but the items it covers are not the ones the response was issued for; or two records are sent in an order or grouping their `prev` links contradict (a response before its parent, or two chained responses in one group, whose separating input is missing). Drop that reasoning item and the later ones, or start a new conversation. |
+  | `unexpected_reasoning_item` | A reasoning item next to new input that the gateway did not issue in this conversation, or a gateway thinking item in a full create's history that cannot be replayed as a thinking block. |
   | `missing_tool_output`, `unexpected_tool_output` | The outputs don't match the calls the conversation waits on. |
   | `tool_output_too_large` | An output over 500,000 characters (Claude Code would move it to a file). |
   | `image_too_large` | `400`: an image whose base64 payload exceeds 5,242,880 characters (5 MiB encoded, up to 3,932,160 decoded bytes), the gateway’s own per-image input cap, enforced before Claude Code’s image processing. Resize it before sending. |
@@ -513,8 +514,21 @@ response is attached, so simultaneous requests never rebuild it twice. The next 
   as when Wuhu commits provider calls under kernel UUIDs. The gateway derives the original ordered tool ids from
   each record's unchanged framing, binds the client ids bijectively, then verifies the digest after translating
   those ids. Apart from the argument reserialization above, item order, names, outputs, text and images must still match exactly.
-  Conflicting/many-to-one ids or any content mismatch prevent record reuse; that history is synthesized and
-  `x_gateway.records` / `synthesized_groups` expose the path. On a match the original session, provider ids and image labels are retained. Log bytes are replayed verbatim while sidecars exist (or from an older fat record); full-loss native image regeneration has the one-time cache break described above. Input results are translated to provider ids before delivery, and
+  A record whose `prev` names a response the request also carries claims the items between them, a record with no
+  parent claims the whole request, and its own digest decides whether they are the ones it was issued for; whether it is
+  reusable under this request's instructions, tools and model is a separate question. A disagreement is `400
+  history_mismatch` — a changed tool set is not evidence that the content changed, and not a reason to skip the comparison
+  — and so are conflicting/many-to-one call ids and two readable records sent in an order (or a grouping) their `prev`
+  links contradict: a response cannot come before its parent, and two chained records cannot share one response group,
+  whose missing input would be the deleted boundary. An output whose call the request cannot map is not compared at all,
+  never reported as a changed digest. Dropping that
+  reasoning item and the later ones makes the remaining history synthesis, which is how a client continues from a
+  changed context; the agy lane, which never replays history from text, then refuses it with `provider_record_missing`.
+  A group with no record, or a record whose parent is not in the supplied prefix, is not a contradiction and is
+  synthesized. This is a check of what the request itself shows, not exhaustive prefix validation: the gateway never
+  looks up a record the request does not carry, and a record it cannot read is its own typed `invalid_provider_record`,
+  never evidence of a changed prefix. `x_gateway.records` / `synthesized_groups` expose which path served a request that
+  was accepted. On a match the original session, provider ids and image labels are retained. Log bytes are replayed verbatim while sidecars exist (or from an older fat record); full-loss native image regeneration has the one-time cache break described above. Input results are translated to provider ids before delivery, and
   aliases are saved in subsequent provider records so they survive another process eviction, retained-store restart
   or lost-store history rebuild. Provider ids remain the ids in Responses output; the kernel still translates warm
   deltas normally. Already-issued records still support the same call-id aliasing.
@@ -684,7 +698,7 @@ transport, any order).
   `output.txt`), so the upstream tool response is the one a native call would have produced. `preview()` in
   `src/agy/step.ts` is the one place.
 
-An image anywhere in the input is `400 unsupported` (until images have their own issue). An absent or mismatched
+An image anywhere in the input is `400 unsupported` (until images have their own issue). A changed prefix that still carries its record is the shared `400 history_mismatch`; after dropping that record the history is recordless here and `provider_record_missing` applies. Consecutive user messages with no history start a new conversation in the order given. An absent or mismatched
 planner line still falls back to one call per response with a diagnostic; usage is absent where it cannot be
 attributed. `x_gateway` reports `path` (`new`, `live`, `store`, `history`), the chain, the conversation, how many
 records a rebuild used and how many steps it completed.
@@ -695,7 +709,7 @@ names, and a step that is not agy 1.5.17's tool-call layout are all refused befo
 
 | Code | When |
 |---|---|
-| `provider_record_missing` | A full create's history has a response group no usable agy record covers, or the chain head carries no trajectory rows. It cannot be rebuilt as one conversation; start a new one. |
+| `provider_record_missing` | A full create's history carries an assistant or tool exchange that no usable agy record covers (including an uncovered group before its last record), or the chain head carries no trajectory rows. An agy conversation is never replayed from plain text; start a new conversation with that context. |
 | `provider_record_foreign` | A reasoning item in the history is the Claude lane's record, or an agy record from another agy version. |
 | `store_mismatch` | The stored tail is not the pending calls the response names, or a call has no step in the store. |
 | `step_layout_unknown` | A step that must be completed is not the tool-call layout agy 1.5.17 writes. |

@@ -196,7 +196,8 @@ export function encodeThinking(t: ThinkingRecord): string {
 export function decodeThinking(s: string): ThinkingRecord | null {
   if (!s.startsWith(THINKING_PREFIX)) return null
   try {
-    return JSON.parse(new TextDecoder().decode(unb64(s.slice(THINKING_PREFIX.length))))
+    const value: unknown = JSON.parse(new TextDecoder().decode(unb64(s.slice(THINKING_PREFIX.length))))
+    return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as ThinkingRecord : null
   } catch {
     return null
   }
