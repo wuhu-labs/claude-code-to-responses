@@ -1,10 +1,11 @@
-import { replayLog } from './replay.ts'
+import { replayLog, recordLogTemplates } from './replay.ts'
 // Routes each Responses request to a lane: the live process when it sits at the previous response, otherwise a
 // process rebuilt from the response store or from the client's history and the provider records it carries.
 import type { InItem, NormRequest, Part } from './api/request.ts'
 import { type EventSink, GatedSink, ResponseState, SseSink } from './api/stream.ts'
-import { type CallAliases, matchRecordItems, remapItems } from './call_ids.ts'
+import { type CallAliases, matchItems, remapItems } from './call_ids.ts'
 import { Bridge } from './bridge.ts'
+import { Chains, type Reservation } from './chains.ts'
 import {
   assistantEntries,
   assistantUuidFor,
@@ -22,6 +23,7 @@ import { CLAUDE_CODE_VERSION, RESUME_LINE } from './claude/pins.ts'
 import { claudeVersion, executableIdentity, processIdentity } from './claude/process.ts'
 import { type Config, ConfigError, paths } from './config.ts'
 import { asGatewayError, GatewayError, invalid, previousResponseNotFound } from './errors.ts'
+import { type Group, matchHistory, segment } from './history.ts'
 import { Active, type ChainSpec, type Head, Lane, MAX_RESULT_CHARS, outputChars } from './lane.ts'
 import { type CallRef, decodeRecord, decodeThinking, type ProviderRecord, RecordError, sha256, THINKING_PREFIX } from './records.ts'
 import { ResponseStore } from './store.ts'
@@ -52,7 +54,8 @@ export class Gateway {
   readonly failures: FailureLog
   private readonly usage: UsageLedger
   readonly bridge: Bridge
-  readonly lanes = new Map<string, Lane>()
+  /** One chain, one process: the live lanes, the busy rule and the wait for a dying predecessor. */
+  readonly chains = new Chains<Lane>()
   readonly events: GatewayEvent[] = []
   private closed = false
 
@@ -85,6 +88,11 @@ export class Gateway {
   note(kind: string, data: Json): void {
     this.events.push({ at: Date.now(), kind, data })
     if (this.events.length > 10000) this.events.splice(0, 1000)
+  }
+
+  /** Every lane holding a process, live or dying (tests evict through it). */
+  get lanes(): ReadonlyMap<string, Lane> {
+    return this.chains.lanes
   }
 
   /** Every lane whose process may still be running, live or dying. */
@@ -138,8 +146,7 @@ export class Gateway {
     },
     note: (kind: string, data: Json) => this.note(kind, data),
     dead: (lane: Lane) => {
-      if (this.lanes.get(lane.sessionId) === lane) this.lanes.delete(lane.sessionId)
-      this.dying.set(lane.sessionId, lane.gone)
+      this.chains.dead(lane)
     },
     gone: (lane: Lane) => {
       this.processes.delete(lane)
@@ -148,7 +155,7 @@ export class Gateway {
   }
 
   private addLane(lane: Lane): void {
-    this.lanes.set(lane.sessionId, lane)
+    this.chains.add(lane)
     this.processes.add(lane)
   }
 
@@ -211,14 +218,14 @@ export class Gateway {
     const state = new ResponseState(req)
     // the chain is reserved from the moment its session is known until the response is attached to its lane,
     // so two requests can never both rebuild (or both continue) one chain
-    const reservation: Reservation = { session: null }
+    const reservation: Reservation = { chain: null }
     try {
       const plan = req.previousResponseId !== null
         ? await this.fromPrevious(req, chain, state, reservation)
         : await this.fromHistory(req, chain, state, reservation)
       this.start(state, plan, sink)
     } finally {
-      if (reservation.session) this.reserved.delete(reservation.session)
+      if (reservation.chain) this.chains.release(reservation)
     }
   }
 
@@ -264,24 +271,6 @@ export class Gateway {
     throw new GatewayError(404, 'not_found_error', 'not_found', `Response '${id}' not found.`, 'response_id')
   }
 
-  private reserved = new Set<string>()
-  /** Lanes being killed, by session: a rebuild waits for its predecessor's tail to be stored. */
-  private dying = new Map<string, Promise<void>>()
-
-  private async settled(session: string): Promise<void> {
-    const d = this.dying.get(session)
-    if (d) await d
-  }
-
-  /** Takes the chain for this request, synchronously: busy if a response is streaming or another request holds it. */
-  private reserve(session: string, r: Reservation): void {
-    if (this.reserved.has(session) || this.lanes.get(session)?.active) {
-      throw new GatewayError(409, 'conflict_error', 'conversation_busy', 'Another response of this conversation is in progress.')
-    }
-    this.reserved.add(session)
-    r.session = session
-  }
-
   private async fromPrevious(req: NormRequest, chain: ChainSpec, state: ResponseState, reservation: Reservation): Promise<Plan> {
     const prev = req.previousResponseId!
     const rec = this.store.get(prev)
@@ -292,16 +281,15 @@ export class Gateway {
     const head: Head = { responseId: rec.id, end: rec.end, calls: rec.calls }
     const input = remapItems(await this.withoutOwnReasoning(req.input, prev), rec.callAliases ?? [])
     const delivery = deliveryFor(head, input)
-    this.reserve(rec.session, reservation)
-    let lane = this.lanes.get(rec.session)
+    this.chains.reserve(rec.session, reservation)
+    let lane = this.chains.get(rec.session)
     if (
       lane && !lane.dead && lane.head?.responseId === prev
     ) {
       state.gateway = { path: 'live', session: rec.session }
       return { lane, delivery, prevId: prev, covered: input, spawn: null }
     }
-    if (lane) await lane.kill('superseded')
-    await this.settled(rec.session)
+    await this.chains.evict(rec.session, 'superseded')
     const records = this.store.chain(prev)
     if (!records) throw previousResponseNotFound(prev, 'its chain is incomplete in the store')
     let log: string[]
@@ -336,7 +324,7 @@ export class Gateway {
       }
       const enc = it.encrypted ?? ''
       if (enc.startsWith(THINKING_PREFIX) && decodeThinking(enc)) continue
-      const r = await clientRecord(enc, i)
+      const r = await clientRecord(enc)
       if (r && chainIds.has(r.id)) continue
       throw invalid(
         `input[${i}]`,
@@ -367,79 +355,41 @@ export class Gateway {
 
   private async fromHistory(req: NormRequest, chain: ChainSpec, state: ResponseState, reservation: Reservation): Promise<Plan> {
     const { groups, tail: originalTail } = segment(req.input)
-    let tail = originalTail
-    if (tail.length === 0) throw invalid('input', 'The input ends with model output: there is nothing new to respond to.')
+    if (originalTail.length === 0) throw invalid('input', 'The input ends with model output: there is nothing new to respond to.')
     if (groups.length === 0) {
       // a new conversation
       const sessionId = crypto.randomUUID()
-      const delivery = deliveryFor(null, tail)
-      this.reserve(sessionId, reservation)
+      const delivery = deliveryFor(null, originalTail)
+      this.chains.reserve(sessionId, reservation)
       const lane = new Lane(sessionId, this.workDir(sessionId), chain, null, this.config, this.bridge, this.store, this.laneEvents)
       this.addLane(lane)
       state.gateway = { path: 'new', session: sessionId }
-      return { lane, delivery, prevId: null, covered: tail, spawn: { resume: false, interruptedTurn: false } }
+      return { lane, delivery, prevId: null, covered: originalTail, spawn: { resume: false, interruptedTurn: false } }
     }
     // the longest run of groups whose records chain onto each other and match the items
-    const used: ProviderRecord[] = []
-    const regenerated = new Map<string, string[]>()
-    let pendingGroups: Group[] = []
-    let synth: Group[] = []
-    let headId: string | null = null
-    let session: string | null = null
-    let aliases: CallAliases = []
-    for (let gi = 0; gi < groups.length; gi++) {
-      const g = groups[gi]
-      pendingGroups.push(g)
-      // a client may repeat an item it already sent; one record counted twice is still one record
-      const encrypted = [...new Set(g.outputs.filter((i) => i.kind === 'reasoning' && i.encrypted).map((i) => (i as { encrypted: string }).encrypted))]
-      const recs = (await Promise.all(encrypted.map((e) => clientRecord(e, gi)))).filter((r) => r !== null)
-      if (recs.length === 0) continue
-      const r = recs[recs.length - 1]!
+    const match = await matchHistory<ProviderRecord, string[]>(groups, req.input, {
+      decode: (content) => clientRecord(content),
+      session: (record) => record.session,
       // Continuation records omit instructions: the chain key already covers them.
-      const candidate = recs.length === 1 && r.chain === chain.key && (r.instructions === undefined || r.instructions === chain.instructions) &&
-        r.prev === headId &&
-        (session === null || r.session === session)
-      const matched = candidate ? await matchRecordItems(pendingGroups.flatMap((x) => [...x.inputs, ...x.outputs]), r, aliases) : null
-      if (candidate && matched === null) {
-        used.length = 0
-        aliases = []
-        headId = null
-        session = null
-        pendingGroups = groups.slice(0, gi + 1)
-      }
-      const fits = matched !== null
-      // a record that does not continue the log (another chain, an edited history) is ignored: its group is synthesized,
-      // unless a later record covers it
-      if (!fits) continue
-      aliases = matched!
-      try {
-        regenerated.set(r.id, replayLog(r, this.store, remapItems(pendingGroups.flatMap((g) => [...g.inputs, ...g.outputs]), aliases)))
-      } catch (error) {
-        if (error instanceof RecordError) throw invalid('input', `Provider record payload recovery failed: ${error.message}`, 'invalid_provider_record')
-        throw error
-      }
-      used.push(r)
-      headId = r.id
-      session = r.session
-      pendingGroups = []
-    }
-    const clientCalls = new Set(req.input.filter((it) => it.kind === 'function_call').map((it) => it.callId))
-    if (tail.some((it) => it.kind === 'function_call_output' && !clientCalls.has(it.callId))) {
-      used.length = 0
-      aliases = []
-      headId = null
-      session = null
-      pendingGroups = groups
-    }
-    // The provider log is never rewritten. Normalize the client-side delivery/digest instead.
-    const remapGroup = (g: Group): Group => ({ inputs: remapItems(g.inputs, aliases), outputs: remapItems(g.outputs, aliases) })
-    tail = remapItems(tail, aliases)
-    pendingGroups = pendingGroups.map(remapGroup)
-    if (pendingGroups.length) synth = pendingGroups
+      continues: (r) => r.chain === chain.key && (r.instructions === undefined || r.instructions === chain.instructions),
+      providerCalls,
+      state: async (record, items, aliases) => {
+        try {
+          return replayLog(record, this.store, remapItems(items, aliases))
+        } catch (error) {
+          if (error instanceof RecordError) throw invalid('input', `Provider record payload recovery failed: ${error.message}`, 'invalid_provider_record')
+          throw error
+        }
+      },
+    })
+    const used = match.used.map((u) => u.record)
+    const synth = match.synth
+    const tail = match.tail
+    const aliases = match.aliases
     // Validate every synthesized group and the new delivery before taking over a live lane or importing records.
     // Log synthesis stays after the old process settles: it must include any tail that eviction stores.
     const lastUsed = used[used.length - 1]
-    let head: Head = { responseId: headId ?? '', end: lastUsed?.end ?? 'turn', calls: lastUsed?.calls ?? [] }
+    let head: Head = match.head ?? { responseId: '', end: 'turn', calls: [] }
     const synthDeliveries: Delivery[] = []
     for (let i = 0; i < synth.length; i++) {
       const g = synth[i]
@@ -448,11 +398,9 @@ export class Gateway {
       head = { responseId: '', end: calls.length ? 'calls' : 'turn', calls }
     }
     const delivery = deliveryFor(head, tail)
-    const sessionId = session ?? crypto.randomUUID()
-    this.reserve(sessionId, reservation)
-    const existing = this.lanes.get(sessionId)
-    if (existing) await existing.kill('superseded')
-    await this.settled(sessionId)
+    const sessionId = lastUsed?.session ?? crypto.randomUUID()
+    this.chains.reserve(sessionId, reservation)
+    await this.chains.evict(sessionId, 'superseded')
     for (const r of used) if (!this.store.has(r.id)) this.store.put(r)
     // records made under another device id rebuild all the same (the model's bytes do not depend on it); only
     // metadata.user_id differs from before, which a backend cache keyed on it will notice. Diagnosis, never an error.
@@ -463,8 +411,8 @@ export class Gateway {
     }
 
     // the records, then what Claude Code wrote after the last of them (if this gateway kept it)
-    const log = used.flatMap((r) => regenerated.get(r.id)!)
-    const tailLines = headId ? this.store.tail(headId) : []
+    const log = match.used.flatMap((u) => u.state)
+    const tailLines = match.head ? this.store.tail(match.head.responseId) : []
     const workDir = this.workDir(sessionId)
     const ctx = contextOf([...log, ...tailLines], sessionId, workDir)
     const extra: string[] = []
@@ -491,7 +439,7 @@ export class Gateway {
       sessionId,
       workDir,
       chain,
-      used.length ? { responseId: headId!, end: used[used.length - 1].end, calls: used[used.length - 1].calls } : null,
+      lastUsed ? { responseId: lastUsed.id, end: lastUsed.end, calls: lastUsed.calls } : null,
       this.config,
       this.bridge,
       this.store,
@@ -517,7 +465,7 @@ export class Gateway {
       synthesized_groups: synth.length,
       resume: spawn.interruptedTurn ? 'interrupted_turn' : 'stdin',
     }
-    return { lane, delivery: spawn.interruptedTurn ? null : delivery, prevId: headId, covered, spawn }
+    return { lane, delivery: spawn.interruptedTurn ? null : delivery, prevId: match.head?.responseId ?? null, covered, spawn }
   }
 }
 
@@ -650,10 +598,6 @@ function releaseLock(stateDir: string): void {
   } catch { /* none */ }
 }
 
-interface Reservation {
-  session: string | null
-}
-
 interface Plan {
   lane: Lane
   delivery: Delivery | null
@@ -662,46 +606,28 @@ interface Plan {
   spawn: { resume: boolean; interruptedTurn: boolean; log?: string[]; attempt?: string[] } | null
 }
 
-interface Group {
-  inputs: InItem[]
-  outputs: InItem[]
-}
-
 /** A provider record from the client's history; a malformed one is the client's error, never silently skipped. */
-async function clientRecord(s: string, group: number): Promise<ProviderRecord | null> {
+async function clientRecord(s: string): Promise<ProviderRecord | null> {
   try {
     return await decodeRecord(s)
   } catch (e) {
-    if (e instanceof RecordError) {
-      throw invalid('input', `The provider record of response ${group + 1} in the history is malformed: ${e.message}.`, 'invalid_provider_record')
-    }
+    if (e instanceof RecordError) throw invalid('input', `A provider record in the history is malformed: ${e.message}.`, 'invalid_provider_record')
     throw e
   }
 }
 
-function isOutput(i: InItem): boolean {
-  return i.kind === 'reasoning' || i.kind === 'function_call' || (i.kind === 'message' && i.role === 'assistant')
-}
-
-/** Splits a history into response groups (the inputs since the previous response, then its outputs) and the new tail. */
-export function segment(items: InItem[]): { groups: Group[]; tail: InItem[] } {
-  const groups: Group[] = []
-  let cur: Group = { inputs: [], outputs: [] }
-  for (const it of items) {
-    if (isOutput(it)) cur.outputs.push(it)
-    else {
-      if (cur.outputs.length) {
-        groups.push(cur)
-        cur = { inputs: [], outputs: [] }
-      }
-      cur.inputs.push(it)
+/** The provider tool_use ids behind a record's client calls, in order: what a client's call ids are matched against. */
+function providerCalls(record: ProviderRecord): string[] {
+  const calls: string[] = []
+  const native = new Set(record.nativeCalls ?? [])
+  for (const line of recordLogTemplates(record)) {
+    const entry = JSON.parse(line.text)
+    if (entry.type !== 'assistant' || !Array.isArray(entry.message?.content)) continue
+    for (const block of entry.message.content) {
+      if (block.type === 'tool_use' && typeof block.id === 'string' && !native.has(block.id)) calls.push(block.id)
     }
   }
-  if (cur.outputs.length) {
-    groups.push(cur)
-    return { groups, tail: [] }
-  }
-  return { groups, tail: cur.inputs }
+  return calls
 }
 
 /**

@@ -1,4 +1,5 @@
 import { ReplayIndex, replayLog } from './replay.ts'
+import { Eviction } from './eviction.ts'
 import { Buffer } from 'node:buffer'
 // A lane is one Claude Code session (one chain of responses) and, while it lives, the one process serving it.
 // It turns Claude Code's stream into Responses events, holds MCP calls until the client's outputs come,
@@ -137,7 +138,7 @@ export class Lane implements BridgeTarget {
   private queued: { resolve: () => void; reject: (e: GatewayError) => void; timer: ReturnType<typeof setTimeout> } | null = null
   /** For each model message id: the stream indexes whose log entries the mirror has delivered. */
   private mirrored = new Map<string, Set<number>>()
-  private timer: ReturnType<typeof setTimeout> | undefined
+  private eviction: Eviction
   private runDir = ''
   /** This process's latest `rate_limit_event` (Claude Code reports only changes, so it stands until the next). */
   rateLimit: RateLimitInfo | null = null
@@ -155,6 +156,17 @@ export class Lane implements BridgeTarget {
     private readonly events: LaneEvents,
   ) {
     this.head = head
+    this.eviction = new Eviction(config.idleTimeoutMs, config.holdTimeoutMs)
+  }
+
+  /** The chain this lane serves: its Claude Code session id. */
+  get laneId(): string {
+    return this.sessionId
+  }
+
+  /** A response is attached and not yet committed or failed. */
+  get busy(): boolean {
+    return this.active !== null
   }
 
   get logFile(): string {
@@ -344,7 +356,7 @@ export class Lane implements BridgeTarget {
 
   private async teardown(reason: string): Promise<void> {
     const atRest = this.pendingAtAttach === null
-    clearTimeout(this.timer)
+    this.eviction.clear()
     this.bridge.unregister(this.epoch)
     if (this.queued) {
       clearTimeout(this.queued.timer)
@@ -420,11 +432,10 @@ export class Lane implements BridgeTarget {
   }
 
   private armEviction(): void {
-    clearTimeout(this.timer)
+    this.eviction.clear()
     if (this.dead || this.active || !this.head) return
     const hold = this.head.end === 'calls'
-    const ms = hold ? this.config.holdTimeoutMs : this.config.idleTimeoutMs
-    this.timer = setTimeout(() => void this.kill(hold ? 'hold_timeout' : 'idle_timeout'), ms)
+    this.eviction.arm(hold, () => void this.kill(hold ? 'hold_timeout' : 'idle_timeout'))
   }
 
   // ---- requests --------------------------------------------------------------------------------------
@@ -433,7 +444,7 @@ export class Lane implements BridgeTarget {
   private pendingAtAttach: number | null = null
 
   attach(a: Active): void {
-    clearTimeout(this.timer)
+    this.eviction.clear()
     this.active = a
     // anything Claude Code wrote while the lane sat at rest belongs before this attempt
     if (this.proc && !this.dead) this.readLog()

@@ -1,4 +1,4 @@
-import { RECORD_PREFIX } from './records.ts'
+import { isRecord } from './records.ts'
 import { Buffer } from 'node:buffer'
 // OpenAI Responses WebSocket subset: one create in flight, text JSON events, no cancel message.
 import { parseWebSocketCreate, WARMUP_ID_STEM, type WarmupPrefix } from './api/request.ts'
@@ -163,7 +163,7 @@ class SocketSink implements EventSink {
     const send = this.writer.prepare(events.map(({ type, data }, i) => {
       if (type === 'response.completed' || type === 'response.incomplete') {
         const output = data.response.output?.map((item: Json) => {
-          if (item.type !== 'reasoning' || !item.encrypted_content?.startsWith(RECORD_PREFIX)) return item
+          if (item.type !== 'reasoning' || !isRecord(item.encrypted_content)) return item
           const { encrypted_content: _, ...rest } = item
           return rest
         })

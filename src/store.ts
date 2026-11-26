@@ -1,21 +1,78 @@
 import { createHash } from 'node:crypto'
-// The response store: response id -> provider record, one JSON file per response under <state>/responses.
-// It survives gateway restarts; a request with a known previous_response_id rebuilds Claude Code's log from it.
+// The response store: one JSON file per response under <state>/responses, id -> provider record. It survives gateway
+// restarts; a request naming a known response rebuilds its lane's state from the chain of records. Both lanes use
+// RecordStore; the Claude lane adds the payload sidecars and tails its log replay needs.
 import { type ProviderRecord, RecordError } from './records.ts'
 
-export class ResponseStore {
+const ID = /^[A-Za-z0-9_-]+$/
+
+export class RecordStore<R extends { id: string; prev: string | null }> {
   readonly dir: string
+  constructor(stateDir: string) {
+    this.dir = `${stateDir}/responses`
+    Deno.mkdirSync(this.dir, { recursive: true, mode: 0o700 })
+  }
+
+  private path(id: string): string {
+    if (!ID.test(id)) throw new Error(`bad response id ${id}`)
+    return `${this.dir}/${id}.json`
+  }
+
+  get(id: string): R | null {
+    if (!ID.test(id)) return null
+    try {
+      return JSON.parse(Deno.readTextFileSync(this.path(id)))
+    } catch (e) {
+      if (e instanceof Deno.errors.NotFound) return null
+      throw e
+    }
+  }
+
+  has(id: string): boolean {
+    return this.get(id) !== null
+  }
+
+  put(r: R): void {
+    const p = this.path(r.id)
+    const tmp = `${p}.tmp`
+    Deno.writeTextFileSync(tmp, JSON.stringify(r), { mode: 0o600 })
+    Deno.renameSync(tmp, p)
+  }
+
+  /** Roll back a just-written response whose synchronous terminal enqueue was refused. */
+  remove(id: string): void {
+    Deno.removeSync(this.path(id))
+  }
+
+  /** The chain of records ending at `id`, oldest first; null if any link is missing. */
+  chain(id: string): R[] | null {
+    const out: R[] = []
+    let cur: string | null = id
+    const seen = new Set<string>()
+    while (cur !== null) {
+      if (seen.has(cur)) return null
+      seen.add(cur)
+      const r = this.get(cur)
+      if (!r) return null
+      out.push(r)
+      cur = r.prev
+    }
+    return out.reverse()
+  }
+}
+
+export class ResponseStore extends RecordStore<ProviderRecord> {
   readonly tailDir: string
   readonly payloadDir: string
   readonly aliasDir: string
+
   constructor(stateDir: string) {
-    this.dir = `${stateDir}/responses`
+    super(stateDir)
     this.tailDir = `${stateDir}/tails`
     this.payloadDir = `${stateDir}/payloads`
     this.aliasDir = `${stateDir}/payload-aliases`
     Deno.mkdirSync(this.payloadDir, { recursive: true, mode: 0o700 })
     Deno.mkdirSync(this.aliasDir, { recursive: true, mode: 0o700 })
-    Deno.mkdirSync(this.dir, { recursive: true, mode: 0o700 })
     Deno.mkdirSync(this.tailDir, { recursive: true, mode: 0o700 })
   }
 
@@ -61,7 +118,7 @@ export class ResponseStore {
 
   /** Log lines Claude Code wrote after a response's record and before its process went away. */
   tail(id: string): string[] {
-    if (!/^[A-Za-z0-9_-]+$/.test(id)) return []
+    if (!ID.test(id)) return []
     try {
       return JSON.parse(Deno.readTextFileSync(`${this.tailDir}/${id}.json`))
     } catch (e) {
@@ -71,55 +128,8 @@ export class ResponseStore {
   }
 
   putTail(id: string, lines: string[]): void {
-    const p = `${this.tailDir}/${this.path(id).replace(/^.*\//, '')}`
+    const p = `${this.tailDir}/${id}.json`
     Deno.writeTextFileSync(`${p}.tmp`, JSON.stringify(lines), { mode: 0o600 })
     Deno.renameSync(`${p}.tmp`, p)
-  }
-
-  private path(id: string): string {
-    if (!/^[A-Za-z0-9_-]+$/.test(id)) throw new Error(`bad response id ${id}`)
-    return `${this.dir}/${id}.json`
-  }
-
-  get(id: string): ProviderRecord | null {
-    if (!/^[A-Za-z0-9_-]+$/.test(id)) return null
-    try {
-      return JSON.parse(Deno.readTextFileSync(this.path(id)))
-    } catch (e) {
-      if (e instanceof Deno.errors.NotFound) return null
-      throw e
-    }
-  }
-
-  has(id: string): boolean {
-    return this.get(id) !== null
-  }
-
-  put(r: ProviderRecord): void {
-    const p = this.path(r.id)
-    const tmp = `${p}.tmp`
-    Deno.writeTextFileSync(tmp, JSON.stringify(r), { mode: 0o600 })
-    Deno.renameSync(tmp, p)
-  }
-
-  /** Roll back a just-written response whose synchronous terminal enqueue was refused. */
-  remove(id: string): void {
-    Deno.removeSync(this.path(id))
-  }
-
-  /** The chain of records ending at `id`, oldest first; null if any link is missing. */
-  chain(id: string): ProviderRecord[] | null {
-    const out: ProviderRecord[] = []
-    let cur: string | null = id
-    const seen = new Set<string>()
-    while (cur !== null) {
-      if (seen.has(cur)) return null
-      seen.add(cur)
-      const r = this.get(cur)
-      if (!r) return null
-      out.push(r)
-      cur = r.prev
-    }
-    return out.reverse()
   }
 }

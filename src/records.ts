@@ -9,6 +9,36 @@ import type { InItem, Part } from './api/request.ts'
 export const RECORD_PREFIX = 'cc2r.record.v1.'
 export const THINKING_PREFIX = 'cc2r.thinking.v1.'
 
+// Every lane's provider-record envelope is gzip + base64 behind its own prefix. A transport that must keep an opaque
+// record out of a terminal batch (WebSocket) asks here instead of naming one lane's constant.
+const recordPrefixes = new Set<string>([RECORD_PREFIX])
+
+/** Registers a lane's record prefix; the Claude lane's is always registered. */
+export function registerRecordPrefix(prefix: string): void {
+  recordPrefixes.add(prefix)
+}
+
+/** Whether this opaque reasoning content is a provider record of any lane. */
+export function isRecord(content: string | undefined): boolean {
+  if (!content) return false
+  for (const prefix of recordPrefixes) if (content.startsWith(prefix)) return true
+  return false
+}
+
+/** A lane's record as its envelope: the prefix, then gzip of the JSON. */
+export async function packRecord(prefix: string, value: unknown): Promise<string> {
+  return prefix + b64(await gzip(new TextEncoder().encode(JSON.stringify(value))))
+}
+
+/** Unpacks a record's envelope; anything that is not exactly one gzip'd JSON value is a RecordError. */
+export async function unpackRecord(prefix: string, content: string): Promise<unknown> {
+  try {
+    return JSON.parse(new TextDecoder().decode(await gunzip(unb64(content.slice(prefix.length)))))
+  } catch {
+    throw new RecordError('not valid gzip+base64 JSON')
+  }
+}
+
 export interface CallRef {
   /** Claude Code's tool_use id, which is also the function_call's call_id. */
   id: string
@@ -72,7 +102,7 @@ function unb64(s: string): Uint8Array<ArrayBuffer> {
 }
 
 export async function encodeRecord(r: ProviderRecord): Promise<string> {
-  return RECORD_PREFIX + b64(await gzip(new TextEncoder().encode(JSON.stringify(r))))
+  return packRecord(RECORD_PREFIX, r)
 }
 
 export class RecordError extends Error {}
@@ -98,12 +128,7 @@ const TOOL_NAME = /^[a-zA-Z0-9_-]{1,64}$/
 export async function decodeRecord(s: string): Promise<ProviderRecord | null> {
   if (!s.startsWith(RECORD_PREFIX)) return null
   // deno-lint-ignore no-explicit-any
-  let r: any
-  try {
-    r = JSON.parse(new TextDecoder().decode(await gunzip(unb64(s.slice(RECORD_PREFIX.length)))))
-  } catch {
-    throw new RecordError('not valid gzip+base64 JSON')
-  }
+  const r: any = await unpackRecord(RECORD_PREFIX, s)
   checkRecord(r)
   return r as ProviderRecord
 }
@@ -118,19 +143,7 @@ export function checkRecord(r: any): void {
   if (r.prev !== null && (typeof r.prev !== 'string' || !RESPONSE_ID.test(r.prev))) fail('bad prev')
   if (typeof r.chain !== 'string' || !HEX64.test(r.chain)) fail('bad chain')
   if (r.instructions !== undefined && (typeof r.instructions !== 'string' || !r.instructions)) fail('bad instructions')
-  if (r.callAliases !== undefined) {
-    if (!Array.isArray(r.callAliases)) fail('bad call aliases')
-    const clients = new Set<string>(), providers = new Set<string>()
-    for (const pair of r.callAliases) {
-      if (
-        !Array.isArray(pair) || pair.length !== 2 || typeof pair[0] !== 'string' || !pair[0] ||
-        typeof pair[1] !== 'string' || !CALL_ID.test(pair[1])
-      ) fail('bad call alias')
-      if (clients.has(pair[0]) || providers.has(pair[1])) fail('call aliases are not one-to-one')
-      clients.add(pair[0])
-      providers.add(pair[1])
-    }
-  }
+  if (r.callAliases !== undefined) checkCallAliases(r.callAliases)
   if (
     r.nativeCalls !== undefined && (!Array.isArray(r.nativeCalls) ||
       r.nativeCalls.some((id: unknown) => typeof id !== 'string' || !CALL_ID.test(id)))
@@ -157,6 +170,22 @@ export function checkRecord(r: any): void {
       fail('entry is not JSON')
     }
     if (typeof o !== 'object' || o === null || Array.isArray(o)) fail('entry is not an object')
+  }
+}
+
+/** One-to-one client -> provider call-id pairs, as both lanes' records carry them. */
+export function checkCallAliases(aliases: unknown): void {
+  if (aliases === undefined) return
+  if (!Array.isArray(aliases)) throw new RecordError('bad call aliases')
+  const clients = new Set<string>(), providers = new Set<string>()
+  for (const pair of aliases) {
+    if (
+      !Array.isArray(pair) || pair.length !== 2 || typeof pair[0] !== 'string' || !pair[0] ||
+      typeof pair[1] !== 'string' || !CALL_ID.test(pair[1])
+    ) throw new RecordError('bad call alias')
+    if (clients.has(pair[0]) || providers.has(pair[1])) throw new RecordError('call aliases are not one-to-one')
+    clients.add(pair[0])
+    providers.add(pair[1])
   }
 }
 
