@@ -545,8 +545,9 @@ Deno.test('agy: an untested binary stamps its own version and never assembles or
     await assertStopped(pids(await r.evidence()))
     const rebuilt = await gw.post(follow(held.response, outputs(held.response)))
     assertEquals(rebuilt.status, 500)
-    assertEquals((await rebuilt.json()).error.code, 'store_unreadable')
-    assertMatch((await rebuilt.json()).error.message, /not the measured 1\.5\.17/)
+    const refusal = await rebuilt.json()
+    assertEquals(refusal.error.code, 'store_unreadable')
+    assertMatch(refusal.error.message, /not the measured 1\.5\.17/)
   } finally {
     await r.dispose()
   }
@@ -612,6 +613,286 @@ Deno.test('agy: a chain head without its trajectory blob is refused before any p
     })
     assertEquals([refused.status, (await refused.json()).error.code], [400, 'provider_record_missing'])
     assertEquals((await r.evidence()).filter((e) => e.kind === 'process').length, processes)
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: steering keeps user, developer and system messages on a held-call delta', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start(['--hold-timeout', '0.2'])
+    const { response } = await gw.create(initial('batch'))
+    const notices = [message('user', 'user notice'), message('developer', 'observation'), message('system', 'system notice')]
+    const live = await gw.create(follow(response, [...outputs(response), ...notices]))
+    assertEquals(live.response.x_gateway.path, 'live')
+    assertEquals(JSON.parse(text(live.response)), {
+      results: ['result-0', 'result-1', 'result-2'],
+      messages: [
+        { userMessage: 'user notice' },
+        { systemMessage: { systemMessage: 'observation' } },
+        { systemMessage: { systemMessage: 'system notice' } },
+      ],
+    })
+    // the same three roles on a rebuilt conversation: the user message is the prompt, the other two ride the hook
+    const second = await gw.create(follow(live.response, [user('pair')]))
+    await assertStopped(pids(await r.evidence()))
+    const rebuilt = await gw.create(follow(second.response, [...outputs(second.response, 'after'), ...notices]))
+    assertEquals([rebuilt.response.x_gateway.path, rebuilt.response.x_gateway.patched], ['store', 2])
+    const evidence = await r.evidence()
+    assertEquals(evidence.filter((e) => e.kind === 'prompt').at(-1).text, 'user notice')
+    const hooks = evidence.filter((e) => e.kind === 'hook' && e.invocationNum === 0)
+    assertEquals(hooks.at(-1).steps, [
+      { systemMessage: { systemMessage: 'observation' } },
+      { systemMessage: { systemMessage: 'system notice' } },
+    ])
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: a socket that leaves during planning does not evict the live lane', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start()
+    const first = await gw.create(initial('Remember one.'))
+    const held = await gw.create(follow(first.response, [user('batch')]))
+    const conversation = first.response.x_gateway.conversation
+    const db = `${r.state}/gemini/antigravity-cli/conversations/${conversation}.db`
+    const before = createHash('sha256').update(await Deno.readFile(db)).digest('hex')
+    const dispatched = (await r.evidence()).length
+    // a full history whose head is the first response, on a socket closed right after the create
+    const socket = new WebSocket(gw.url.replace('http:', 'ws:') + '/v1/responses')
+    await new Promise((resolve) => socket.addEventListener('open', resolve, { once: true }))
+    socket.send(JSON.stringify({
+      type: 'response.create',
+      model: MODEL,
+      instructions: INSTRUCTIONS,
+      tools: [tool()],
+      input: [user('Remember one.'), ...first.response.output, user('Again.')],
+    }))
+    socket.close()
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    // the socket that left did nothing on its behalf: it launched no process and assembled no store
+    assertEquals((await r.evidence()).slice(dispatched).filter((e) => e.kind !== 'hook' && e.kind !== 'prompt'), [])
+    assertEquals(createHash('sha256').update(await Deno.readFile(db)).digest('hex'), before, 'the closed socket assembled the store')
+    // the lane that was holding the batch is still the chain's live process, and the chain is not reserved
+    const live = await gw.create(follow(held.response, outputs(held.response)))
+    assertEquals([live.response.status, live.response.x_gateway.path], ['completed', 'live'])
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: a socket that leaves while its history is being matched writes nothing', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start(['--hold-timeout', '0.2'])
+    const { response } = await gw.create(initial('batch'))
+    await assertStopped(pids(await r.evidence()))
+    const conversation = response.x_gateway.conversation
+    const db = `${r.state}/gemini/antigravity-cli/conversations/${conversation}.db`
+    const before = createHash('sha256').update(await Deno.readFile(db)).digest('hex')
+    const socket = new WebSocket(gw.url.replace('http:', 'ws:') + '/v1/responses')
+    await new Promise((resolve) => socket.addEventListener('open', resolve, { once: true }))
+    socket.send(JSON.stringify({
+      type: 'response.create',
+      model: MODEL,
+      instructions: INSTRUCTIONS,
+      tools: [tool()],
+      input: [user('batch'), ...response.output, ...outputs(response)],
+    }))
+    socket.close()
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    const after = createHash('sha256').update(await Deno.readFile(db)).digest('hex')
+    assertEquals(after, before, 'the cancelled request assembled the store')
+    // the chain is free and its store untouched: the same release now works and completes the calls
+    const released = await gw.create(follow(response, outputs(response)))
+    assertEquals([released.response.status, released.response.x_gateway.path, released.response.x_gateway.patched], ['completed', 'store', 3])
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: one validator, one outcome for every kind of unusable reasoning, in both modes', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start(['--idle-timeout', '0.2', '--hold-timeout', '0.2'])
+    const first = await gw.create(initial('batch'))
+    const record = first.response.output.find((item: any) => item.type === 'reasoning' && item.encrypted_content)?.encrypted_content
+    const decoded = await unpackRecord(AGY_RECORD_PREFIX, record!) as any
+    const items = first.response.output.filter((item: any) => !(item.type === 'reasoning' && item.encrypted_content?.startsWith(AGY_RECORD_PREFIX)))
+    const withRecord = (content: string) => ({ type: 'reasoning', summary: [], encrypted_content: content })
+    const olderVersion = await packRecord(AGY_RECORD_PREFIX, { ...decoded, agy: '1.5.16' })
+    const claude = await packRecord('cc2r.record.v1.', { v: 1 })
+    const oldEnvelope = await packRecord('agy2r.record.v0.', decoded)
+    const badBase64 = await packRecord(AGY_RECORD_PREFIX, { ...decoded, steps: [{ ...decoded.steps[0], step_payload: 'A' }] })
+    const corrupt = `${AGY_RECORD_PREFIX}not-gzip`
+    const notARecord = encodeThinkingText()
+    const cases: [string, string, string | null][] = [
+      ['a corrupt record', corrupt, 'invalid_provider_record'],
+      ['another agy version', olderVersion, 'provider_record_foreign'],
+      ["the Claude lane's record", claude, 'provider_record_foreign'],
+      ['an older agy envelope', oldEnvelope, 'provider_record_foreign'],
+      ['invalid base64 in a row', badBase64, 'invalid_provider_record'],
+      ['a thinking item', notARecord, null],
+    ]
+    for (const [name, content, code] of cases) {
+      // a delta naming the chain head reads every reasoning item it was sent
+      const delta = await gw.post(follow(first.response, [withRecord(content)]))
+      // and a full history reads the record beside the response it closes
+      const full = await gw.post({
+        model: MODEL,
+        instructions: INSTRUCTIONS,
+        tools: [tool()],
+        input: [user('batch'), user('batch'), ...items, withRecord(content), user('Again.')],
+      })
+      if (code === null) {
+        // a thinking item carries no record: the delta drops it and goes on to the missing outputs
+        assertEquals([name, delta.status, (await delta.json()).error.code], [name, 400, 'missing_tool_output'])
+        continue
+      }
+      assertEquals([name, delta.status, (await delta.json()).error.code], [name, 400, code], `${name} (delta)`)
+      assertEquals([name, full.status, (await full.json()).error.code], [name, 400, code], `${name} (full history)`)
+    }
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+/** agy's own thinking text: a reasoning item with no opaque content at all, which is the lane's state already. */
+function encodeThinkingText(): string {
+  return ''
+}
+
+/** One transport's way of sending a create; both answer with the terminal response object. */
+function connection(gw: { url: string; create: (body: unknown) => Promise<{ response: any }> }, transport: 'sse' | 'ws') {
+  if (transport === 'sse') return { send: async (body: any) => (await gw.create(body)).response, close: async () => {} }
+  const ws = new WsClient(new WebSocket(gw.url.replace('http:', 'ws:') + '/v1/responses'))
+  return { send: async (body: any) => (await ws.send(body)).response, close: () => ws.close() }
+}
+
+/** The transcript the model was shown: user turns, planner lines and resume notices, in order. */
+function transcript(visible: string[]): string[] {
+  return visible.filter((row) => /^\d+:(14|15|101):/.test(row)).map((row) => row.replace(/^\d+:/, ''))
+}
+
+const USER1 = 'Remember the marker KUMQUAT-3311.'
+
+for (const transport of ['sse', 'ws'] as const) {
+  for (const disruption of ['live', 'evict', 'restart', 'restart-lost-store'] as const) {
+    Deno.test(`agy: ${disruption} over ${transport}: one conversation, one prefix, one system part`, async () => {
+      const r = await rig()
+      try {
+        let gw = await r.start(disruption === 'evict' ? ['--hold-timeout', '0.2'] : [])
+        let conn = connection(gw, transport)
+        const history: any[] = []
+        const send = async (input: any[], previous: string | null) => {
+          const body = { model: MODEL, instructions: INSTRUCTIONS, tools: [tool()], input: previous ? input : [...history, ...input] }
+          const response = await conn.send(previous ? { ...body, previous_response_id: previous } : body)
+          assertEquals(response.status, 'completed', JSON.stringify(response.error))
+          history.push(...input, ...response.output)
+          return response
+        }
+        try {
+          const first = await send([user(USER1)], null)
+          assertEquals(first.x_gateway.path, 'new')
+          const batch = await send([user('batch')], first.id)
+          assertEquals(calls(batch).length, 3)
+          if (disruption === 'evict') await assertStopped(pids(await r.evidence()))
+          if (disruption === 'restart' || disruption === 'restart-lost-store') {
+            await conn.close()
+            await gw.stop()
+            if (disruption === 'restart-lost-store') await Deno.remove(r.state, { recursive: true })
+            gw = await r.start()
+            conn = connection(gw, transport)
+          }
+          const outputsAtHead = outputs(batch)
+          const lost = disruption === 'restart-lost-store'
+          const released = await send(outputsAtHead, lost ? null : batch.id)
+          assertEquals(released.x_gateway.path, lost ? 'history' : disruption === 'live' ? 'live' : 'store')
+          assertEquals(released.x_gateway.patched, disruption === 'live' ? 0 : 3)
+          const again = await send([user('And one more, please.')], released.id)
+          assertEquals(again.status, 'completed')
+          // the live process did the release itself; every rebuild completed the three steps first
+          const events = await r.evidence()
+          if (disruption !== 'live') {
+            const checks = events.filter((e) => e.kind === 'resume-check')
+            assertEquals(checks.at(-1).completed.length >= 3, true)
+          }
+          // every inference's transcript starts with the one before it
+          const promptsSeen = promptsOf(events).map((p) => transcript(p.visible))
+          for (let i = 1; i < promptsSeen.length; i++) {
+            const before = promptsSeen[i - 1], now = promptsSeen[i]
+            assert(now.length >= before.length, `prompt ${i}: ${now.length} rows, before ${before.length}`)
+            for (let j = 0; j < before.length; j++) assertEquals(now[j], before[j], `prompt ${i} changed transcript row ${j}`)
+          }
+          // the system part is one thing for the whole conversation: agent text, working folder and tool set
+          const processes = events.filter((e) => e.kind === 'process')
+          assertEquals(new Set(processes.map((p) => p.cwd)).size, 1, 'the working folder changed within the chain')
+          assertEquals(new Set(processes.map((p) => p.instructions)).size, 1, 'the agent text changed within the chain')
+          assertEquals(new Set(events.filter((e) => e.kind === 'listed').map((e) => JSON.stringify(e.names))).size, 1, 'the tool set changed')
+        } finally {
+          await conn.close().catch(() => {})
+        }
+        await gw.stop()
+        await assertStopped(pids(await r.evidence()))
+      } finally {
+        await r.dispose()
+      }
+    })
+  }
+}
+
+Deno.test('agy: a second create on a chain in progress is 409 conversation_busy', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start()
+    const first = await gw.create(initial('Remember one.'))
+    const inFlight = await gw.post(follow(first.response, [user('hold-generation')]))
+    assertEquals(inFlight.status, 200)
+    const reader = inFlight.body!.getReader()
+    let buffer = ''
+    let id = ''
+    while (!id) {
+      const { value, done } = await reader.read()
+      assert(!done, 'the in-flight response ended before it started')
+      buffer += new TextDecoder().decode(value)
+      for (const line of buffer.split('\n')) {
+        if (!line.startsWith('data: ')) continue
+        const event = JSON.parse(line.slice(6))
+        if (event.type === 'response.created') id = event.response.id
+      }
+    }
+    const busy = await gw.post(follow(first.response, [user('another request')]))
+    assertEquals([busy.status, (await busy.json()).error.code], [409, 'conversation_busy'])
+    const cancelled = await fetch(`${gw.url}/v1/responses/${id}/cancel`, { method: 'POST' })
+    assertEquals(cancelled.status, 200)
+    await reader.cancel().catch(() => {})
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: naming an earlier response rebuilds at it while a later process is live', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start()
+    const first = await gw.create(initial('Remember one.'))
+    const second = await gw.create(follow(first.response, [user('Second turn.')]))
+    assertEquals(second.response.x_gateway.path, 'live')
+    // the live process sits at the second response; naming the first one rebuilds at it
+    const earlier = await gw.create(follow(first.response, [user('From the first response again.')]))
+    assertEquals([earlier.response.status, earlier.response.x_gateway.path], ['completed', 'store'])
+    // and the rebuilt conversation continues normally
+    const next = await gw.create(follow(earlier.response, [user('Onward.')]))
+    assertEquals(next.response.status, 'completed')
     await gw.stop()
   } finally {
     await r.dispose()

@@ -6,13 +6,13 @@ import { Chains, type Reservation } from '../chains.ts'
 import { asGatewayError, GatewayError, invalid, previousResponseNotFound, serverError, unsupported } from '../errors.ts'
 import { type Group, matchHistory, segment } from '../history.ts'
 import { bindCalls, type CallAliases, remapItems } from '../call_ids.ts'
-import { isRecord, ItemDigest } from '../records.ts'
+import { ItemDigest, RECORD_PREFIX } from '../records.ts'
 import { handler, type ResponsesEndpoint } from '../server.ts'
 import { RecordStore } from '../store.ts'
 import { agyEnvironment, reapOrphans } from './acp.ts'
 import { type Exchange, injection, Lane, type Tier } from './lane.ts'
 import { type Call, Output } from './output.ts'
-import { type AgyRecord, type CallRef, checkAgyRecord, encodeAgyRecord, readAgyRecord, RecordVerdict } from './record.ts'
+import { AGY_RECORD_FAMILY, type AgyRecord, type CallRef, checkAgyRecord, encodeAgyRecord, readAgyRecord, RecordVerdict } from './record.ts'
 import { stepsHash, stepsRowJson, stepsRowFromJson, type StepsRow, trajectoryFromJson, trajectoryJson } from './rows.ts'
 import { AGY_VERSION } from './schema.ts'
 import { callOf, completeStep, outputFileText, stepStart, type StepOutput } from './step.ts'
@@ -285,6 +285,7 @@ export class AgyGateway implements ResponsesEndpoint {
       const atHead = live !== undefined && !live.dead && !live.busy && live.head === (head?.id ?? null)
       let path: 'new' | 'live' | 'store' | 'history'
       let moved = false
+      let patched = 0
       if (head === null) {
         lane = this.launch(chain, model, instructions, tools)
         await lane.start(null)
@@ -300,7 +301,9 @@ export class AgyGateway implements ResponsesEndpoint {
         if (abandoned()) return
         moved = this.pathsMoved(chain, head)
         if (moved) console.error(`paths_moved: chain ${chain} was recorded under another state folder; its prompt differs (one cold cache miss)`)
-        lane = this.laneFromRecords(chain, identity!, chainRecords, head, delivery)
+        const rebuilt = this.laneFromRecords(chain, identity!, chainRecords, head, delivery)
+        lane = rebuilt.lane
+        patched = rebuilt.patched
         if (abandoned()) {
           await lane.stop()
           return
@@ -321,7 +324,7 @@ export class AgyGateway implements ResponsesEndpoint {
         chain,
         conversation: lane.session,
         records: chainRecords.length,
-        patched: head?.end === 'calls' ? head.calls.length : 0,
+        patched,
         ...(moved ? { paths: 'elsewhere' } : {}),
       }
       output.open()
@@ -414,7 +417,8 @@ export class AgyGateway implements ResponsesEndpoint {
         continue
       }
       const content = item.encrypted ?? ''
-      if (!isRecord(content)) continue
+      // a thinking item is ours too, but it carries no record: only an envelope is read (and judged) here
+      if (!content.startsWith(RECORD_PREFIX) && !content.startsWith(AGY_RECORD_FAMILY)) continue
       const record = await this.readRecord(content, `input[${i}]`)
       if (record === null) continue
       if (ids.has(record.id)) continue
@@ -438,7 +442,7 @@ export class AgyGateway implements ResponsesEndpoint {
   }
 
   /** A lane at a record's conversation: the store assembled from the chain's records, with pending calls completed. */
-  private laneFromRecords(chain: string, identity: Identity, chainRecords: AgyRecord[], head: AgyRecord, delivery: Delivery): Lane {
+  private laneFromRecords(chain: string, identity: Identity, chainRecords: AgyRecord[], head: AgyRecord, delivery: Delivery): { lane: Lane; patched: number } {
     if (this.version !== AGY_VERSION) {
       throw serverError('store_unreadable', `agy ${this.version} is not the measured ${AGY_VERSION}: its store is never assembled or patched.`)
     }
@@ -499,7 +503,7 @@ export class AgyGateway implements ResponsesEndpoint {
       Deno.mkdirSync(dirname(file.path), { recursive: true, mode: 0o700 })
       Deno.writeFileSync(file.path, file.content, { mode: 0o600 })
     }
-    return this.launch(chain, identity.model, identity.instructions, identity.tools)
+    return { lane: this.launch(chain, identity.model, identity.instructions, identity.tools), patched: files.length }
   }
 
   /**

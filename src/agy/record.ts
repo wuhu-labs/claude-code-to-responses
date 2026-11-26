@@ -7,7 +7,10 @@ import { checkCallAliases, packRecord, RECORD_PREFIX, registerRecordPrefix, RESP
 import type { StepsRowJson, TrajectoryJson } from './rows.ts'
 
 export const AGY_RECORD_PREFIX = 'agy2r.record.v1.'
+export const AGY_RECORD_FAMILY = 'agy2r.record.'
+// the family's older envelopes are recorded content too: a transport keeps them out of its terminal batch
 registerRecordPrefix(AGY_RECORD_PREFIX)
+registerRecordPrefix(AGY_RECORD_FAMILY)
 
 export interface CallRef {
   /** agy's own call id inside the step payload; the client's ids are bound to these in `callAliases`. */
@@ -71,7 +74,8 @@ export class RecordVerdict extends Error {
  */
 export async function readAgyRecord(content: string, version: string): Promise<AgyRecord | null> {
   if (content.startsWith(RECORD_PREFIX)) throw new RecordVerdict('foreign', "the Claude lane's provider record")
-  if (!content.startsWith(AGY_RECORD_PREFIX)) return null
+  if (!content.startsWith(AGY_RECORD_FAMILY)) return null
+  if (!content.startsWith(AGY_RECORD_PREFIX)) throw new RecordVerdict('foreign', 'a provider record of another gateway generation')
   let record: unknown
   try {
     record = await unpackRecord(AGY_RECORD_PREFIX, content)

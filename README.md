@@ -671,8 +671,11 @@ transport, any order).
   re-issue interrupted calls, so they are never re-run.
 - **Large outputs.** agy stores an `output.txt` whole up to 10,240 bytes and otherwise keeps a 10,240-byte preview:
   a notice naming the file, the first ~4.9 KB, one `<truncated N of M bytes from the middle of the output>` line and
-  the last ~4.9 KB. The gateway writes exactly that preview (and the whole text to `output.txt`), so the upstream
-  tool response is the one a native call would have produced. `preview()` in `src/agy/step.ts` is the one place.
+  the last ~4.9 KB. Both cuts are rounded to whole UTF-8 characters, so a multibyte output never keeps half a
+  character: the measured native preview of 4,000 `🙂` and 3,000 CJK characters is 10,238 bytes with no replacement
+  character, and `preview()` reproduces those bytes exactly. The gateway writes that preview (and the whole text to
+  `output.txt`), so the upstream tool response is the one a native call would have produced. `preview()` in
+  `src/agy/step.ts` is the one place.
 
 An image anywhere in the input is `400 unsupported` (until images have their own issue). An absent or mismatched
 planner line still falls back to one call per response with a diagnostic; usage is absent where it cannot be
@@ -737,7 +740,7 @@ The probes use the same setting. The binary must still be 2.1.322. Gateway tests
 working folders under `/tmp/cc2r-test`. Each probe owns a unique `/tmp/cc2r-probe-*` root for its configuration, logs
 and working folders; cleanup removes only that root. Tests use ports 18300-18399 and fail if any Claude Code process outlives them.
 
-`test/agy_test.ts` runs the agy lane against `test/fixtures/fake_agy.ts`, a strict ACP double that keeps a **real SQLite store** in agy 1.5.17's layout and recreates the planner transcript on resume. One conversation runs live and again with an eviction, a gateway restart that keeps the store and a restart that loses the whole state folder; every prompt's evidence carries what agy would render upstream, and the last turn's rows must be the live run's, apart from the resume notices. The same suite covers a held batch released by a live process, a restart during a hold (the gateway's step write, checked by the double), the preview for a 30 KB output, the typed refusals above and the shared 400s. `deno task probe:agy` is the per-release run against the real binary and its `--cloud_code_endpoint` capture.
+`test/agy_test.ts` runs the agy lane against `test/fixtures/fake_agy.ts`, a strict ACP double that keeps a **real SQLite store** in agy 1.5.17's layout and recreates the planner transcript on resume. One conversation runs live and again with an eviction, a gateway restart that keeps the store and a restart that loses the whole state folder, each of the four over SSE and over WebSocket: every inference is checked to extend the previous one's transcript prefix, with one system part (workspace, instructions, tool set) per conversation. A second create on a chain in progress is `409 conversation_busy`; naming an earlier response rebuilds at it while a later process is live. Every prompt's evidence carries what agy would render upstream, and the last turn's rows must be the live run's, apart from the resume notices. The same suite covers a held batch released by a live process, a restart during a hold (the gateway's step write, checked by the double), the preview for a 30 KB output, the typed refusals above and the shared 400s. `deno task probe:agy` is the per-release run against the real binary and its `--cloud_code_endpoint` capture: one conversation per transport (SSE, then a persistent WebSocket), each a turn, a held batch released from a rebuilt store, a restart and a rebuild with the state folder gone, asserting one system instruction, one tool set and a growing transcript prefix per conversation.
 
 The byte assertions (`test/core_test.ts`, `test/hold_test.ts`, `test/matrix_test.ts`) run over both HTTP/SSE and
 persistent WebSockets: one conversation runs twice,

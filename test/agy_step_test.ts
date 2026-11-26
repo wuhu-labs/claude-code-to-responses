@@ -143,3 +143,17 @@ Deno.test('agy step: the middle line names what is missing, counted from the pre
   assertEquals(Number(match![1]), 20_000 - 2 * headBytes)
   assertEquals(new TextEncoder().encode(shown).length <= 10_240, true)
 })
+
+Deno.test('agy step: a multibyte output is cut exactly as agy cuts it, on whole characters', async () => {
+  // measured on agy 1.5.17 from a live large call: 4,000 emoji and 3,000 CJK characters plus markers
+  const fixture = JSON.parse(await Deno.readTextFile(new URL('./fixtures/agy-preview-multibyte.json', import.meta.url)))
+  const full = new TextEncoder().encode(fixture.full)
+  const shown = preview(full, fixture.url)
+  assertEquals(new TextEncoder().encode(fixture.stored).length, 10_238)
+  assertEquals(shown, fixture.stored)
+  assertEquals(shown.includes('\uFFFD'), false)
+  // every character of the head and the tail is whole, and the middle line counts bytes
+  const match = /<truncated (\d+) of (\d+) bytes from the middle of the output>/.exec(shown)!
+  assertEquals(Number(match[2]), full.length)
+  assertEquals(Number(match[1]), full.length - 4_930 - 4_929)
+})

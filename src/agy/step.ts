@@ -40,26 +40,42 @@ export function outputFileText(output: StepOutput): Uint8Array {
 /**
  * What agy puts in the step (and so in the upstream functionResponse) when the output is too long to store whole:
  * a notice naming the file, then the head and the tail of the full text with one line saying what is missing.
- * Sizes are UTF-8 bytes; the two halves are computed so that the whole preview is PREVIEW_BYTES long.
+ * The halves are byte budgets rounded to whole UTF-8 characters, so a multibyte output never yields half a character
+ * and the stored text stays the size agy's own cut produces. Sizes are bytes; `M` is the `output.txt` length.
  */
 export function preview(full: Uint8Array, outputUrl: string): string {
   const notice = `The tool's output was truncated due to being too long. You can find the full output in a file at ${outputUrl}.\n\nHere is a preview with the middle of the output truncated:\n`
   const encoder = new TextEncoder()
   const room = PREVIEW_BYTES - encoder.encode(notice).length
   const total = full.length
-  let half = 0
+  const middle = (missing: number) => `\n<truncated ${missing} of ${total} bytes from the middle of the output>\n`
+  let head = 0
+  let tail = 0
   for (let i = 0; i < 8; i++) {
-    const line = encoder.encode(middleLine(total - 2 * half, total)).length
-    const next = Math.max(0, Math.floor((room - line) / 2))
-    if (next === half) break
-    half = next
+    const half = Math.max(0, Math.floor((room - encoder.encode(middle(total - head - tail)).length) / 2))
+    // a byte budget is rounded to a character boundary: the head back, the tail forward
+    const nextHead = wholePrefix(full, Math.min(half, total))
+    const nextTail = Math.min(total - nextHead, wholeSuffix(full, Math.min(half, total - nextHead)))
+    if (nextHead === head && nextTail === tail) break
+    head = nextHead
+    tail = nextTail
   }
   const decoder = new TextDecoder()
-  return notice + decoder.decode(full.subarray(0, half)) + middleLine(total - 2 * half, total) + decoder.decode(full.subarray(total - half))
+  return notice + decoder.decode(full.subarray(0, head)) + middle(total - head - tail) + decoder.decode(full.subarray(total - tail))
 }
 
-function middleLine(missing: number, total: number): string {
-  return `\n<truncated ${missing} of ${total} bytes from the middle of the output>\n`
+/** The longest prefix of at most `bytes` bytes that ends on a UTF-8 character boundary. */
+function wholePrefix(bytes: Uint8Array, budget: number): number {
+  let end = budget
+  while (end > 0 && end < bytes.length && (bytes[end] & 0xc0) === 0x80) end--
+  return end
+}
+
+/** The longest suffix of at most `bytes` bytes that starts on a UTF-8 character boundary. */
+function wholeSuffix(bytes: Uint8Array, budget: number): number {
+  let start = bytes.length - budget
+  while (start < bytes.length && (bytes[start] & 0xc0) === 0x80) start++
+  return bytes.length - start
 }
 
 /** The `140.2.1` value (and the `**Result**` body) for an output: whole when it fits, else the preview. */

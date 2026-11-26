@@ -1,13 +1,21 @@
 // The agy lane's per-release probe, against the real agy. `AGY_BINARY` names it (default: agy on PATH).
 //
-// It runs the same conversation twice on a plain-http pass-through capture of agy's upstream endpoint
-// (`--cloud_code_endpoint`): once live, and once with an eviction, a gateway restart that keeps the store, and a
-// restart that lost the whole state folder. Every request's system instruction and tools must be byte-identical, and
-// each request's `contents` must start with the previous request's: the cache prefix survives every rebuild.
-// Nothing but request bodies is recorded; Authorization, cookies and tokens are never read or printed.
+// What it runs: one conversation per transport — HTTP/SSE, then a persistent WebSocket — against a plain-http
+// pass-through capture of agy's upstream endpoint (`--cloud_code_endpoint`). Each conversation is: a plain turn, a
+// tool batch held until the gateway's hold timeout evicts the process, the outputs released into a store rebuilt from
+// the records, a gateway restart that keeps the state folder, and finally the whole state folder deleted with the
+// client's full history sent instead. Every response must complete.
+//
+// Assertions, per conversation and over all captured agent requests: one system instruction (the chain, the workspace
+// and the conversation id it names stay the same, the deleted-state rebuild included), one tool set, and each
+// request's `contents` starting with the previous request's. The two transports run two conversations, so their
+// instructions differ only in those three names. The Wuhu session past 190 KB over both transports is the post-merge
+// trial, not this probe. Nothing but request bodies is recorded; Authorization, cookies and tokens are never read or
+// printed.
 import { assert, assertEquals, assertMatch } from '@std/assert'
 import { fileURLToPath } from 'node:url'
 import { lines } from '../src/claude/lines.ts'
+import { WsClient } from '../test/websocket_client.ts'
 
 const main = fileURLToPath(new URL('../src/agy/main.ts', import.meta.url))
 const home = Deno.env.get('HOME') ?? ''
@@ -24,9 +32,10 @@ const MODEL = 'gemini-3.8-flash-low'
 const INSTRUCTIONS = 'You are a helpful assistant in a probe. Answer in one short sentence.'
 const tool = { type: 'function', name: 'echo', parameters: { type: 'object', properties: { value: { type: 'string' } }, required: ['value'] } }
 const user = (text: string) => ({ role: 'user', content: text })
-const message = (role: string, content: unknown) => ({ role, content })
 const result = (call: any, output: string) => ({ type: 'function_call_output', call_id: call.call_id, output })
 const shellWord = (s: string) => `'${s.replaceAll("'", `'"'"'`)}'`
+const calls = (response: any) => (response.output ?? []).filter((item: any) => item.type === 'function_call')
+const textOf = (response: any) => (response.output ?? []).filter((item: any) => item.type === 'message').map((item: any) => item.content[0].text).join('')
 
 /** A pass-through capture: agy's upstream endpoint stays https, only its entry point is plain http loopback. */
 function upstreamProxy() {
@@ -57,7 +66,7 @@ const normalize = (text: string) =>
     .replace(/The current local time is: [^.\n]*/g, 'The current local time is: T')
     .replace(/timestamp=[^ \n]*/g, 'timestamp=T')
 
-/** One gateway run: a temp state dir, the real agy behind a capture, and a conversation driver. */
+/** One gateway run: a temp state dir, the real agy behind a capture, and both transports. */
 async function rig(proxy: string, extra: string[] = []) {
   const root = await Deno.realPath(await Deno.makeTempDir({ prefix: 'agy-probe-' }))
   const state = `${root}/state`
@@ -117,7 +126,8 @@ async function rig(proxy: string, extra: string[] = []) {
       }
       throw new Error('the gateway still holds a lane')
     }
-    return { url, stop, create, idle }
+    const socket = () => new WsClient(new WebSocket(url.replace('http:', 'ws:') + '/v1/responses'))
+    return { url, stop, create, idle, socket }
   }
   const dispose = async () => {
     for (const child of processes) child.kill('SIGTERM')
@@ -128,69 +138,91 @@ async function rig(proxy: string, extra: string[] = []) {
 }
 
 Deno.test({
-  name: 'agy upstream: live, store-rebuilt and history-rebuilt requests keep one system instruction, tools and prefix',
+  name: 'agy upstream: per conversation one system instruction, one tool set and one growing prefix, over SSE and WebSocket',
   ignore: !available,
   fn: async () => {
     const proxy = upstreamProxy()
     const r = await rig(proxy.url, ['--hold-timeout', '0.5'])
     try {
-      let gw = await r.start()
-      const history: any[] = []
-      const send = async (input: any[], previous: string | null) => {
-        const body = { model: MODEL, instructions: INSTRUCTIONS, tools: [tool], input: previous ? input : [...history, ...input] }
-        const response = await gw.create(previous ? { ...body, previous_response_id: previous } : body)
-        assertEquals(response.status, 'completed')
-        history.push(...input, ...response.output)
-        return response
+      for (const transport of ['sse', 'ws'] as const) {
+        const history: any[] = []
+        let gw = await r.start()
+        let ws: WsClient | null = null
+        const open = async () => {
+          if (transport === 'ws') ws = gw.socket()
+        }
+        const close = async () => {
+          if (ws) await ws.close()
+          ws = null
+        }
+        const send = async (input: any[], previous: string | null) => {
+          const body: any = {
+            model: MODEL,
+            instructions: INSTRUCTIONS,
+            tools: [tool],
+            input: previous ? input : [...history, ...input],
+            ...(previous ? { previous_response_id: previous } : {}),
+          }
+          const response = transport === 'sse' ? await gw.create(body) : (await ws!.send(body)).response
+          assertEquals(response.status, 'completed', `${transport}: ${JSON.stringify(response.error)}`)
+          history.push(...input, ...response.output)
+          return response
+        }
+        await open()
+        try {
+          const first = await send([user('Remember the marker PROBE-7731.')], null)
+          assertEquals(first.x_gateway.path, 'new', transport)
+          const batch = await send([user('Call echo with value ALPHA, then tell me the result.')], first.id)
+          assertEquals(calls(batch).length, 1, `${transport}: the model did not call the tool`)
+          await gw.idle() // the hold timeout evicts the process: the release rebuilds from the store
+          const released = await send([result(calls(batch)[0], 'ECHO ALPHA echoed'), user('Also remember KIWI-5502.')], batch.id)
+          assertEquals([released.x_gateway.path, released.x_gateway.patched], ['store', 1], transport)
+          await close()
+          await gw.stop()
+          gw = await r.start()
+          await open()
+          const named = await send([user('Name both markers.')], released.id)
+          assertEquals(named.x_gateway.path, 'store', transport)
+          assertMatch(textOf(named), /PROBE-7731/, transport)
+          await close()
+          await gw.stop()
+          await Deno.remove(r.state, { recursive: true })
+          gw = await r.start()
+          await open()
+          const rebuilt = await send([user('In one line: what did echo return, and both markers?')], null)
+          assertEquals(rebuilt.x_gateway.path, 'history', transport)
+          assertMatch(textOf(rebuilt), /PROBE-7731/, transport)
+        } finally {
+          await close()
+          await gw.stop()
+        }
       }
-      const first = await send([user('Remember marker PROBE-7731.')], null)
-      const second = await send([user('Call echo with value ALPHA, then tell me the result.')], first.id)
-      assertEquals(second.x_gateway.path, 'live')
-      const calls = second.output.filter((item: any) => item.type === 'function_call')
-      assertEquals(calls.length, 1, 'the model did not call the tool')
-      // the held process is evicted by the hold timeout: the outputs are written into the step and resumed
-      await gw.idle()
-      const third = await send([result(calls[0], 'ECHO ALPHA echoed'), user('Also remember KIWI-5502.')], second.id)
-      assertEquals([third.x_gateway.path, third.x_gateway.patched], ['store', 1])
-      await gw.stop()
-      gw = await r.start()
-      const fourth = await send([user('Name both markers.')], third.id)
-      assertEquals(fourth.x_gateway.path, 'store')
-      await gw.stop()
-      await Deno.remove(r.state, { recursive: true })
-      gw = await r.start()
-      const fifth = await send([user('In one line: what did echo return, and both markers?')], null)
-      assertEquals(fifth.x_gateway.path, 'history')
-      assertMatch(fifth.output.filter((item: any) => item.type === 'message').map((item: any) => item.content[0].text).join(''), /PROBE-7731/)
-      await gw.stop()
     } finally {
       await r.dispose()
       await proxy.close()
     }
     // the agent's own inferences only: agy also asks a title generator, which is not this conversation
     const generate = proxy.bodies.filter((body) => body.json?.requestType === 'custom_agent' && body.json?.request?.contents)
-    assert(generate.length >= 5, `only ${generate.length} generate requests were captured`)
-    const instructions = generate.map((g) => typeof g.json.request.systemInstruction === 'string' ? g.json.request.systemInstruction : JSON.stringify(g.json.request.systemInstruction))
-    const baseline = instructions[0]
-    const differing = instructions.findIndex((text) => text !== baseline)
-    if (differing > 0) {
-      const other = instructions[differing]
-      let at = 0
-      while (at < baseline.length && baseline[at] === other[at]) at++
-      console.error(`system instruction differs in request ${differing} at ${at} of ${baseline.length}/${other.length}:`)
-      console.error(`  ${JSON.stringify(baseline.slice(Math.max(0, at - 60), at + 120))}`)
-      console.error(`  ${JSON.stringify(other.slice(Math.max(0, at - 60), at + 120))}`)
-    }
-    assertEquals(differing, -1, 'the system instruction changed across the conversation')
+    assert(generate.length >= 8, `only ${generate.length} generate requests were captured`)
+    // one conversation per transport, told apart by the chain its instruction names: the rebuild after the state
+    // folder is deleted has to stay in its own conversation, which is what makes the prompt the same one again
+    const instructions = generate.map((g) => JSON.stringify(g.json.request.systemInstruction))
+    const conversations = new Map<string, number[]>()
+    generate.forEach((_, i) => {
+      const chain = /\/workspaces\/(chain_[0-9a-f]+)/.exec(instructions[i])?.[1]
+      assert(chain, `request ${i} names no chain workspace`)
+      conversations.set(chain, [...(conversations.get(chain) ?? []), i])
+    })
+    assertEquals([...conversations.values()].map((indexes) => indexes.length), [5, 5], 'one conversation of five inferences per transport')
     const tools = new Set(generate.map((g) => JSON.stringify(g.json.request.tools)))
-    assertEquals(tools.size, 1, 'the tool declarations changed across the conversation')
+    assertEquals(tools.size, 1, 'the tool declarations changed across the conversations')
     const contents = generate.map((g) => g.json.request.contents.map((part: any) => normalize(JSON.stringify(part))))
-    for (let i = 1; i < contents.length; i++) {
-      const previous = contents[i - 1]
-      const current = contents[i]
-      assert(current.length >= previous.length, `request ${i} has ${current.length} contents, request ${i - 1} had ${previous.length}`)
-      for (let j = 0; j < previous.length; j++) {
-        assertEquals(current[j], previous[j], `request ${i} changed prior content ${j}`)
+    for (const [chain, indexes] of conversations) {
+      for (const i of indexes) assertEquals(instructions[i], instructions[indexes[0]], `the system instruction changed in request ${i} of ${chain}`)
+      for (let k = 1; k < indexes.length; k++) {
+        const [previous, current] = [contents[indexes[k - 1]], contents[indexes[k]]]
+        assert(current.length >= previous.length, `request ${indexes[k]}: ${current.length} contents, request ${indexes[k - 1]} had ${previous.length}`)
+        for (let j = 0; j < previous.length; j++) assertEquals(current[j], previous[j], `request ${indexes[k]} changed prior content ${j}`)
       }
     }
   },
