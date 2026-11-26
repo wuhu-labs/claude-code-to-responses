@@ -689,7 +689,7 @@ names, and a step that is not agy 1.5.17's tool-call layout are all refused befo
 | `provider_record_foreign` | A reasoning item in the history is the Claude lane's record, or an agy record from another agy version. |
 | `store_mismatch` | The stored tail is not the pending calls the response names, or a call has no step in the store. |
 | `step_layout_unknown` | A step that must be completed is not the tool-call layout agy 1.5.17 writes. |
-| `store_unreadable` | `500`: agy refused the conversation assembled from the records, or its store has another layout. |
+| `store_unreadable` | `500`: agy refused the conversation assembled from the records, the running agy is not the pinned 1.5.17 (a rebuild would assemble or patch a store measured on another version), or a record in the gateway's own store is unusable. Live continuations under `--allow-untested-agy` still work. |
 
 An omitted `tools` on a continuation inherits the chain's set; an explicit different set, a different model or
 different instructions start a new chain (`previous_response_not_found`).

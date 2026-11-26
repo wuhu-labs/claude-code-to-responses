@@ -35,8 +35,8 @@ export type Config = {
 /** What a request asks of agy given where its conversation stops. */
 type Delivery =
   | { kind: 'turn'; text: string }
-  /** Every output of the pending calls is in hand; `messages` is the client's steering text, if any. */
-  | { kind: 'outputs'; outputs: Map<string, string>; messages: string | null }
+  /** Every output of the pending calls is in hand; `messages` are the client's, in order, whatever their role. */
+  | { kind: 'outputs'; outputs: Map<string, string>; messages: Extract<InItem, { kind: 'message' }>[] }
 
 /** The chain's fixed identity, from its head record. */
 interface Identity {
@@ -346,19 +346,18 @@ export class AgyGateway implements ResponsesEndpoint {
         await lane.continue(attempt, results, injection(notices))
         return
       }
-      const prompt = delivery.kind === 'turn' ? delivery.text : (delivery.messages ?? ' ')
+      const prompt = delivery.kind === 'turn' ? delivery.text : userPrompt(delivery.messages)
+      const steps = delivery.kind === 'outputs' ? injection(delivery.messages.filter((m) => m.role !== 'user')) : []
       const running = lane
-      void running.run(attempt, prompt).catch((e) => {
+      void running.run(attempt, prompt, steps).catch((e) => {
         console.error('agy response failed', e)
         running.fail(e)
       })
     } catch (e) {
       fail(e)
     } finally {
-      if (!settled) {
-        // the reservation is the request's until it has stopped touching the store; a response is released by detach
-        if (output.status !== 'in_progress') this.chains.release(reservation)
-      }
+      // the request no longer holds the chain once it is attached to a lane (busy) or has stopped
+      this.chains.release(reservation)
     }
   }
 
@@ -675,6 +674,12 @@ export class AgyGateway implements ResponsesEndpoint {
   }
 }
 
+/** The prompt a rebuilt conversation is reopened with: the client's user messages, or one space when it sent none. */
+function userPrompt(messages: Extract<InItem, { kind: 'message' }>[]): string {
+  const parts = messages.filter((m) => m.role === 'user').map((m) => text(m.parts)).filter((value) => value.trim() !== '')
+  return parts.length ? parts.join('\n\n') : ' '
+}
+
 function capitalize(text: string): string {
   return text.length ? text[0].toUpperCase() + text.slice(1) : text
 }
@@ -713,21 +718,21 @@ function deliveryFor(head: AgyRecord | null, input: InItem[]): Delivery {
     return { kind: 'turn', text: prompt }
   }
   const outputs = new Map<string, string>()
-  const messages: string[] = []
+  const messages: Extract<InItem, { kind: 'message' }>[] = []
   const want = new Set(head.calls.map((call) => call.id))
   input.forEach((it, i) => {
     if (it.kind === 'function_call_output') {
       if (!want.has(it.callId)) throw invalid(`input[${i}].call_id`, `No tool call '${it.callId}' is waiting for output.`, 'unexpected_tool_output')
       if (outputs.has(it.callId)) throw invalid(`input[${i}].call_id`, `Duplicate output for '${it.callId}'.`, 'unexpected_tool_output')
       outputs.set(it.callId, text(it.parts))
-    } else if (it.kind === 'message' && it.role === 'user') {
-      if (it.parts.some((p) => p.type === 'text' && p.text.trim() !== '')) messages.push(text(it.parts))
+    } else if (it.kind === 'message' && (it.role === 'user' || it.role === 'developer' || it.role === 'system')) {
+      if (it.parts.some((p) => p.type === 'text' && p.text.trim() !== '')) messages.push(it)
     } else {
-      throw unsupported(`input[${i}]`, 'A delta accepts tool outputs and user messages.')
+      throw unsupported(`input[${i}]`, 'A delta accepts tool outputs and user, developer or system messages.')
     }
   })
   const missing = head.calls.filter((call) => !outputs.has(call.id)).map((call) => call.id)
   if (missing.length) throw invalid('input', `Missing outputs for tool calls: ${missing.join(', ')}.`, 'missing_tool_output')
-  return { kind: 'outputs', outputs, messages: messages.length ? messages.join('\n\n') : null }
+  return { kind: 'outputs', outputs, messages }
 }
 

@@ -545,6 +545,7 @@ Deno.test('agy: an untested binary stamps its own version and never assembles or
     await assertStopped(pids(await r.evidence()))
     const rebuilt = await gw.post(follow(held.response, outputs(held.response)))
     assertEquals(rebuilt.status, 500)
+    assertEquals((await rebuilt.json()).error.code, 'store_unreadable')
     assertMatch((await rebuilt.json()).error.message, /not the measured 1\.5\.17/)
   } finally {
     await r.dispose()
@@ -585,6 +586,32 @@ Deno.test('agy: pending steps the record does not name are refused before any wr
     assertEquals([refused.status, (await refused.json()).error.code], [400, 'store_mismatch'])
     const after = createHash('sha256').update(await Deno.readFile(db)).digest('hex')
     assertEquals(after, before, 'the refused rebuild wrote the store')
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: a chain head without its trajectory blob is refused before any process starts', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start(['--idle-timeout', '0.2', '--hold-timeout', '0.2'])
+    const response = await gw.create(initial('Remember the marker.'))
+    await assertStopped(pids(await r.evidence()))
+    const processes = (await r.evidence()).filter((e) => e.kind === 'process').length
+    const record = response.response.output.find((item: any) => item.type === 'reasoning' && item.encrypted_content)?.encrypted_content
+    const decoded = await unpackRecord(AGY_RECORD_PREFIX, record) as any
+    assert(decoded.trajectory?.blob, 'the head record has no trajectory blob to drop')
+    const headless = await packRecord(AGY_RECORD_PREFIX, { ...decoded, trajectory: { ...decoded.trajectory, blob: null } })
+    const items = response.response.output.filter((item: any) => !(item.type === 'reasoning' && item.encrypted_content?.startsWith(AGY_RECORD_PREFIX)))
+    const refused = await gw.post({
+      model: MODEL,
+      instructions: INSTRUCTIONS,
+      tools: [tool()],
+      input: [user('Remember the marker.'), ...items, { type: 'reasoning', summary: [], encrypted_content: headless }, user('Again.')],
+    })
+    assertEquals([refused.status, (await refused.json()).error.code], [400, 'provider_record_missing'])
+    assertEquals((await r.evidence()).filter((e) => e.kind === 'process').length, processes)
     await gw.stop()
   } finally {
     await r.dispose()

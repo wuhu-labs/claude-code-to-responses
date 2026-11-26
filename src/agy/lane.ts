@@ -232,13 +232,16 @@ export class Lane {
     throw serverError('upstream_error', 'Could not verify the fenced agent in the agy process log; no prompt was sent.')
   }
 
-  /** One new user turn on a process that sits at a finished turn. */
-  async run(exchange: Exchange, prompt: string) {
+  /**
+   * One new user turn on a process that sits at a finished turn. `steps` are the steering messages the client sent
+   * with the outputs: the invocation hook injects them before the model sees this prompt.
+   */
+  async run(exchange: Exchange, prompt: string, steps: HookStep[] = []) {
     if (this.turn || this.active || !this.transcript) throw new Error('overlapping ACP prompt')
     this.active = exchange
     const cursor = await this.transcript.head()
     this.controller.signal.throwIfAborted()
-    const turn = this.turn = { cursor, invocation: null, fallback: null, queue: [], chunks: false, used: [], boundaries: 0, drainedACP: new Set() }
+    const turn = this.turn = { cursor, invocation: null, fallback: null, queue: [...steps], chunks: false, used: [], boundaries: 0, drainedACP: new Set() }
     const result = await this.proc.request('session/prompt', { sessionId: this.session, prompt: [{ type: 'text', text: prompt }] })
     if (this.turn !== turn) return
     if (this.batch || !this.active) throw serverError('upstream_error', 'agy ended its prompt before issuing every planned tool call.')
