@@ -27,7 +27,7 @@ export interface Head {
 
 export interface HistoryOptions<R extends MatchRecord, S> {
   /** The lane's record carried by an encrypted_content string; null when the string is not this lane's record. */
-  decode(content: string): Promise<R | null>
+  decode(content: string, group: number): Promise<R | null>
   /** The provider session (Claude Code session, agy conversation) the response belongs to; a run never mixes two. */
   session(record: R): string
   /** Whether the record continues the chain this request asks for (same instructions, tools and model). */
@@ -100,7 +100,7 @@ export async function matchHistory<R extends MatchRecord, S>(
     pending.push(group)
     // a client may repeat an item it already sent; one record counted twice is still one record
     const encrypted = [...new Set(group.outputs.filter((i) => i.kind === 'reasoning' && i.encrypted).map((i) => (i as { encrypted: string }).encrypted))]
-    const records = (await Promise.all(encrypted.map((e) => o.decode(e)))).filter((r) => r !== null)
+    const records = (await Promise.all(encrypted.map((e) => o.decode(e, gi)))).filter((r) => r !== null)
     if (records.length === 0) continue
     const record = records[records.length - 1]!
     const covers = pending.flatMap((x) => [...x.inputs, ...x.outputs])

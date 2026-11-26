@@ -70,12 +70,14 @@ export function encode(fields: Field[]): Uint8Array {
   const out: number[] = []
   for (const f of fields) {
     writeVarint(out, f.field * 8 + f.wt)
-    if (f.wt === 0) writeVarint(out, f.value as number)
-    else {
-      const bytes = f.value as Uint8Array
-      writeVarint(out, bytes.length)
-      for (const b of bytes) out.push(b)
+    if (f.wt === 0) {
+      writeVarint(out, f.value as number)
+      continue
     }
+    const bytes = f.value as Uint8Array
+    // only a length-delimited field carries its length; fixed64/fixed32 are their own bytes
+    if (f.wt === 2) writeVarint(out, bytes.length)
+    for (const b of bytes) out.push(b)
   }
   return new Uint8Array(out)
 }

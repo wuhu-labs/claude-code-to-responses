@@ -3,9 +3,8 @@
 // rows assemble is a cache; these records are the state.
 import type { FnTool } from '../api/request.ts'
 import type { CallAliases } from '../call_ids.ts'
-import { checkCallAliases, packRecord, RECORD_PREFIX, RecordError, registerRecordPrefix, RESPONSE_ID, unpackRecord } from '../records.ts'
+import { checkCallAliases, packRecord, RECORD_PREFIX, registerRecordPrefix, RESPONSE_ID, unpackRecord } from '../records.ts'
 import type { StepsRowJson, TrajectoryJson } from './rows.ts'
-import { AGY_VERSION } from './schema.ts'
 
 export const AGY_RECORD_PREFIX = 'agy2r.record.v1.'
 registerRecordPrefix(AGY_RECORD_PREFIX)
@@ -33,6 +32,9 @@ export interface AgyRecord {
   tools?: FnTool[]
   /** agy's conversation id: the store file's name and every step payload's own id. */
   conversation: string
+  /** The chain head: the gemini dir and the working folder the chain ran with (both are in agy's prompt). */
+  gemini?: string
+  workspace?: string
   end: 'turn' | 'calls'
   calls: CallRef[]
   /** The clients' call ids bound to agy's, accumulated over the chain; every pair is one-to-one. */
@@ -56,22 +58,33 @@ export async function encodeAgyRecord(record: AgyRecord): Promise<string> {
   return packRecord(AGY_RECORD_PREFIX, record)
 }
 
-/** The lane's record of an encrypted_content string; null when the string is not this lane's. */
-export async function decodeAgyRecord(content: string): Promise<AgyRecord | null> {
+/** Why a reasoning item is not a usable record of the running lane: malformed, or from another lane or version. */
+export class RecordVerdict extends Error {
+  constructor(readonly kind: 'malformed' | 'foreign', message: string) {
+    super(message)
+  }
+}
+
+/**
+ * The one reader of a provider record, wherever it comes from: null when the content is not a record at all, the
+ * record when it is one of this lane's at the running binary's version, and a RecordVerdict naming why it is not.
+ */
+export async function readAgyRecord(content: string, version: string): Promise<AgyRecord | null> {
+  if (content.startsWith(RECORD_PREFIX)) throw new RecordVerdict('foreign', "the Claude lane's provider record")
   if (!content.startsWith(AGY_RECORD_PREFIX)) return null
-  const record = await unpackRecord(AGY_RECORD_PREFIX, content)
-  checkAgyRecord(record)
-  return record as AgyRecord
+  let record: unknown
+  try {
+    record = await unpackRecord(AGY_RECORD_PREFIX, content)
+  } catch (e) {
+    throw new RecordVerdict('malformed', `not a valid provider record (${(e as Error).message})`)
+  }
+  return checkAgyRecord(record, version)
 }
 
-/** Whether an opaque reasoning content belongs to another lane (its wire carries a different envelope). */
-export function isForeignRecord(content: string): boolean {
-  return content.startsWith(RECORD_PREFIX) || /^agy2r\.record\./.test(content)
-}
-
-function checkAgyRecord(r: unknown): void {
+/** Validates a record against the running binary's version; also the reader of every record the gateway stored. */
+export function checkAgyRecord(r: unknown, version: string): AgyRecord {
   const fail = (why: string) => {
-    throw new RecordError(why)
+    throw new RecordVerdict('malformed', why)
   }
   if (typeof r !== 'object' || r === null) fail('not an object')
   const record = r as Record<string, unknown>
@@ -96,7 +109,10 @@ function checkAgyRecord(r: unknown): void {
   if (record.jsonArgumentDigest !== undefined && (typeof record.jsonArgumentDigest !== 'string' || !HEX64.test(record.jsonArgumentDigest))) {
     fail('bad JSON argument digest')
   }
-  if (record.agy !== AGY_VERSION) fail(`a record from agy ${String(record.agy)}, not ${AGY_VERSION}`)
+  if (typeof record.agy !== 'string' || !/^\d+\.\d+\.\d+/.test(record.agy)) fail('bad agy version')
+  if (record.agy !== version) throw new RecordVerdict('foreign', `a record from agy ${record.agy}, not ${version}`)
+  if (record.gemini !== undefined && (typeof record.gemini !== 'string' || !record.gemini.startsWith('/'))) fail('bad gemini dir')
+  if (record.workspace !== undefined && (typeof record.workspace !== 'string' || !record.workspace.startsWith('/'))) fail('bad workspace')
   if (!Array.isArray(record.steps) || !record.steps.length) fail('bad steps')
   let previous = -1
   for (const step of record.steps as Record<string, unknown>[]) {
@@ -106,7 +122,13 @@ function checkAgyRecord(r: unknown): void {
     if (!Number.isSafeInteger(step.step_type) || !Number.isSafeInteger(step.status)) fail('bad step type or status')
     for (const column of ['metadata', 'error_details', 'permissions', 'task_details', 'render_info', 'step_payload']) {
       const value = step[column]
-      if (value !== null && (typeof value !== 'string' || !BASE64.test(value))) fail(`bad step ${column}`)
+      if (value === null) continue
+      if (typeof value !== 'string' || !BASE64.test(value)) fail(`bad step ${column}`)
+      try {
+        atob(value as string)
+      } catch {
+        fail(`bad step ${column}`)
+      }
     }
   }
   if (record.trajectory !== undefined) {
@@ -117,6 +139,14 @@ function checkAgyRecord(r: unknown): void {
     if (typeof trajectoryId !== 'string' || !CONVERSATION.test(trajectoryId)) fail('bad trajectory id')
     if (typeof cascadeId !== 'string' || !CONVERSATION.test(cascadeId)) fail('bad cascade id')
     const blob = trajectory.blob as Record<string, unknown> | null
-    if (blob !== null && (typeof blob !== 'object' || typeof blob.data !== 'string' || !BASE64.test(blob.data))) fail('bad trajectory blob')
+    if (blob !== null) {
+      if (typeof blob !== 'object' || typeof blob.data !== 'string' || !BASE64.test(blob.data)) fail('bad trajectory blob')
+      try {
+        atob(blob.data as string)
+      } catch {
+        fail('bad trajectory blob')
+      }
+    }
   }
+  return record as unknown as AgyRecord
 }

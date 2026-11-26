@@ -4,11 +4,29 @@ import { ItemDigest, type ProviderRecord } from './records.ts'
 
 export type CallAliases = [string, string][]
 
+/** One client -> provider binding, kept one-to-one both ways. False when the pair contradicts one already bound. */
 function bind(map: Map<string, string>, reverse: Map<string, string>, client: string, provider: string): boolean {
   if (map.has(client)) return map.get(client) === provider
   if (reverse.has(provider)) return false
   map.set(client, provider)
   reverse.set(provider, client)
+  return true
+}
+
+/**
+ * The one writer of call aliases: both lanes' records are written and matched through it, so a response the gateway
+ * emitted always replays its own record. Duplicate pairs are kept once; a contradiction is reported.
+ */
+export function bindCalls(aliases: CallAliases, pairs: [string, string][]): boolean {
+  const map = new Map(aliases)
+  const reverse = new Map(aliases.map(([client, provider]) => [provider, client]))
+  let changed = false
+  for (const [client, provider] of pairs) {
+    if (!bind(map, reverse, client, provider)) return false
+    if (!aliases.some(([c]) => c === client)) changed = true
+  }
+  if (!changed) return true
+  aliases.splice(0, aliases.length, ...[...map.entries()])
   return true
 }
 
@@ -26,9 +44,8 @@ export function matchItems(
 ): CallAliases | null {
   const calls = items.filter((it) => it.kind === 'function_call')
   if (calls.length !== providerCalls.length) return null
+  if (!bindCalls(aliases, calls.map((call, i) => [call.callId, providerCalls[i]] as [string, string]))) return null
   const map = new Map(aliases)
-  const reverse = new Map(aliases.map(([client, provider]) => [provider, client]))
-  for (let i = 0; i < calls.length; i++) if (!bind(map, reverse, calls[i].callId, providerCalls[i])) return null
   if (items.some((it) => it.kind === 'function_call_output' && !map.has(it.callId))) return null
   const next = [...map.entries()]
   const { digest, jsonArgumentDigest } = new ItemDigest(remapItems(items, next)).finish()

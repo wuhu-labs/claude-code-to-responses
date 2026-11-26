@@ -324,7 +324,7 @@ export class Gateway {
       }
       const enc = it.encrypted ?? ''
       if (enc.startsWith(THINKING_PREFIX) && decodeThinking(enc)) continue
-      const r = await clientRecord(enc)
+      const r = await clientRecord(enc, i)
       if (r && chainIds.has(r.id)) continue
       throw invalid(
         `input[${i}]`,
@@ -368,7 +368,7 @@ export class Gateway {
     }
     // the longest run of groups whose records chain onto each other and match the items
     const match = await matchHistory<ProviderRecord, string[]>(groups, req.input, {
-      decode: (content) => clientRecord(content),
+      decode: (content, group) => clientRecord(content, group),
       session: (record) => record.session,
       // Continuation records omit instructions: the chain key already covers them.
       continues: (r) => r.chain === chain.key && (r.instructions === undefined || r.instructions === chain.instructions),
@@ -607,11 +607,13 @@ interface Plan {
 }
 
 /** A provider record from the client's history; a malformed one is the client's error, never silently skipped. */
-async function clientRecord(s: string): Promise<ProviderRecord | null> {
+async function clientRecord(s: string, group: number): Promise<ProviderRecord | null> {
   try {
     return await decodeRecord(s)
   } catch (e) {
-    if (e instanceof RecordError) throw invalid('input', `A provider record in the history is malformed: ${e.message}.`, 'invalid_provider_record')
+    if (e instanceof RecordError) {
+      throw invalid('input', `The provider record of response ${group + 1} in the history is malformed: ${e.message}.`, 'invalid_provider_record')
+    }
     throw e
   }
 }

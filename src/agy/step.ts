@@ -68,8 +68,8 @@ export function storedOutput(output: StepOutput): string {
   return file.length > MAX_STORED_OUTPUT_BYTES ? preview(file, output.outputUrl) : new TextDecoder().decode(file)
 }
 
-/** The tool call a step holds: agy's own call id and the tool name without its MCP prefix. */
-export function callOf(row: StepsRow): { provider: string; tool: string } | null {
+/** The tool call a step holds: agy's own call id, the tool without its MCP prefix, and the step's conversation. */
+export function callOf(row: StepsRow): { provider: string; tool: string; conversation: string } | null {
   if (row.step_type !== 132 || !row.step_payload) return null
   let payload: Field[]
   try {
@@ -77,12 +77,14 @@ export function callOf(row: StepsRow): { provider: string; tool: string } | null
   } catch {
     return null
   }
-  const call = message(message(payload, 5) ?? [], 4)
+  const step5 = message(payload, 5)
+  const call = step5 ? message(step5, 4) : null
   const provider = call ? text(call, 1) : null
   const name = call ? text(call, 2) : null
-  if (!provider || !name || !name.startsWith('mcp_')) return null
+  const conversation = step5 ? text(sub(step5, 20), 4) : null
+  if (!provider || !name || !name.startsWith('mcp_') || !conversation) return null
   const at = name.indexOf('_', 4)
-  return at < 0 ? null : { provider, tool: name.slice(at + 1) }
+  return at < 0 ? null : { provider, tool: name.slice(at + 1), conversation }
 }
 
 /** The moment agy started the step: its execution start, else its enqueue time. */
@@ -124,6 +126,29 @@ export function completeStep(row: StepsRow, output: StepOutput): StepsRow {
   if (!step5) throw new StepLayoutError(`step ${row.idx} has no step metadata`)
   const call = message(step5, 4)
   if (!call) throw new StepLayoutError(`step ${row.idx} names no tool call`)
+  // The step must be exactly the tool-call layout that was measured: a pending step (status 2) carries its tool
+  // identity (133), render metadata (147) and an Executing render block; a queued step (status 1) only its arguments.
+  const identity = message(payload, 133)
+  const renderInfo = message(payload, 147)
+  const existing = sub(payload, 140)
+  const executing = message(sub(existing, 2), 3)
+  if (row.status === 2 && (!identity || !renderInfo || !executing || text(executing, 5) !== 'Executing')) {
+    throw new StepLayoutError(`step ${row.idx} is not the measured pending tool-call layout`)
+  }
+  if (row.status === 1 && (identity || renderInfo)) {
+    throw new StepLayoutError(`step ${row.idx} is not the measured queued tool-call layout`)
+  }
+  // `140` holds the argument pairs (field 1) and, once agy started the call, one render block (field 2); nothing else.
+  let renderBlocks = 0
+  for (const block of existing) {
+    if (block.field === 2 && block.wt === 2) {
+      if (++renderBlocks > 1) throw new StepLayoutError(`step ${row.idx} holds two render blocks`)
+      continue
+    }
+    if (block.field !== 1 || block.wt !== 2) throw new StepLayoutError(`step ${row.idx} holds an unrecognized result block`)
+    const arg = message([block], 1)
+    if (!arg || text(arg, 1) === null || text(arg, 2) === null) throw new StepLayoutError(`step ${row.idx} holds an unrecognized argument`)
+  }
   const step20 = sub(step5, 20)
   const conversation = text(step20, 4)
   const trajectory = text(step20, 1)

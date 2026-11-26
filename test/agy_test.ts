@@ -1,4 +1,5 @@
 import { assert, assertEquals, assertMatch } from '@std/assert'
+import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { lines } from '../src/claude/lines.ts'
 import { packRecord, unpackRecord } from '../src/records.ts'
@@ -421,6 +422,169 @@ Deno.test('agy: a default-agent fallback is refused before any prompt', async ()
     assertEquals(failure.status, 500)
     assertMatch((await failure.json()).error.message, /default agent; no prompt was sent/)
     assertEquals((await r.evidence()).filter((e) => e.kind === 'prompt').length, 0)
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: a full-history release on a live held batch steers it with only the new messages', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start(), ws = new WsClient(new WebSocket(gw.url.replace('http:', 'ws:') + '/v1/responses'))
+    const tools = [tool()]
+    try {
+      const send = (body: any) => ws.send(body)
+      const turn = user('Remember one.')
+      const first = (await send({ model: MODEL, instructions: INSTRUCTIONS, tools, input: [turn] })).response
+      const batch = (await send({ model: MODEL, instructions: INSTRUCTIONS, previous_response_id: first.id, input: [user('batch')] })).response
+      const held = outputs(batch)
+      // the client resends the whole history with the outputs and one new message, on the live held process
+      const full = {
+        model: MODEL,
+        instructions: INSTRUCTIONS,
+        tools,
+        input: [turn, ...first.output, user('batch'), ...batch.output, ...held, user('only this notice')],
+      }
+      const released = await send(full)
+      assertEquals(released.response.x_gateway.path, 'live')
+      assertEquals(JSON.parse(text(released.response)), {
+        results: ['result-0', 'result-1', 'result-2'],
+        messages: [{ userMessage: 'only this notice' }],
+      })
+    } finally {
+      await ws.close()
+    }
+    // the same over SSE
+    const sseTurn = user('Remember two.')
+    const first = await gw.create({ ...initial(''), input: [sseTurn] })
+    const batch = await gw.create(follow(first.response, [user('batch')]))
+    const full = {
+      model: MODEL,
+      instructions: INSTRUCTIONS,
+      tools: [tool()],
+      input: [sseTurn, ...first.response.output, user('batch'), ...batch.response.output, ...outputs(batch.response), user('only this notice')],
+    }
+    const released = await gw.create(full)
+    assertEquals(released.response.x_gateway.path, 'live')
+    assertEquals(JSON.parse(text(released.response)).messages, [{ userMessage: 'only this notice' }])
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: a history rebuild refills the gateway store, and a cached chain prefers the store', async () => {
+  const r = await rig()
+  try {
+    let gw = await r.start()
+    const turn = user('Remember the marker.')
+    const history: any[] = [turn]
+    const first = await gw.create({ ...initial(''), input: [turn] })
+    history.push(...first.response.output)
+    const batch = await gw.create(follow(first.response, [user('batch')]))
+    history.push(user('batch'), ...batch.response.output)
+    const outputsAtHead = outputs(batch.response)
+    // losing the state: the history rebuild must put the whole chain back into the store
+    await gw.stop()
+    await Deno.remove(r.state, { recursive: true })
+    gw = await r.start()
+    const rebuilt = await gw.create({ model: MODEL, instructions: INSTRUCTIONS, tools: [tool()], input: [...history, ...outputsAtHead] })
+    assertEquals([rebuilt.response.x_gateway.path, rebuilt.response.x_gateway.patched], ['history', 3])
+    // a delta naming the rebuilt response works: the chain is in the store again
+    const next = await gw.create(follow(rebuilt.response, [user('After the rebuild.')]))
+    assertEquals(next.response.status, 'completed')
+    assert(['live', 'store'].includes(next.response.x_gateway.path), JSON.stringify(next.response.x_gateway))
+    // and a full-history request at a cached parent takes the store, not the history route
+    await gw.stop()
+    gw = await r.start()
+    const cached = await gw.create({ model: MODEL, instructions: INSTRUCTIONS, tools: [tool()], input: [...history, ...outputsAtHead, user('Again.')] })
+    assertEquals([cached.response.status, cached.response.x_gateway.path], ['completed', 'store'])
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: absent planner falls back to one call per response, without a second ACP prompt', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start()
+    let { response } = await gw.create(initial('missing-planner'))
+    try {
+    for (let i = 0; i < 3; i++) {
+      assertEquals(calls(response).map((c: any) => JSON.parse(c.arguments).index), [i])
+      ;({ response } = await gw.create(follow(response, [result(calls(response)[0], `fallback-${i}`)])))
+    }
+    assertEquals(JSON.parse(text(response)).results, ['fallback-0', 'fallback-1', 'fallback-2'])
+    assertEquals((await r.evidence()).filter((e) => e.kind === 'prompt').length, 1)
+    assertMatch(gw.stderr.join('\n'), /emitting one call/)
+    } catch (e) { console.error('STDERR', gw.stderr.join('\n')); throw e }
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: an untested binary stamps its own version and never assembles or patches the pinned store', async () => {
+  const r = await rig('version')
+  try {
+    const gw = await r.start(['--allow-untested-agy', '--hold-timeout', '0.2'])
+    const first = await gw.create(initial('Remember one.'))
+    assertEquals(first.response.x_gateway.path, 'new')
+    const record = first.response.output.find((item: any) => item.type === 'reasoning' && item.encrypted_content)?.encrypted_content
+    const decoded = await unpackRecord(AGY_RECORD_PREFIX, record) as any
+    assertEquals(decoded.agy, '9.9.9')
+    // a live continuation still works
+    const batch = await gw.create(follow(first.response, [user('batch')]))
+    assertEquals(calls(batch.response).length, 3)
+    const live = await gw.create(follow(batch.response, outputs(batch.response)))
+    assertEquals(live.response.x_gateway.path, 'live')
+    // a rebuild that would assemble the store or write a step is refused before any process
+    const held = await gw.create(follow(live.response, [user('pair')]))
+    await assertStopped(pids(await r.evidence()))
+    const rebuilt = await gw.post(follow(held.response, outputs(held.response)))
+    assertEquals(rebuilt.status, 500)
+    assertMatch((await rebuilt.json()).error.message, /not the measured 1\.5\.17/)
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: a rebuild under other paths continues and says so', async () => {
+  const a = await rig(), b = await rig()
+  try {
+    const first = await a.start()
+    const turn = user('Remember the marker.')
+    const response = await first.create({ ...initial(''), input: [turn] })
+    assertEquals(response.response.x_gateway.paths, undefined)
+    await first.stop()
+    const second = await b.start()
+    const moved = await second.create({ model: MODEL, instructions: INSTRUCTIONS, tools: [tool()], input: [turn, ...response.response.output, user('Again.')] })
+    assertEquals(moved.response.status, 'completed')
+    assertEquals([moved.response.x_gateway.path, moved.response.x_gateway.paths], ['history', 'elsewhere'])
+    await second.stop()
+  } finally {
+    await a.dispose()
+    await b.dispose()
+  }
+})
+
+Deno.test('agy: pending steps the record does not name are refused before any write', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start(['--hold-timeout', '0.2'])
+    const { response } = await gw.create(initial('missing-planner'))
+    // the planner was absent, so the record names one call while agy wrote three pending rows
+    assertEquals(calls(response).length, 1)
+    await assertStopped(pids(await r.evidence()))
+    const conversation = response.x_gateway.conversation
+    const db = `${r.state}/gemini/antigravity-cli/conversations/${conversation}.db`
+    const before = createHash('sha256').update(await Deno.readFile(db)).digest('hex')
+    const refused = await gw.post(follow(response, [result(calls(response)[0], 'one')]))
+    assertEquals([refused.status, (await refused.json()).error.code], [400, 'store_mismatch'])
+    const after = createHash('sha256').update(await Deno.readFile(db)).digest('hex')
+    assertEquals(after, before, 'the refused rebuild wrote the store')
     await gw.stop()
   } finally {
     await r.dispose()

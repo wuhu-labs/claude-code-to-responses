@@ -335,12 +335,20 @@ function planCalls(name: string, count: number): { idx: number; id: string; args
     const args140 = Object.entries({ toolSummary: args.toolSummary, ...Object.fromEntries(Object.entries(args).filter(([k]) => k !== 'toolSummary')) })
       .map(([k, v]) => sub_(1, [str(1, k), str(2, typeof v === 'string' ? v : JSON.stringify(v))]))
     const callField = sub_(4, [str(1, id), str(2, `mcp_responses_${name}`), str(3, JSON.stringify(args))])
+    const pair = [str(1, 'mcp'), str(2, `responses/${name}`)]
+    const identity = [sub_(2, [sub_(1, pair), int(2, 1), str(5, 'mcp'), str(6, `responses/${name}`)])]
+    const renderInfo = [
+      sub_(1, [sub_(21, [sub_(1, pair), str(5, `Run ${name} from MCP server responses`), sub_(6, [int(1, 5)])])]),
+      sub_(2, [str(1, trajectory), int(2, step), sub_(21, [int(1, 1), str(4, '')])]),
+    ]
     const payload = i === 0
       ? [
         int(1, 132),
         int(4, 2),
         sub_(5, step5(step, [callField, sub_(6, stamp()), sub_(7, stamp())])),
-        sub_(140, [...args140, sub_(2, [sub_(3, [str(5, 'Executing')])])]),
+        sub_(133, identity),
+        sub_(147, renderInfo),
+        sub_(140, [...args140, sub_(2, [sub_(3, [str(5, 'Executing'), str(6, 'build'), str(7, 'actions')])])]),
       ]
       : [int(1, 132), int(4, 1), sub_(5, step5(step, [callField])), sub_(140, args140)]
     putRow(step, 132, i === 0 ? 2 : 1, payload)

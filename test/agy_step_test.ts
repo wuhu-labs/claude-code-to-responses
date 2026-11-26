@@ -1,0 +1,145 @@
+// The agy store format's own units: the protobuf tree editor round-trips every wire type agy writes, the step writer
+// accepts exactly the layout that was measured, and a large output's preview is agy's byte rule.
+import { assert, assertEquals, assertMatch, assertThrows } from '@std/assert'
+import { decode, encode, type Field } from '../src/agy/pb.ts'
+import { type StepsRow } from '../src/agy/rows.ts'
+import { completeStep, MAX_STORED_OUTPUT_BYTES, outputFileText, preview, stamp, StepLayoutError, storedOutput, type StepOutput } from '../src/agy/step.ts'
+
+const bytes = (value: string) => new TextEncoder().encode(value)
+const field = (n: number, value: number | Uint8Array | string, wt?: 0 | 1 | 2 | 5): Field => {
+  if (typeof value === 'number') return { field: n, wt: wt ?? 0, value }
+  return { field: n, wt: wt ?? 2, value: typeof value === 'string' ? bytes(value) : value }
+}
+const message = (n: number, fields: Field[]): Field => ({ field: n, wt: 2, value: encode(fields) })
+
+Deno.test('agy pb: decode then encode gives back the same bytes for every wire type agy writes', () => {
+  const fields: Field[] = [
+    field(1, 14),
+    field(2, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]), 1),
+    field(3, new Uint8Array([9, 10, 11, 12]), 5),
+    message(5, [field(1, 132), message(20, [field(1, 'a conversation'), field(4, 'a trajectory')])]),
+    field(35, 'a uuid'),
+    field(38, 3),
+  ]
+  const bytes = encode(fields)
+  const decoded = decode(bytes)
+  assertEquals(encode(decoded).length, bytes.length)
+  assertEquals([...encode(decoded)], [...bytes])
+  // a nested message with a fixed-width field survives the trip too, which a length-prefixed re-encode would not
+  const nested = message(7, [field(1, new Uint8Array([0xde, 0xad, 0xbe, 0xef]), 5), field(2, 1)])
+  const outer = decode(encode([nested]))
+  assertEquals([...encode(outer)], [...encode([nested])])
+})
+
+function row(overrides: Partial<StepsRow> = {}): StepsRow {
+  const conversation = '11111111-2222-4333-8444-555555555555'
+  const trajectory = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+  const step5 = [
+    field(1, 1_700_000_000),
+    field(3, 2),
+    message(4, [field(1, 'call_abc'), field(2, 'mcp_responses_echo'), field(3, '{"value":"ALPHA"}')]),
+    message(20, [field(1, trajectory), field(2, 7), field(3, 2), field(4, conversation)]),
+  ]
+  const payload = [
+    field(1, 132),
+    field(4, 2),
+    message(5, step5),
+    message(133, [message(2, [message(1, [field(1, 'mcp'), field(2, 'responses/echo')]), field(2, 1), field(5, 'mcp'), field(6, 'responses/echo')])]),
+    message(147, [
+      message(1, [message(21, [message(1, [field(1, 'mcp'), field(2, 'responses/echo')]), field(5, 'Run echo from MCP server responses'), message(6, [field(1, 5)])])]),
+      message(2, [field(1, trajectory), field(2, 7), message(21, [field(1, 1), field(4, '')])]),
+    ]),
+    message(140, [
+      message(1, [field(1, 'toolSummary'), field(2, 'Echo call')]),
+      message(1, [field(1, 'value'), field(2, 'ALPHA')]),
+      message(2, [message(3, [field(5, 'Executing'), field(6, 'build'), field(7, 'actions')])]),
+    ]),
+  ]
+  return {
+    idx: 7,
+    step_type: 132,
+    status: 2,
+    has_subtrajectory: 0,
+    metadata: encode(step5),
+    error_details: null,
+    permissions: null,
+    task_details: null,
+    render_info: null,
+    step_payload: encode(payload),
+    step_format: 0,
+    ...overrides,
+  }
+}
+
+const output = (text: string): StepOutput => ({
+  text,
+  created: new Date('2026-11-26T08:00:00Z'),
+  completed: new Date('2026-11-26T08:00:01Z'),
+  outputUrl: 'file:///state/gemini/antigravity-cli/brain/11111111-2222-4333-8444-555555555555/.system_generated/steps/7/output.txt',
+})
+
+Deno.test('agy step: a pending step is completed in agy\'s own shape, and nothing else is accepted', () => {
+  const done = completeStep(row(), output('ECHO ALPHA echoed'))
+  assertEquals(done.status, 3)
+  const payload = decode(done.step_payload!)
+  assertEquals(payload.find((f) => f.field === 4)?.value, 3)
+  const step5 = payload.find((f) => f.field === 5)!.value as Uint8Array
+  assert(decode(step5).some((f) => f.field === 8), 'the completion timestamp is missing')
+  const rendered = decode(payload.find((f) => f.field === 140)!.value as Uint8Array)
+  const render = decode(rendered.find((f) => f.field === 2)!.value as Uint8Array)
+  const stored = new TextDecoder().decode(render.find((f) => f.field === 1)!.value as Uint8Array)
+  assertMatch(stored, /^Created At: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d\nCompleted At: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d\nECHO ALPHA echoed$/)
+  assertEquals(stored, new TextDecoder().decode(outputFileText(output('ECHO ALPHA echoed'))))
+  assertEquals(new TextDecoder().decode(render.find((f) => f.field === 7)!.value as Uint8Array), output('').outputUrl)
+  const inner = decode(render.find((f) => f.field === 3)!.value as Uint8Array)
+  assertEquals(new TextDecoder().decode(inner.find((f) => f.field === 5)!.value as Uint8Array), 'Executed')
+  // an unrecognized block in the result, a missing tool identity, a missing render block, or a finished row: refused
+  const payloadOf = (r: StepsRow) => decode(r.step_payload!)
+  const withExtra = row()
+  const extraPayload = payloadOf(withExtra)
+  const result = decode(extraPayload.find((f) => f.field === 140)!.value as Uint8Array)
+  result.push(field(3, 'unexpected'))
+  extraPayload.find((f) => f.field === 140)!.value = encode(result)
+  withExtra.step_payload = encode(extraPayload)
+  assertThrows(() => completeStep(withExtra, output('x')), StepLayoutError, 'unrecognized result block')
+  const noIdentity = row()
+  const noIdentityPayload = payloadOf(noIdentity).filter((f) => f.field !== 133)
+  noIdentity.step_payload = encode(noIdentityPayload)
+  assertThrows(() => completeStep(noIdentity, output('x')), StepLayoutError, 'pending tool-call layout')
+  assertThrows(() => completeStep(row({ status: 3 }), output('x')), StepLayoutError, 'not a pending tool call')
+})
+
+Deno.test('agy step: a large output is stored as agy\'s preview over the output file\'s bytes', () => {
+  const big = `BIG ${'x'.repeat(30_000)} TAIL`
+  const written = output(big)
+  const file = outputFileText(written)
+  assertEquals(new TextDecoder().decode(file).startsWith('Created At: '), true)
+  const stored = storedOutput(written)
+  assert(stored.startsWith("The tool's output was truncated due to being too long."))
+  assert(stored.endsWith('TAIL'))
+  const bytes = new TextEncoder().encode(stored).length
+  assert(bytes <= 10_240, `preview is ${bytes} bytes`)
+  assert(bytes >= 10_238, `preview is only ${bytes} bytes`)
+  // agy stores the output whole at exactly the cap and previews one byte over it
+  const header = new TextEncoder().encode(`Created At: ${stamp(written.created)}\nCompleted At: ${stamp(written.completed)}\n`).length
+  const whole = output('y'.repeat(MAX_STORED_OUTPUT_BYTES - header))
+  assertEquals(outputFileText(whole).length, MAX_STORED_OUTPUT_BYTES)
+  assertEquals(storedOutput(whole), new TextDecoder().decode(outputFileText(whole)))
+  const over = output('y'.repeat(MAX_STORED_OUTPUT_BYTES - header + 1))
+  assert(storedOutput(over).startsWith("The tool's output was truncated due to being too long."))
+})
+
+Deno.test('agy step: the middle line names what is missing, counted from the previewed text', () => {
+  const full = new TextEncoder().encode('a'.repeat(20_000))
+  const shown = preview(full, 'file:///tmp/output.txt')
+  const match = /<truncated (\d+) of (\d+) bytes from the middle of the output>/.exec(shown)
+  assert(match, shown.slice(0, 200))
+  assertEquals(Number(match![2]), 20_000)
+  // the head is everything between the notice and the middle line; the tail is as long as it
+  const notice = "The tool's output was truncated due to being too long. You can find the full output in a file at file:///tmp/output.txt.\n\nHere is a preview with the middle of the output truncated:\n"
+  assertEquals(shown.startsWith(notice), true)
+  const head = shown.slice(notice.length, shown.indexOf('\n<truncated'))
+  const headBytes = new TextEncoder().encode(head).length
+  assertEquals(Number(match![1]), 20_000 - 2 * headBytes)
+  assertEquals(new TextEncoder().encode(shown).length <= 10_240, true)
+})
