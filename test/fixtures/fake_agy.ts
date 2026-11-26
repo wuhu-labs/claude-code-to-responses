@@ -30,9 +30,10 @@ const config = JSON.parse(await Deno.readTextFile(`${gemini}/config/mcp_config.j
 const server = config.mcpServers.responses
 if (Object.keys(config.mcpServers).length !== 1 || server.timeoutSeconds !== -1) throw new Error('wrong MCP configuration')
 const ag = await Deno.readTextFile(`${cwd}/.agents/agents/${agent}/agent.md`)
-if (!ag.includes(`name: ${agent}\n`) || !ag.includes('tools: []\nmcpServers:\n  - name: responses\ninheritMcp: false\ninheritCustomizations: true')) {
+if (!ag.includes(`name: ${agent}\n`) || !ag.includes('tools: [view_file]\nmcpServers:\n  - name: responses\ninheritMcp: false\ninheritCustomizations: true')) {
   throw new Error('agent not fenced')
 }
+if (!ag.includes('[Resource offloaded to file://')) throw new Error('agent carries no image guidance')
 const hooks = JSON.parse(await Deno.readTextFile(`${cwd}/.agents/hooks.json`))
 const hook = Object.values(hooks)[0] as { PreInvocation: { command: string }[] }
 const logDir = `${app}/log`, conversations = `${app}/conversations`
@@ -119,6 +120,7 @@ const second = () => Math.floor(Date.now() / 1000)
 const stamp = (): Field[] => [{ field: 1, wt: 0, value: BigInt(second()) }, { field: 2, wt: 0, value: 1_000_000n }]
 const int = (field: number, value: number): Field => ({ field, wt: 0, value: BigInt(value) })
 const str = (field: number, value: string): Field => ({ field, wt: 2, value: new TextEncoder().encode(value) })
+const bytes_ = (field: number, value: Uint8Array): Field => ({ field, wt: 2, value })
 const sub_ = (field: number, tree: Field[]): Field => ({ field, wt: 2, value: encode(tree) })
 
 /** The step metadata (`5`) every step carries: when it was enqueued, its position in the conversation. */
@@ -279,6 +281,43 @@ function completeNatively(idx: number, outputText: string) {
   flush()
 }
 
+/** agy's own `read_file` step: a built-in call agy answers itself, whose payload keeps the file's bytes. */
+function readFileStep(image: { mimeType: string; data: string }, path: string) {
+  const idx = step++
+  const call = sub_(4, [str(1, `call_read_${idx}`), str(2, 'read_file'), str(3, JSON.stringify({ Path: path }))])
+  const bytes = Uint8Array.from(atob(image.data), (c) => c.charCodeAt(0))
+  putRow(idx, 132, 3, [
+    int(1, 132),
+    int(4, 3),
+    sub_(5, step5(idx, [call])),
+    sub_(140, [
+      sub_(2, [
+        str(1, `Created At: 2026-01-01T00:00:00+00:00\nCompleted At: 2026-01-01T00:00:00+00:00\nShowing binary file of type ${image.mimeType}`),
+        sub_(4, [str(1, image.mimeType), bytes_(2, bytes)]),
+        sub_(3, [str(5, 'Analyzed')]),
+      ]),
+    ]),
+  ])
+  flush()
+  appendTranscript({ step_index: idx, type: 'GENERIC', output: `Showing binary file of type ${image.mimeType}` })
+  planner(step, 'Looking at the image.', '', null)
+}
+
+/** A tool result agy offloads: the image goes to `media_<n>.<ext>` and the output text names it. */
+function completeWithImages(idx: number, outputText: string, images: { mimeType: string; data: string }[]): string {
+  const dir = `${app}/brain/${session}/.system_generated/steps/${idx}`
+  Deno.mkdirSync(dir, { recursive: true })
+  const pointers = images.map((image, n) => {
+    const file = `${dir}/media_${n}.${image.mimeType === 'image/jpeg' ? 'jpg' : 'png'}`
+    Deno.writeFileSync(file, Uint8Array.from(atob(image.data), (c) => c.charCodeAt(0)))
+    return `[Resource offloaded to file://${file}]`
+  })
+  const text = [outputText, ...pointers].filter(Boolean).join('\n')
+  completeNatively(idx, text)
+  readFileStep(images[0], `${dir}/media_0.${images[0].mimeType === 'image/jpeg' ? 'jpg' : 'png'}`)
+  return text
+}
+
 function iso(): string {
   const date = new Date()
   const pad = (n: number) => String(n).padStart(2, '0')
@@ -396,13 +435,17 @@ async function issue(planned: { idx: number; id: string; args: Record<string, un
     arguments: given,
     _meta: { 'antigravity.google/conversation_id': session, progressToken: `${crypto.randomUUID()}:${idx}` },
   })
-  const output = result.result?.content?.[0]?.text
-  if (typeof output !== 'string') throw new Error('MCP result was not served')
-  record('output', { index: i, output })
+  const content = Array.isArray(result.result?.content) ? result.result.content : []
+  const texts = content.filter((item: any) => item?.type === 'text' && typeof item.text === 'string').map((item: any) => item.text as string)
+  const images = content.filter((item: any) => item?.type === 'image' && typeof item.data === 'string')
+    .map((item: any) => ({ mimeType: typeof item.mimeType === 'string' ? item.mimeType : 'image/png', data: item.data as string }))
+  if (!texts.length && !images.length) throw new Error('MCP result was not served')
+  const output = texts.join('\n')
+  record('output', { index: i, output, images: images.length })
   appendTranscript({ step_index: idx, type: 'GENERIC', output })
-  completeNatively(idx, output)
+  const seen = images.length ? completeWithImages(idx, output, images) : (completeNatively(idx, output), output)
   await update({ sessionUpdate: 'tool_call_update', toolCallId: id, status: 'completed' })
-  return output
+  return seen
 }
 
 /** A planner line: the transcript row the gateway reads, and the store row agy writes with it. */
@@ -429,6 +472,16 @@ function planner(index: number, content: string, thinking: string, calls: { name
   flush()
 }
 
+function fieldBytes(fields: Field[], field: number): Uint8Array | null {
+  for (const f of fields) if (f.field === field && f.wt === 2) return f.value as Uint8Array
+  return null
+}
+
+/** What the model sees of an image step: the byte digest, so a rebuild can be compared without the bytes. */
+function imageMark(bytes: Uint8Array | null, mime: string | null): string {
+  return bytes ? ` [${mime ?? 'image'}:${createHash('sha256').update(bytes).digest('hex').slice(0, 16)}]` : ''
+}
+
 /** What agy renders upstream, in step order: user turns, planner text, resume notices and tool results. */
 function visibleRows(): string[] {
   return [...rows.values()].sort((a, b) => a.idx - b.idx).map((row) => {
@@ -437,10 +490,15 @@ function visibleRows(): string[] {
     if (row.step_type === 132) {
       const render = message(sub(payload, 140), 2)
       const output = render ? text(render, 1) : null
+      const file = render ? message(render, 4) : null
       shown = output === null ? '' : output.replace(/^Created At: [^\n]*\nCompleted At: [^\n]*\n/, '')
+      shown += imageMark(file ? fieldBytes(file, 2) : null, file ? text(file, 1) : null)
     } else if (row.step_type === 14) {
-      // a user turn keeps its text in its step metadata (5.19.2); the planner line keeps it in the payload (19.2)
-      shown = text(sub(message(payload, 5) ?? [], 19), 2) ?? ''
+      // a user turn keeps its text in its step metadata (5.19.2); its image is 5.19.9.2
+      const meta = sub(message(payload, 5) ?? [], 19)
+      const upload = message(meta, 9) ?? []
+      shown = text(meta, 2) ?? ''
+      shown += imageMark(fieldBytes(upload, 2), text(message(upload, 1) ?? [], 13))
     } else {
       shown = text(sub(payload, 19), 2) ?? ''
     }
@@ -453,11 +511,16 @@ let recovered: string[] = []
 /** What the model sees for the inference about to start: the whole transcript, in store order. */
 const inference = () => record('inference', { session, visible: visibleRows(), steps: rows.size })
 
-async function prompt(id: unknown, promptText: string) {
+async function prompt(id: unknown, promptText: string, images: { mimeType: string; data: string }[] = []) {
   if (prompting) throw new Error('overlapping ACP prompts')
   prompting = true
-  record('prompt', { session, text: promptText, context: contextDigest(), visible: visibleRows(), steps: rows.size })
-  putRow(step, 14, 3, [int(1, 14), int(4, 3), sub_(5, step5(step, [sub_(19, [str(2, promptText)])]))])
+  const imageDigests = images.map((image) => createHash('sha256').update(Uint8Array.from(atob(image.data), (c) => c.charCodeAt(0))).digest('hex').slice(0, 16))
+  record('prompt', { session, text: promptText, images: imageDigests, context: contextDigest(), visible: visibleRows(), steps: rows.size })
+  const content = [str(2, promptText)]
+  for (const image of images) {
+    content.push(sub_(9, [sub_(1, [str(13, image.mimeType)]), bytes_(2, Uint8Array.from(atob(image.data), (c) => c.charCodeAt(0)))]))
+  }
+  putRow(step, 14, 3, [int(1, 14), int(4, 3), sub_(5, step5(step, [sub_(19, content)]))])
   appendTranscript({ step_index: step, type: 'USER_INPUT', content: promptText })
   step++
   flush()
@@ -472,10 +535,11 @@ async function prompt(id: unknown, promptText: string) {
     answer = JSON.stringify({ results: recovered, messages: promptText.trim() ? [{ userMessage: promptText }] : [] })
     recovered = []
   }
-  if (promptText === 'batch' || promptText === 'missing-planner' || promptText === 'pair') {
+  const plan = promptText === 'batch' || promptText === 'missing-planner' || promptText === 'pair' || promptText === 'image'
+  if (plan) {
     if (!tools.length) throw new Error('no fake tools')
     const name = tools[0]
-    const count = promptText === 'pair' ? 2 : 3
+    const count = promptText === 'pair' ? 2 : promptText === 'image' ? 1 : 3
     if (promptText !== 'missing-planner') planner(step, 'Planning.', 'Thinking.', Array.from({ length: count }, (_, i) => ({ name, i })))
     else step++
     await chunk('agent_thought_chunk', 'Think')
@@ -490,7 +554,7 @@ async function prompt(id: unknown, promptText: string) {
     answer = JSON.stringify({ results, messages })
   }
   planner(step, answer, '', null)
-  await chunk('agent_message_chunk', promptText === 'batch' || promptText === 'missing-planner' || promptText === 'pair' ? `\n\n${answer}` : answer)
+  await chunk('agent_message_chunk', plan ? `\n\n${answer}` : answer)
   prompting = false
   await reply(id, {
     stopReason: promptText === 'output-limit' ? 'max_tokens' : 'end_turn',
@@ -565,13 +629,18 @@ for await (const line of lines(Deno.stdin.readable)) {
       record('config', { model: p.value })
       await reply(msg.id, {})
       break
-    case 'session/prompt':
-      if (p.sessionId !== session || p.prompt.length !== 1 || p.prompt[0].type !== 'text') throw new Error('wrong prompt shape')
-      void prompt(msg.id, p.prompt[0].text).catch((e) => {
+    case 'session/prompt': {
+      if (p.sessionId !== session || !Array.isArray(p.prompt) || !p.prompt.length) throw new Error('wrong prompt shape')
+      const texts = p.prompt.filter((block: any) => block?.type === 'text')
+      const images = p.prompt.filter((block: any) => block?.type === 'image')
+      const other = p.prompt.filter((block: any) => block?.type !== 'text' && block?.type !== 'image')
+      if (texts.length > 1 || other.length || !texts.length) throw new Error('wrong prompt shape')
+      void prompt(msg.id, texts[0].text, images.map((block: any) => ({ mimeType: block.mimeType, data: block.data }))).catch((e) => {
         record('error', { message: String(e) })
         Deno.exit(1)
       })
       break
+    }
     default:
       permissions.get(msg.id)?.resolve(msg.result)
   }

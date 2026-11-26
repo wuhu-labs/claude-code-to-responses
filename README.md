@@ -684,10 +684,31 @@ transport, any order).
   `output.txt`), so the upstream tool response is the one a native call would have produced. `preview()` in
   `src/agy/step.ts` is the one place.
 
-An image anywhere in the input is `400 unsupported` (until images have their own issue). An absent or mismatched
-planner line still falls back to one call per response with a diagnostic; usage is absent where it cannot be
-attributed. `x_gateway` reports `path` (`new`, `live`, `store`, `history`), the chain, the conversation, how many
-records a rebuild used and how many steps it completed.
+**Images.** A user message's image reaches agy as an ACP image block with exactly the bytes the client sent; the
+gateway never re-encodes or resizes. agy re-encodes once at ingestion and keeps that form in its store, and the bytes
+it puts upstream are the same on the next turn, after a resume and after a rebuild from records — measured for PNG
+and JPEG, large images included (a 4000×3000 image is downsized to 2000×1500 deterministically). GIF and WebP are
+refused with `400 unsupported` before agy sees them. The fenced agent declares agy's one built-in, `read_file`
+(`view_file`), and the gateway appends fixed text to its instructions: a tool's image is saved to a file that the
+tool output names in a line `[Resource offloaded to file://…]`, to open exactly that path with `read_file`, which is
+for those files only. A `function_call_output` that carries images is returned to agy as an MCP result with text and
+image items, unchanged: a live held call gets them as they came, and a rebuild writes each the way agy does —
+`media_<n>.<ext>` next to the step's `output.txt`, with the same pointer line in the step's text — so the upstream
+tool response is the native one. agy answers `read_file` itself, inside the same response: the call is not in the
+Responses output, its step rides in the record, and the response's text and usage cover every inference of the turn.
+Any other built-in, or a `read_file` outside the chain's working and state folders, raises a permission request the
+gateway refuses, as it refuses every request that is not for one of our tools.
+
+**Images in records.** A record never repeats image bytes the client's history already holds: each such run in a
+step row is left out and named by its sha256 (`crops`), and a rebuild puts it back from the request's items; the
+row's digest as agy wrote it is kept (`hashes`), so no later response re-records the row. Bytes agy produced itself —
+a downsized copy it stores and sends, or a `read_file` of a large image — match no client image and ride in the
+record. A rebuild that cannot find a cropped digest in the request answers `previous_response_not_found` (a delta;
+resend the full history) or `provider_record_missing` (a full create), never an incomplete conversation.
+
+An absent or mismatched planner line still falls back to one call per response with a diagnostic; usage is absent
+where it cannot be attributed. `x_gateway` reports `path` (`new`, `live`, `store`, `history`), the chain, the
+conversation, how many records a rebuild used and how many steps it completed.
 
 **Marked cleanly.** History is never rendered as text. A full create whose history carries items no record covers,
 a record from the other lane or from another agy version, a stored tail that is not the pending calls its record
@@ -717,7 +738,7 @@ stream-json restarting with a replayed call, unlike ACP.
 
 | Pin or observed behavior | Evidence |
 |---|---|
-| `agy acp --stdio --gemini-dir <state>/gemini --agent <name>`; `AGY_CLI_DISABLE_AUTO_UPDATE=true`. Fenced agent: `tools: []`, list-of-objects `mcpServers`, `inheritMcp: false`, `inheritCustomizations: true`. Agent body is the client's instructions. | ACP probe §0/A and housekeeping. A failed agent can silently fall back; the gateway reads its own ACP log for the startup/session banners and rejects the fallback warning **before sending a prompt**. The normal and fallback logs were separately inspected. |
+| `agy acp --stdio --gemini-dir <state>/gemini --agent <name>`; `AGY_CLI_DISABLE_AUTO_UPDATE=true`. Fenced agent: `tools: [view_file]` (agy's one built-in, `read_file`), list-of-objects `mcpServers`, `inheritMcp: false`, `inheritCustomizations: true`. Agent body is the client's instructions plus the gateway's fixed image-offloading lines. | ACP probe §0/A and housekeeping; the image and `read_file` measurements (a tool's image is saved to `steps/<idx>/media_<n>.<ext>` and named by a pointer line; agy re-encodes once at ingestion; PNG and JPEG bytes upstream are stable on the next turn, after a resume and from rows). A failed agent can silently fall back; the gateway reads its own ACP log for the startup/session banners and rejects the fallback warning **before sending a prompt**. |
 | A single stdio `mcpServers` entry in `<gemini-dir>/config/mcp_config.json`, with `timeoutSeconds: -1`. agy starts the gateway executable in shim mode, with the lane token and loopback origin inherited from agy. Declarations carry `_meta["antigravity/alwaysLoad"] = true`. | §G/H and MCP rig. A session/new server timed out at 180 s; the config-file server held at least 400 s. Stdio inherits env; HTTP tools were lazy. |
 | Permission decisions use the ACP **name** and exact declared `mcp_responses_` tool, never the title. Other permission requests are denied. | §C and `err4` trace: a native shell title contains the command line, and denying a call ends the turn. |
 | `PLANNER_RESPONSE` is visible before the hold; `transcript_full.jsonl` has real JSON values; `transcript.jsonl` stringifies each value. `toolSummary` is agy's added field. ACP supplies the live first-call id and distinct text/thought chunks. | §B/H3 and raw `shape1` trace; 70/70 calls saw the line at first read, and all 30 measured batches issued in listed order. |
@@ -732,7 +753,7 @@ stream-json restarting with a replayed call, unlike ACP.
 - The real Mac trial confirmed the fence, 52 planner lines for 52 responses, long holds, steering, resume, eviction, concurrent conversations and usage on 1.5.17. Codex 0.153 completed a full-history tool conversation in that trial with function tools and neutral trial instructions; its stock identity prompt was not sent to agy. The automated suite uses `test/fixtures/fake_agy.ts`, not the real binary.
 - The pinned layout is measured on 1.5.17 only: the DDL, the step field numbers and the preview rule are constants of that version, and another version's store is refused rather than patched. Startup rewrites the agent file and checks the current process's own log for default-agent fallback.
 - The chain's gemini dir and workspace are recorded on its first response only (every later response inherits them), so the `paths: elsewhere` mark is decided from that record. A transcript whose first response was dropped from the client's history shows no mark — the rebuild still stops at the usable head, which is the one record that carries them.
-- The model cannot read `output.txt` with the fenced tool set: asked for the middle of a 300 KB result it tried `list_resources`/`read_resource` and reported that it only had the preview.
+- `read_file` reaches every file in the chain's working folder and its conversation's state folder — `brain/` artifacts and `output.txt` included — and raises a permission request anywhere else, which the gateway refuses. The gateway's fixed agent text asks it to open only the paths of offloaded images; the reach is agy's, not the gateway's.
 
 ## Tests
 
@@ -748,7 +769,7 @@ The probes use the same setting. The binary must still be 2.1.322. Gateway tests
 working folders under `/tmp/cc2r-test`. Each probe owns a unique `/tmp/cc2r-probe-*` root for its configuration, logs
 and working folders; cleanup removes only that root. Tests use ports 18300-18399 and fail if any Claude Code process outlives them.
 
-`test/agy_test.ts` runs the agy lane against `test/fixtures/fake_agy.ts`, a strict ACP double that keeps a **real SQLite store** in agy 1.5.17's layout and recreates the planner transcript on resume. One conversation runs live and again with an eviction, a gateway restart that keeps the store and a restart that loses the whole state folder, each of the four over SSE and over WebSocket: every inference is checked to extend the previous one's transcript prefix, with one system part (workspace, instructions, tool set) per conversation. A second create on a chain in progress is `409 conversation_busy`; naming an earlier response rebuilds at it while a later process is live. Every prompt's evidence carries what agy would render upstream, and the last turn's rows must be the live run's, apart from the resume notices. The same suite covers a held batch released by a live process, a restart during a hold (the gateway's step write, checked by the double), the preview for a 30 KB output, the typed refusals above and the shared 400s. `deno task probe:agy` is the per-release run against the real binary and its `--cloud_code_endpoint` capture: one conversation per transport (SSE, then a persistent WebSocket), each a turn, a held batch released from a rebuilt store, a restart and a rebuild with the state folder gone, asserting one system instruction, one tool set and a growing transcript prefix per conversation.
+`test/agy_test.ts` runs the agy lane against `test/fixtures/fake_agy.ts`, a strict ACP double that keeps a **real SQLite store** in agy 1.5.17's layout and recreates the planner transcript on resume. One conversation runs live and again with an eviction, a gateway restart that keeps the store and a restart that loses the whole state folder, each of the four over SSE and over WebSocket: every inference is checked to extend the previous one's transcript prefix, with one system part (workspace, instructions, tool set) per conversation. A second create on a chain in progress is `409 conversation_busy`; naming an earlier response rebuilds at it while a later process is live. Every prompt's evidence carries what agy would render upstream, and the last turn's rows must be the live run's, apart from the resume notices. The same suite covers a held batch released by a live process, a restart during a hold (the gateway's step write, checked by the double), the preview for a 30 KB output, the typed refusals above and the shared 400s. Images: a user image reaches agy byte for byte and is rebuilt from the client's items after the state is lost, a tool image is offloaded by agy and read with `read_file` inside one response (the record keeps the step and leaves out the client's bytes), a held call's image output is written as agy writes it (media file and pointer line), and GIF/WebP are refused before a process starts. `deno task probe:agy` is the per-release run against the real binary and its `--cloud_code_endpoint` capture: one conversation per transport (SSE, then a persistent WebSocket), each a turn, a held batch released from a rebuilt store, a restart and a rebuild with the state folder gone, asserting one system instruction, one tool set and a growing transcript prefix per conversation.
 
 The byte assertions (`test/core_test.ts`, `test/hold_test.ts`, `test/matrix_test.ts`) run over both HTTP/SSE and
 persistent WebSockets: one conversation runs twice,

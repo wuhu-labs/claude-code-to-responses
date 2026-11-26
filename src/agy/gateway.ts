@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from 'node:util'
-import { dirname } from 'node:path'
+import { Buffer } from 'node:buffer'
+import { dirname, join } from 'node:path'
 import type { FnTool, InItem, NormRequest, Part } from '../api/request.ts'
 import { type EventSink, GatedSink, newId, SseSink } from '../api/stream.ts'
 import { Chains, type Reservation } from '../chains.ts'
@@ -15,10 +16,11 @@ import { type Call, Output } from './output.ts'
 import { AGY_RECORD_FAMILY, type AgyRecord, type CallRef, checkAgyRecord, encodeAgyRecord, readAgyRecord, RecordVerdict } from './record.ts'
 import { stepsHash, stepsRowJson, stepsRowFromJson, type StepsRow, trajectoryFromJson, trajectoryJson } from './rows.ts'
 import { AGY_VERSION } from './schema.ts'
-import { callOf, completeStep, outputFileText, stepStart, type StepOutput } from './step.ts'
+import { callOf, completeStep, mediaExtension, outputFileText, stepStart, type StepImage, type StepOutput } from './step.ts'
+import { clientImages, cropStepImages, restoreStepImages, type StepCrop } from './images.ts'
 import { put, Store, StoreError } from './store.ts'
 import type { Planner, Tokens } from './transcript.ts'
-import { BRIDGE_PATH, MCP_NAME, object } from './wire.ts'
+import { BRIDGE_PATH, MCP_NAME, object, toolResultOf, type ToolResult } from './wire.ts'
 
 const checkedVersions = new Set([AGY_VERSION])
 export type Config = {
@@ -34,9 +36,9 @@ export type Config = {
 
 /** What a request asks of agy given where its conversation stops. */
 type Delivery =
-  | { kind: 'turn'; text: string }
+  | { kind: 'turn'; parts: Part[] }
   /** Every output of the pending calls is in hand; `messages` are the client's, in order, whatever their role. */
-  | { kind: 'outputs'; outputs: Map<string, string>; messages: Extract<InItem, { kind: 'message' }>[] }
+  | { kind: 'outputs'; outputs: Map<string, Part[]>; messages: Extract<InItem, { kind: 'message' }>[] }
 
 /** The chain's fixed identity, from its head record. */
 interface Identity {
@@ -221,6 +223,9 @@ export class AgyGateway implements ResponsesEndpoint {
     let cached = prev !== null
     let identity: Identity | null = null
     let complete = true
+    // The image bytes this request carries: a record leaves out the ones the client's history holds, and a rebuild
+    // puts them back from here.
+    const images = clientImages(req.input)
     if (prev) {
       const walked = this.chainUpTo(prev)
       chainRecords = walked.records
@@ -248,7 +253,7 @@ export class AgyGateway implements ResponsesEndpoint {
       }
       // The supplied transcript is validated first and in full: a defective client record — a head without its
       // trajectory blob, a tail that is not the pending calls — is refused even when the cache holds a good copy.
-      this.planRebuild(match.records, match.head, deliveryFor(match.head, match.tail))
+      this.planRebuild(match.records, match.head, deliveryFor(match.head, match.tail), images, previous)
       // The supplied transcript is validated first (matchRecords read every record through the validator) and stays
       // the state: a defective client record is never rescued by a cache hit. The cache's copies are read tolerantly
       // — absent, torn or unusable is a miss — and only when every record has a valid copy do those copies serve the
@@ -278,6 +283,9 @@ export class AgyGateway implements ResponsesEndpoint {
     const tools = identity?.tools ?? req.tools
     const model = identity?.model ?? req.model
     const delivery = deliveryFor(head, input)
+    // A message that carries an image cannot ride the steering hook (it is text only): such a request rebuilds the
+    // conversation and prompts with the messages instead, so the image reaches agy as its own ACP image block.
+    const imagesWithOutputs = delivery.kind === 'outputs' && delivery.messages.some((m) => m.parts.some((p) => p.type === 'image'))
     const reservation: Reservation = { chain: null }
     const output = new Output({ ...req, instructions, tools, model }, sink)
     let lane: Lane | undefined
@@ -323,7 +331,7 @@ export class AgyGateway implements ResponsesEndpoint {
         lane = this.launch(chain, model, instructions, tools)
         await lane.start(null)
         path = 'new'
-      } else if (atHead && (delivery.kind === 'turn' || live!.holding)) {
+      } else if (atHead && (delivery.kind === 'turn' || (live!.holding && !imagesWithOutputs))) {
         lane = live!
         lane.detach()
         lane.head = head.id
@@ -338,7 +346,7 @@ export class AgyGateway implements ResponsesEndpoint {
         if (abandoned()) return
         moved = this.pathsMoved(chain, chainRecords)
         if (moved) console.error(`paths_moved: chain ${chain} was recorded under another state folder; its prompt differs (one cold cache miss)`)
-        const rebuilt = this.laneFromRecords(chain, identity!, chainRecords, head, delivery)
+        const rebuilt = this.laneFromRecords(chain, identity!, chainRecords, head, delivery, images, previous)
         lane = rebuilt.lane
         patched = rebuilt.patched
         if (abandoned()) {
@@ -378,16 +386,16 @@ export class AgyGateway implements ResponsesEndpoint {
         // only what is new since the matched parent steers the live process
         const notices = input.filter((it) => it.kind === 'message') as Extract<InItem, { kind: 'message' }>[]
         // The inputs are canonicalised to agy's call ids; the live process's calls are the client's.
-        const results = new Map<string, string>()
+        const results = new Map<string, ToolResult>()
         for (const [client, provider] of head?.callAliases ?? []) {
           const value = delivery.outputs.get(provider)
-          if (value !== undefined) results.set(client, value)
+          if (value !== undefined) results.set(client, toolResultOf(value))
         }
-        for (const [id, value] of delivery.outputs) if (!results.has(id)) results.set(id, value)
+        for (const [id, value] of delivery.outputs) if (!results.has(id)) results.set(id, toolResultOf(value))
         await lane.continue(attempt, results, injection(notices))
         return
       }
-      const prompt = delivery.kind === 'turn' ? delivery.text : userPrompt(delivery.messages)
+      const prompt = delivery.kind === 'turn' ? delivery.parts : userPrompt(delivery.messages)
       const steps = delivery.kind === 'outputs' ? injection(delivery.messages.filter((m) => m.role !== 'user')) : []
       const running = lane
       void running.run(attempt, prompt, steps).catch((e) => {
@@ -534,13 +542,31 @@ export class AgyGateway implements ResponsesEndpoint {
    * What a rebuild of this chain would write, and every check that must pass before it does: the chain's trajectory,
    * the terminal slice of pending calls, and the step layout of each output. Pure — it plans, it does not touch disk.
    */
-  private planRebuild(chainRecords: AgyRecord[], head: AgyRecord, delivery: Delivery): { conversation: string; steps: StepsRow[]; files: { path: string; content: Uint8Array }[] } {
+  private planRebuild(
+    chainRecords: AgyRecord[],
+    head: AgyRecord,
+    delivery: Delivery,
+    images: Map<string, Uint8Array>,
+    previous: string | null,
+  ): { conversation: string; steps: StepsRow[]; files: { path: string; content: Uint8Array }[]; patched: number } {
     if (this.version !== AGY_VERSION) {
       throw serverError('store_unreadable', `agy ${this.version} is not the measured ${AGY_VERSION}: its store is never assembled or patched.`)
     }
     const conversation = head.conversation
     const rows = new Map<number, StepsRow>()
-    for (const record of chainRecords) for (const row of record.steps) rows.set(row.idx, stepsRowFromJson(row))
+    for (const record of chainRecords) {
+      for (const row of record.steps) {
+        const crops = (record.crops ?? []).filter((crop) => crop.idx === row.idx)
+        const restored = restoreStepImages(row, crops, images)
+        if (restored.missing.length) {
+          const digests = restored.missing.map((digest) => digest.slice(0, 8)).join(', ')
+          throw previous !== null
+            ? previousResponseNotFound(previous, `its provider record leaves out image bytes this request does not carry (${digests})`)
+            : invalid('input', `The history does not carry the image bytes its provider record leaves out (${digests}); send the same images again.`, 'provider_record_missing')
+        }
+        rows.set(row.idx, stepsRowFromJson(restored.row))
+      }
+    }
     const recorded = chainRecords[0].trajectory
     if (!recorded) {
       throw invalid('input', 'The chain head record carries no trajectory metadata, so its store cannot be rebuilt.', 'provider_record_missing')
@@ -578,15 +604,29 @@ export class AgyGateway implements ResponsesEndpoint {
       throw invalid('input', `The store holds ${pending.length} pending tool steps, but the response names no pending call.`, 'store_mismatch')
     }
     // The output files are written after the store is assembled: assembling replaces the conversation's brain folder,
-    // and a step's `file://` result must survive.
+    // and a step's `file://` result must survive. An image rides next to `output.txt` as agy writes one: the client's
+    // bytes in `media_<n>.<ext>`, named by the pointer line the step's text ends with.
     const files: { path: string; content: Uint8Array }[] = []
+    let patched = 0
     if (head.end === 'calls' && delivery.kind === 'outputs') {
       for (let i = 0; i < head.calls.length; i++) {
         const call = head.calls[i]
         const row = rows.get(call.step)!
-        const text = delivery.outputs.get(call.id)!
+        const parts = delivery.outputs.get(call.id)!
         const file = this.store.outputFile(conversation, row.idx)
-        const output: StepOutput = { text, created: stepStart(row) ?? new Date(), completed: new Date(), outputUrl: file.url }
+        const dir = dirname(file.path)
+        const stepImages: StepImage[] = parts.filter((part) => part.type === 'image').map((part, n) => ({
+          url: `file://${join(dir, `media_${n}.${mediaExtension(part.mediaType)}`)}`,
+          mimeType: part.mediaType,
+          data: part.data,
+        }))
+        const output: StepOutput = {
+          text: textOf(parts),
+          created: stepStart(row) ?? new Date(),
+          completed: new Date(),
+          outputUrl: file.url,
+          ...(stepImages.length ? { images: stepImages } : {}),
+        }
         let done: StepsRow
         try {
           done = completeStep(row, output)
@@ -595,21 +635,31 @@ export class AgyGateway implements ResponsesEndpoint {
         }
         rows.set(done.idx, done)
         files.push({ path: file.path, content: outputFileText(output) })
+        for (const image of stepImages) files.push({ path: image.url.slice('file://'.length), content: new Uint8Array(Buffer.from(image.data, 'base64')) })
+        patched++
       }
     }
-    return { conversation, steps: [...rows.values()].sort((a, b) => a.idx - b.idx), files }
+    return { conversation, steps: [...rows.values()].sort((a, b) => a.idx - b.idx), files, patched }
   }
 
   /** A lane at a record's conversation: the store assembled from the chain's records, with pending calls completed. */
-  private laneFromRecords(chain: string, identity: Identity, chainRecords: AgyRecord[], head: AgyRecord, delivery: Delivery): { lane: Lane; patched: number } {
-    const plan = this.planRebuild(chainRecords, head, delivery)
+  private laneFromRecords(
+    chain: string,
+    identity: Identity,
+    chainRecords: AgyRecord[],
+    head: AgyRecord,
+    delivery: Delivery,
+    images: Map<string, Uint8Array>,
+    previous: string | null,
+  ): { lane: Lane; patched: number } {
+    const plan = this.planRebuild(chainRecords, head, delivery, images, previous)
     const recorded = chainRecords[0].trajectory!
     this.store.assemble(plan.conversation, { steps: plan.steps, trajectory: trajectoryFromJson(recorded) })
     for (const file of plan.files) {
       Deno.mkdirSync(dirname(file.path), { recursive: true, mode: 0o700 })
       Deno.writeFileSync(file.path, file.content, { mode: 0o600 })
     }
-    return { lane: this.launch(chain, identity.model, identity.instructions, identity.tools), patched: plan.files.length }
+    return { lane: this.launch(chain, identity.model, identity.instructions, identity.tools), patched: plan.patched }
   }
 
   /**
@@ -674,7 +724,9 @@ export class AgyGateway implements ResponsesEndpoint {
       let floor = -1
       for (const ancestor of o.chainRecords) {
         for (const row of ancestor.steps) {
-          recorded.set(row.idx, stepsHash(row))
+          // A recorded row whose image bytes were left out carries the hash of the row as agy wrote it, so the live
+          // row below compares equal and is never re-recorded.
+          recorded.set(row.idx, ancestor.hashes?.[String(row.idx)] ?? stepsHash(row))
           floor = Math.max(floor, row.idx)
         }
       }
@@ -682,8 +734,9 @@ export class AgyGateway implements ResponsesEndpoint {
       const named = new Set<number>()
       for (const ancestor of o.chainRecords) for (const call of ancestor.calls) named.add(call.step)
       const ownCalls = (steps: StepsRow[]) =>
-        steps.filter((row) => row.step_type === 132 && !named.has(row.idx) && (recorded.has(row.idx) || row.idx > floor || row.status === 1))
-          .sort((a, b) => a.idx - b.idx)
+        steps.filter((row) =>
+          row.step_type === 132 && !!callOf(row) && !named.has(row.idx) && (recorded.has(row.idx) || row.idx > floor || row.status === 1)
+        ).sort((a, b) => a.idx - b.idx)
       const snapshot = await this.snapshotFor(conversation, ownCalls, o.calls.length)
       if (!snapshot) throw serverError('store_unreadable', `agy wrote no conversation store for ${conversation}.`)
       const fresh = snapshot.steps.filter((row) => row.idx > floor || (recorded.has(row.idx) && recorded.get(row.idx) !== stepsHash(stepsRowJson(row))))
@@ -705,6 +758,19 @@ export class AgyGateway implements ResponsesEndpoint {
         throw serverError('store_mismatch', `agy's store bound this response's tool calls many-to-one, which cannot be replayed.`)
       }
       const digest = new ItemDigest(remapItems(o.input, aliases)).finish(remapItems(history, aliases))
+      // Bytes the client's own history holds are left out of the recorded rows; agy-produced ones (a downsized copy
+      // it stores and sends) match no client image and ride in the record.
+      const imageBytes = clientImages(o.input)
+      const crops: StepCrop[] = []
+      const hashes: Record<string, string> = {}
+      const steps = fresh.map((row) => {
+        const json = stepsRowJson(row)
+        const cropped = cropStepImages(json, imageBytes)
+        if (!cropped.crops.length) return json
+        hashes[String(row.idx)] = stepsHash(json)
+        crops.push(...cropped.crops)
+        return cropped.row
+      })
       record = {
         v: 1,
         id: output.id,
@@ -718,7 +784,9 @@ export class AgyGateway implements ResponsesEndpoint {
         ...(aliases.length ? { callAliases: aliases } : {}),
         ...digest,
         agy: this.version,
-        steps: fresh.map(stepsRowJson),
+        steps,
+        ...(crops.length ? { crops } : {}),
+        ...(Object.keys(hashes).length ? { hashes } : {}),
         ...(head === null && snapshot.trajectory ? { trajectory: trajectoryJson(snapshot.trajectory) } : {}),
       }
       item = { type: 'reasoning', id: newId('rs'), summary: [], encrypted_content: await encodeAgyRecord(record) }
@@ -795,10 +863,20 @@ export class AgyGateway implements ResponsesEndpoint {
   }
 }
 
-/** The prompt a rebuilt conversation is reopened with: the client's user messages, or one space when it sent none. */
-function userPrompt(messages: Extract<InItem, { kind: 'message' }>[]): string {
-  const parts = messages.filter((m) => m.role === 'user').map((m) => text(m.parts)).filter((value) => value.trim() !== '')
-  return parts.length ? parts.join('\n\n') : ' '
+/** The client's user messages as one prompt: agy's single text block when nothing is an image, else its parts in order. */
+function userPrompt(messages: Extract<InItem, { kind: 'message' }>[]): Part[] {
+  const user = messages.filter((m) => m.role === 'user')
+  if (!user.some((m) => m.parts.some((p) => p.type === 'image'))) {
+    const texts = user.map((m) => text(m.parts)).filter((value) => value.trim() !== '')
+    return [{ type: 'text', text: texts.length ? texts.join('\n\n') : ' ' }]
+  }
+  const parts: Part[] = []
+  for (const item of user) {
+    if (text(item.parts).trim() === '' && !item.parts.some((p) => p.type === 'image')) continue
+    if (parts.length) parts.push({ type: 'text', text: '\n\n' })
+    parts.push(...item.parts)
+  }
+  return parts
 }
 
 function capitalize(text: string): string {
@@ -825,29 +903,34 @@ function text(parts: Part[]): string {
   return parts.map((p) => p.type === 'text' ? p.text : '').join('\n')
 }
 
+/** A tool result's text items, without the empty slots images leave in `text()`. */
+function textOf(parts: Part[]): string {
+  return parts.filter((p) => p.type === 'text').map((p) => p.text).join('\n')
+}
+
 /** What the new input asks of agy given where its conversation stops. */
 function deliveryFor(head: AgyRecord | null, input: InItem[]): Delivery {
   if (head === null || head.end === 'turn') {
-    const texts: string[] = []
+    const messages: Extract<InItem, { kind: 'message' }>[] = []
     input.forEach((it, i) => {
       if (it.kind === 'function_call_output') throw invalid(`input[${i}]`, `No tool call is waiting for output '${it.callId}'.`, 'unexpected_tool_output')
       if (it.kind !== 'message' || it.role !== 'user') throw invalid(`input[${i}]`, 'New input must be user messages here.')
-      texts.push(text(it.parts))
+      messages.push(it)
     })
-    const prompt = texts.join('\n\n')
-    if (!prompt.trim()) throw invalid('input', 'There is nothing new to respond to: the new input carries no content.')
-    return { kind: 'turn', text: prompt }
+    const parts = userPrompt(messages)
+    if (!parts.some((p) => p.type === 'image') && !text(parts).trim()) throw invalid('input', 'There is nothing new to respond to: the new input carries no content.')
+    return { kind: 'turn', parts }
   }
-  const outputs = new Map<string, string>()
+  const outputs = new Map<string, Part[]>()
   const messages: Extract<InItem, { kind: 'message' }>[] = []
   const want = new Set(head.calls.map((call) => call.id))
   input.forEach((it, i) => {
     if (it.kind === 'function_call_output') {
       if (!want.has(it.callId)) throw invalid(`input[${i}].call_id`, `No tool call '${it.callId}' is waiting for output.`, 'unexpected_tool_output')
       if (outputs.has(it.callId)) throw invalid(`input[${i}].call_id`, `Duplicate output for '${it.callId}'.`, 'unexpected_tool_output')
-      outputs.set(it.callId, text(it.parts))
+      outputs.set(it.callId, it.parts)
     } else if (it.kind === 'message' && (it.role === 'user' || it.role === 'developer' || it.role === 'system')) {
-      if (it.parts.some((p) => p.type === 'text' && p.text.trim() !== '')) messages.push(it)
+      if (it.parts.some((p) => p.type === 'image' || (p.type === 'text' && p.text.trim() !== ''))) messages.push(it)
     } else {
       throw unsupported(`input[${i}]`, 'A delta accepts tool outputs and user, developer or system messages.')
     }

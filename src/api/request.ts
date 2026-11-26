@@ -341,11 +341,15 @@ function parseContent(content: unknown, p: string, role: MessageRole, mode: Inpu
       }
       return { type: 'text', text: c.text }
     }
-    if (c.type === 'input_image' && mode === 'agy') throw unsupported(`${q}.type`, 'The agy gateway accepts text only.')
     if (c.type === 'input_image' && role === 'user') {
       const url = c.image_url
       const m = typeof url === 'string' ? /^data:(image\/(?:png|jpeg|gif|webp));base64,([\s\S]*)$/.exec(url) : null
       if (!m) throw unsupported(`${q}.image_url`, 'Only base64 data URLs of png, jpeg, gif or webp images are supported.')
+      // agy re-encodes an image once at ingestion and keeps that form in its store; the bytes it puts upstream were
+      // measured stable for PNG and JPEG only, so the other kinds are refused here, before agy can see them.
+      if (mode === 'agy' && m[1] !== 'image/png' && m[1] !== 'image/jpeg') {
+        throw unsupported(`${q}.image_url`, 'The agy gateway accepts PNG and JPEG images only.')
+      }
       if (m[2].length > MAX_IMAGE_BASE64_CHARS) {
         throw invalid(`${q}.image_url`, `Image base64 exceeds ${MAX_IMAGE_BASE64_CHARS} characters; resize it before sending.`, 'image_too_large')
       }

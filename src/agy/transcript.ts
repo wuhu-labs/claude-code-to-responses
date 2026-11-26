@@ -110,21 +110,43 @@ export class Transcript {
     const deadline = performance.now() + 350
     do {
       signal.throwIfAborted()
-      const [brief, full] = await Promise.all([rows(`${this.dir}/transcript.jsonl`), rows(`${this.dir}/transcript_full.jsonl`)])
-      const candidates = new Map<number, Planner>()
-      for (const [data, rich] of [[brief, false], [full, true]] as const) {
-        for (const row of data) {
-          const p = planner(row, rich)
-          if (p && p.index > after && p.index < before && match(p)) candidates.set(p.index, p)
-        }
-      }
+      const candidates = (await this.read()).filter((p) => p.index > after && p.index < before && match(p))
       let latest: Planner | null = null
-      for (const p of candidates.values()) if (!latest || latest.index < p.index) latest = p
+      for (const p of candidates) if (!latest || latest.index < p.index) latest = p
       if (latest) return latest
       signal.throwIfAborted()
       if (performance.now() >= deadline) break
       await new Promise((resolve) => setTimeout(resolve, 12))
     } while (performance.now() < deadline)
     return null
+  }
+
+  /**
+   * Every planner line after a cursor, oldest first, once one without calls is in: a turn agy answered some calls
+   * itself (`read_file`) made several inferences, and the response covers all of them.
+   */
+  async lines(after: number, signal: AbortSignal): Promise<Planner[]> {
+    const deadline = performance.now() + 350
+    do {
+      signal.throwIfAborted()
+      const all = (await this.read()).filter((p) => p.index > after).sort((a, b) => a.index - b.index)
+      if (all.some((p) => p.calls.length === 0)) return all
+      if (performance.now() >= deadline) break
+      await new Promise((resolve) => setTimeout(resolve, 12))
+    } while (performance.now() < deadline)
+    return []
+  }
+
+  /** Every planner line the two transcripts hold, one per inference, the full transcript's copy winning. */
+  private async read(): Promise<Planner[]> {
+    const [brief, full] = await Promise.all([rows(`${this.dir}/transcript.jsonl`), rows(`${this.dir}/transcript_full.jsonl`)])
+    const candidates = new Map<number, Planner>()
+    for (const [data, rich] of [[brief, false], [full, true]] as const) {
+      for (const row of data) {
+        const p = planner(row, rich)
+        if (p) candidates.set(p.index, p)
+      }
+    }
+    return [...candidates.values()]
   }
 }

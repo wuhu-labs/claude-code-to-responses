@@ -1,5 +1,5 @@
 import { join } from 'node:path'
-import type { FnTool, InItem } from '../api/request.ts'
+import type { FnTool, InItem, Part } from '../api/request.ts'
 import { newId } from '../api/stream.ts'
 import { Eviction } from '../eviction.ts'
 import { serverError } from '../errors.ts'
@@ -45,7 +45,10 @@ export type Exchange = {
   fail: (error: unknown) => void
 }
 type Turn = {
+  /** Where `find` looks for the next planner line; the invocation hook may advance it over rows the gateway did not read. */
   cursor: number
+  /** Where the response that is being finished begins: the prompt, or the last client call it answered. */
+  since: number
   invocation: number | null
   fallback: number | null
   queue: HookStep[]
@@ -56,9 +59,19 @@ type Turn = {
 }
 type Batch =
   | { kind: 'held'; calls: Call[]; release: (output: ToolResult) => void }
-  | { kind: 'draining'; next: number; calls: Call[]; results: Map<string, string> }
+  | { kind: 'draining'; next: number; calls: Call[]; results: Map<string, ToolResult> }
 
 const launchTimeout = 30_000
+
+/**
+ * The gateway's own agent text, the same on every launch of a chain: agy offloads a tool's image to a file and names
+ * it in the tool output, and the model reaches it only through agy's own `read_file`. Measured wording.
+ */
+const imageGuidance = [
+  'When a tool returns an image, agy saves it to a file in the tool step\'s folder and the tool output names the path in a line like `[Resource offloaded to file://<path>]`.',
+  'Open exactly that path with read_file to look at the image.',
+  'read_file is only for those files.',
+].join(' ')
 
 export class Lane {
   readonly token = crypto.randomUUID()
@@ -92,13 +105,13 @@ export class Lane {
         'description: Responses API conversation agent.',
         'mainAgent: true',
         'subagent: false',
-        'tools: []',
+        'tools: [view_file]',
         'mcpServers:',
         `  - name: ${MCP_NAME}`,
         'inheritMcp: false',
         'inheritCustomizations: true',
         '---',
-        spec.instructions,
+        `${spec.instructions}\n\n${imageGuidance}`,
       ].join('\n'),
       { mode: 0o600 },
     )
@@ -249,40 +262,47 @@ export class Lane {
    * One new user turn on a process that sits at a finished turn. `steps` are the steering messages the client sent
    * with the outputs: the invocation hook injects them before the model sees this prompt.
    */
-  async run(exchange: Exchange, prompt: string, steps: HookStep[] = []) {
+  async run(exchange: Exchange, prompt: Part[], steps: HookStep[] = []) {
     if (this.turn || this.active || !this.transcript) throw new Error('overlapping ACP prompt')
     this.active = exchange
     const cursor = await this.transcript.head()
     this.controller.signal.throwIfAborted()
-    const turn = this.turn = { cursor, invocation: null, fallback: null, queue: [...steps], chunks: false, used: [], boundaries: 0, drainedACP: new Set() }
-    const result = await this.proc.request('session/prompt', { sessionId: this.session, prompt: [{ type: 'text', text: prompt }] })
+    const turn = this.turn = { cursor, since: cursor, invocation: null, fallback: null, queue: [...steps], chunks: false, used: [], boundaries: 0, drainedACP: new Set() }
+    const result = await this.proc.request('session/prompt', { sessionId: this.session, prompt: promptBlocks(prompt) })
     if (this.turn !== turn) return
     if (this.batch || !this.active) throw serverError('upstream_error', 'agy ended its prompt before issuing every planned tool call.')
     if (turn.queue.length) throw serverError('notice_undelivered', 'agy ended before the PreInvocation hook consumed queued messages.')
     const current = this.active
-    const line = await this.transcript.find(turn.cursor, (p) => p.calls.length === 0, this.controller.signal)
+    const lines = await this.transcript.lines(turn.since, this.controller.signal)
     if (this.active !== current) return
+    const line = lines.filter((p) => p.calls.length === 0).at(-1) ?? null
     const remainder = remainingTokens(promptTokens(result.usage), turn)
-    const counts = line?.usage ?? remainder
+    const counts = sumTokens(lines) ?? line?.usage ?? remainder
     if (counts?.thought_tokens === null && remainder?.thought_tokens != null) counts.thought_tokens = remainder.thought_tokens
+    // A turn agy answered some calls itself (read_file) made more than one inference: its response is the whole turn's
+    // text and thoughts, and its usage the sum over those inferences.
+    const planner = line
+      ? { ...line, text: lines.map((p) => p.text).filter(Boolean).join('\n\n'), thinking: lines.map((p) => p.thinking).filter(Boolean).join('\n\n') }
+      : null
     this.active = null
     this.turn = null
     this.pendingCall = undefined
     try {
-      await current.finish([], line, counts, result.stopReason === 'max_tokens')
+      await current.finish([], planner, counts, result.stopReason === 'max_tokens')
     } catch (error) {
       current.fail(error)
     }
   }
 
   /** Posts the held calls' outputs into the live process: the gateway's answer to agy's own MCP calls. */
-  async continue(exchange: Exchange, results: Map<string, string>, steps: HookStep[]) {
+  async continue(exchange: Exchange, results: Map<string, ToolResult>, steps: HookStep[]) {
     if (!this.turn || this.active || this.batch?.kind !== 'held') throw new Error('no agy tool hold is available')
     const { calls, release } = this.batch
     this.active = exchange
+    this.turn.since = this.turn.cursor // this response continues after the call it just answered
     this.turn.queue.push(...steps) // the hook sees the whole queue before any call is released
     this.batch = calls.length === 1 ? null : { kind: 'draining', next: 1, calls, results }
-    release(toolResult(results.get(calls[0].callId)!))
+    release(results.get(calls[0].callId)!)
   }
 
   list() {
@@ -326,7 +346,7 @@ export class Lane {
         throw serverError('upstream_error', 'agy issued a different call than the planner listed.')
       }
       if (batch.next === batch.calls.length) this.batch = null
-      return toolResult(batch.results.get(expect.callId)!)
+      return batch.results.get(expect.callId)!
     }
     const active = this.active
     if (!active || this.batch || !this.transcript) throw serverError('upstream_error', 'agy issued an unowned tool call.')
@@ -350,7 +370,10 @@ export class Lane {
       turn.fallback = turn.invocation
       console.error('agy planner did not identify a complete client tool batch; emitting one call')
     }
-    if (line) turn.cursor = line.index
+    if (line) {
+      turn.cursor = line.index
+      turn.since = line.index
+    }
     if (group?.usage) turn.used.push(group.usage)
     turn.boundaries++
     const hold = new Promise<ToolResult>((release) => this.batch = { kind: 'held', calls, release })
@@ -388,6 +411,27 @@ export class Lane {
       this.active.output.chunk(type, delta)
     }
   }
+}
+
+/** The ACP prompt content: the client's text and image parts in order; images keep the bytes the client sent. */
+function promptBlocks(parts: Part[]): JsonObject[] {
+  return parts.map((part) => part.type === 'text' ? { type: 'text', text: part.text } : { type: 'image', mimeType: part.mediaType, data: part.data })
+}
+
+/** The usage of every inference a turn made; null when a planner line did not report it. */
+function sumTokens(lines: Planner[]): Tokens | null {
+  if (!lines.length) return null
+  const total: Tokens = { input_tokens: 0, cached_read_tokens: 0, cached_write_tokens: 0, output_tokens: 0, thought_tokens: 0 }
+  for (const line of lines) {
+    const usage = line.usage
+    if (!usage) return null
+    total.input_tokens += usage.input_tokens
+    total.cached_read_tokens += usage.cached_read_tokens
+    total.cached_write_tokens += usage.cached_write_tokens
+    total.output_tokens += usage.output_tokens
+    total.thought_tokens = total.thought_tokens === null || usage.thought_tokens === null ? null : total.thought_tokens + usage.thought_tokens
+  }
+  return total
 }
 
 function remainingTokens(total: Tokens | null, turn: Turn): Tokens | null {
