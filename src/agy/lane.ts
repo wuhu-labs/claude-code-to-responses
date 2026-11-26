@@ -1,6 +1,7 @@
 import { join } from 'node:path'
 import type { FnTool, InItem } from '../api/request.ts'
 import { newId } from '../api/stream.ts'
+import { Eviction } from '../eviction.ts'
 import { serverError } from '../errors.ts'
 import { AcpError, AcpProcess, agentName } from './acp.ts'
 import type { Call, Output } from './output.ts'
@@ -24,7 +25,9 @@ import {
 export type Tier = { name: string; id: string }
 export type Launch = {
   agy: string
+  /** The chain's fixed working folder: its path is in the prompt agy sends. */
   workspace: string
+  /** The one gemini dir from the gateway's configuration. */
   gemini: string
   chain: string
   origin: string
@@ -32,10 +35,13 @@ export type Launch = {
   instructions: string
   model: string
   tools: FnTool[]
+  idleMs: number
+  holdMs: number
 }
 export type Exchange = {
   output: Output
-  finish: (calls: Call[], planner: Planner | null, tokens: Tokens | null, incomplete: boolean) => void
+  /** Ends the response: its output items, its record cut from the store, and the terminal batch, committed. */
+  finish: (calls: Call[], planner: Planner | null, tokens: Tokens | null, incomplete: boolean) => Promise<void>
   fail: (error: unknown) => void
 }
 type Turn = {
@@ -58,10 +64,12 @@ export class Lane {
   readonly token = crypto.randomUUID()
   readonly controller = new AbortController()
   readonly exit: Promise<void>
+  /** agy's conversation id, from `session/new`; '' before the session exists. */
   session = ''
   tier: Tier | null = null
+  /** The response this process sits at, once its record is committed. */
   head: string | null = null
-  timer?: ReturnType<typeof setTimeout>
+  private eviction: Eviction
   private listed = false
   private pendingCall?: AcpCall
   private turn: Turn | null = null
@@ -73,6 +81,7 @@ export class Lane {
 
   constructor(readonly spec: Launch, onExit: () => void) {
     this.knownTools = new Set(spec.tools.map((t) => t.name))
+    this.eviction = new Eviction(spec.idleMs, spec.holdMs)
     const dir = join(spec.workspace, '.agents', 'agents', agentName(spec.chain))
     Deno.mkdirSync(dir, { recursive: true, mode: 0o700 })
     Deno.writeTextFileSync(
@@ -108,14 +117,49 @@ export class Lane {
       (p) => this.permission(p),
       (err) => {
         this.controller.abort(err)
-        clearTimeout(this.timer)
+        this.eviction.clear()
         if (this.batch?.kind === 'held') this.batch.release(toolResult('agy lane closed', true))
         this.batch = null
-        this.active?.fail(err)
+        void this.active?.fail(err)
         onExit()
       },
     )
     this.exit = this.proc.stopped
+  }
+
+  /** The chain this lane serves. */
+  get laneId(): string {
+    return this.spec.chain
+  }
+
+  /** The chain's identity as this process was launched with it (a rebuild may name an earlier response). */
+  get model(): string {
+    return this.spec.model
+  }
+
+  get instructions(): string {
+    return this.spec.instructions
+  }
+
+  get tools(): FnTool[] {
+    return this.spec.tools
+  }
+
+  get busy(): boolean {
+    return this.active !== null
+  }
+
+  get gone(): Promise<void> {
+    return this.exit
+  }
+
+  get dead(): boolean {
+    return this.controller.signal.aborted
+  }
+
+  /** Whether this process is sitting on a planner line whose tool calls it is waiting for the gateway to answer. */
+  get holding(): boolean {
+    return this.batch?.kind === 'held' && this.turn !== null
   }
 
   async start(resume: string | null): Promise<boolean> {
@@ -148,13 +192,30 @@ export class Lane {
   }
 
   stop() {
+    this.eviction.clear()
     this.proc.stop()
     return this.exit
   }
 
+  /** The same stop, under the name the shared chain registry calls it. */
+  kill(_reason: string): Promise<void> {
+    return this.stop()
+  }
+
   fail(error: unknown) {
-    this.active?.fail(error)
-    this.proc.stop()
+    void this.active?.fail(error)
+    this.stop()
+  }
+
+  /** Schedules the eviction of a process that ended a turn or is holding calls. */
+  armEviction(): void {
+    if (this.dead || this.active) return
+    const hold = this.batch?.kind === 'held'
+    this.eviction.arm(hold, () => void this.stop())
+  }
+
+  detach(): void {
+    this.eviction.clear()
   }
 
   private async verifyAgent() {
@@ -184,12 +245,16 @@ export class Lane {
     throw serverError('upstream_error', 'Could not verify the fenced agent in the agy process log; no prompt was sent.')
   }
 
-  async run(exchange: Exchange, prompt: string) {
+  /**
+   * One new user turn on a process that sits at a finished turn. `steps` are the steering messages the client sent
+   * with the outputs: the invocation hook injects them before the model sees this prompt.
+   */
+  async run(exchange: Exchange, prompt: string, steps: HookStep[] = []) {
     if (this.turn || this.active || !this.transcript) throw new Error('overlapping ACP prompt')
     this.active = exchange
     const cursor = await this.transcript.head()
     this.controller.signal.throwIfAborted()
-    const turn = this.turn = { cursor, invocation: null, fallback: null, queue: [], chunks: false, used: [], boundaries: 0, drainedACP: new Set() }
+    const turn = this.turn = { cursor, invocation: null, fallback: null, queue: [...steps], chunks: false, used: [], boundaries: 0, drainedACP: new Set() }
     const result = await this.proc.request('session/prompt', { sessionId: this.session, prompt: [{ type: 'text', text: prompt }] })
     if (this.turn !== turn) return
     if (this.batch || !this.active) throw serverError('upstream_error', 'agy ended its prompt before issuing every planned tool call.')
@@ -203,14 +268,19 @@ export class Lane {
     this.active = null
     this.turn = null
     this.pendingCall = undefined
-    current.finish([], line, counts, result.stopReason === 'max_tokens')
+    try {
+      await current.finish([], line, counts, result.stopReason === 'max_tokens')
+    } catch (error) {
+      current.fail(error)
+    }
   }
 
-  continue(exchange: Exchange, results: Map<string, string>, steps: HookStep[]) {
+  /** Posts the held calls' outputs into the live process: the gateway's answer to agy's own MCP calls. */
+  async continue(exchange: Exchange, results: Map<string, string>, steps: HookStep[]) {
     if (!this.turn || this.active || this.batch?.kind !== 'held') throw new Error('no agy tool hold is available')
     const { calls, release } = this.batch
     this.active = exchange
-    this.turn.queue.push(...steps) // Hook sees the whole queue before any call is released.
+    this.turn.queue.push(...steps) // the hook sees the whole queue before any call is released
     this.batch = calls.length === 1 ? null : { kind: 'draining', next: 1, calls, results }
     release(toolResult(results.get(calls[0].callId)!))
   }
@@ -285,7 +355,12 @@ export class Lane {
     turn.boundaries++
     const hold = new Promise<ToolResult>((release) => this.batch = { kind: 'held', calls, release })
     this.active = null
-    active.finish(calls, group, group?.usage ?? null, false)
+    try {
+      await active.finish(calls, group, group?.usage ?? null, false)
+    } catch (error) {
+      active.fail(error)
+      throw error
+    }
     return await hold
   }
 
@@ -325,6 +400,7 @@ function remainingTokens(total: Tokens | null, turn: Turn): Tokens | null {
   return total
 }
 
+/** The client's messages as agy's steering hook injects them before the next inference. */
 export function injection(notices: Extract<InItem, { kind: 'message' }>[]): HookStep[] {
   return notices.flatMap<HookStep>((item) => {
     const text = item.parts.map((p) => p.type === 'text' ? p.text : '').join('\n')
