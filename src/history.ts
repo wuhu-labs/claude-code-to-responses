@@ -4,6 +4,7 @@
 // lane renders them, the agy lane refuses the request.
 import type { InItem } from './api/request.ts'
 import { type CallAliases, matchItems, remapItems } from './call_ids.ts'
+import { invalid } from './errors.ts'
 
 export interface Group {
   inputs: InItem[]
@@ -75,8 +76,9 @@ export function isOutput(i: InItem): boolean {
 }
 
 /**
- * The longest run of groups whose records chain onto each other and match their items. A record that does not continue
- * the run (another chain, an edited history) is ignored and its group synthesized, unless a later record covers it.
+ * The longest run of groups whose records chain onto each other and match their items. A group no record covers is
+ * synthesized (or refused by a lane that cannot represent it). A record that does chain onto the run but whose items
+ * disagree with what it covers is positive evidence of a changed prefix: that is a 400, never a silent synthesis.
  */
 export async function matchHistory<R extends MatchRecord, S>(
   groups: Group[],
@@ -88,13 +90,14 @@ export async function matchHistory<R extends MatchRecord, S>(
   let head: Head | null = null
   let session: string | null = null
   let aliases: CallAliases = []
-  const reset = (to: number) => {
+  const reset = () => {
     used.length = 0
     aliases = []
     head = null
     session = null
-    pending = groups.slice(0, to)
+    pending = [...groups]
   }
+  const known = new Map<string, R>()
   for (let gi = 0; gi < groups.length; gi++) {
     const group = groups[gi]
     pending.push(group)
@@ -102,13 +105,30 @@ export async function matchHistory<R extends MatchRecord, S>(
     const encrypted = [...new Set(group.outputs.filter((i) => i.kind === 'reasoning' && i.encrypted).map((i) => (i as { encrypted: string }).encrypted))]
     const records = (await Promise.all(encrypted.map((e) => o.decode(e, gi)))).filter((r) => r !== null)
     if (records.length === 0) continue
+    // Two readable records whose own prev links disagree with the order they were sent in are a visible contradiction:
+    // a response cannot follow its own parent. A response sent twice is still one record and keeps its first position.
+    for (const record of records) {
+      if (known.has(record.id)) continue
+      const child = [...known.values()].find((r) => r.prev === record.id)
+      if (child) throw invalid('input', `The history puts response '${child.id}' before its parent '${record.id}'.`, 'history_mismatch')
+      known.set(record.id, record)
+    }
     const record = records[records.length - 1]!
     const covers = pending.flatMap((x) => [...x.inputs, ...x.outputs])
     const candidate = records.length === 1 && o.continues(record) && record.prev === (head?.responseId ?? null) &&
       (session === null || o.session(record) === session)
     const providerCalls = candidate ? o.providerCalls(record) : null
     const matched = providerCalls === null ? null : matchItems(covers, record, providerCalls, aliases)
-    if (candidate && matched === null) reset(gi + 1)
+    // The record names this exact parent and continues the run, but the items it covers are not the ones it was issued
+    // for. No lookup can make that true; the client must drop the reasoning it contradicts.
+    if (candidate && providerCalls !== null && matched === null) {
+      throw invalid(
+        'input',
+        `The history carries the reasoning record of response '${record.id}', but the input it covers is not the input it was issued for. ` +
+          'A changed prefix cannot keep its old reasoning: drop that reasoning item and the later ones, or start a new conversation.',
+        'history_mismatch',
+      )
+    }
     if (matched === null) continue
     aliases = matched
     used.push({ record, state: await o.state(record, covers, aliases) })
@@ -116,10 +136,10 @@ export async function matchHistory<R extends MatchRecord, S>(
     session = o.session(record)
     pending = []
   }
-  const { tail: pure, groups: all } = segment(input)
+  const { tail: pure } = segment(input)
   // an output for a call no function_call in this input names sends the whole history back to synthesis
   const clientCalls = new Set(input.filter((it) => it.kind === 'function_call').map((it) => it.callId))
-  if (pure.some((it) => it.kind === 'function_call_output' && !clientCalls.has(it.callId))) reset(all.length)
+  if (pure.some((it) => it.kind === 'function_call_output' && !clientCalls.has(it.callId))) reset()
   return {
     used,
     aliases,

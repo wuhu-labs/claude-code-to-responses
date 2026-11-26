@@ -25,8 +25,14 @@ Deno.test('HTTP history with reserialized function arguments replays the origina
     const replayed = await giveHistory('{ "a": "text", "z": ["a", {"x":true,"y":1}] }')
     assertEquals([replayed.status, replayed.response.x_gateway.records, replayed.response.x_gateway.synthesized_groups], ['completed', 1, 0])
     assertEquals(run.fake.main()[2].raw, run.fake.main()[1].raw)
-    const changed = await giveHistory('{"a":"text","z":["a",{"x":true,"y":2}]}')
-    assertEquals([changed.status, changed.response.x_gateway.records, changed.response.x_gateway.synthesized_groups], ['completed', 0, 1])
+    const changed = await assertRejects(() => giveHistory('{"a":"text","z":["a",{"x":true,"y":2}]}')) as { status?: number; code?: string }
+    assertEquals([changed.status, changed.code], [400, 'history_mismatch'])
+    // the documented way past it: drop the record that covers the edited call and let that group be synthesized
+    const dropped = await send(run.tg.client, {
+      ...body,
+      input: [...input, ...first.response.output.filter((item: Json) => item.type !== 'reasoning'), result],
+    })
+    assertEquals([dropped.status, dropped.response.x_gateway.synthesized_groups], ['completed', 1])
     const malformed = await assertRejects(() => giveHistory('[]')) as { status?: number; code?: string }
     assertEquals([malformed.status, malformed.code], [400, 'invalid_function_arguments'])
   })

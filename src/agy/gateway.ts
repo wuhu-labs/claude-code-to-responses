@@ -241,10 +241,18 @@ export class AgyGateway implements ResponsesEndpoint {
       // a full create carrying history: only the records in it can rebuild the conversation
       const match = await this.matchRecords(req)
       if (match.head === null) {
-        throw invalid('input', 'The history carries no usable agy provider record, so its conversation cannot be rebuilt; start a new conversation.', 'provider_record_missing')
+        throw invalid(
+          'input',
+          'The history carries an assistant or tool exchange that no usable agy provider record covers, so it cannot be rebuilt as one agy conversation; an agy conversation is never replayed from plain text. Start a new conversation with that context.',
+          'provider_record_missing',
+        )
       }
       if (match.synth.length) {
-        throw invalid('input', 'The history carries responses this lane cannot place in one conversation; start a new conversation.', 'provider_record_missing')
+        throw invalid(
+          'input',
+          'The history carries an earlier assistant or tool exchange that no usable agy provider record covers, so it cannot be rebuilt as one agy conversation; an agy conversation is never replayed from plain text. Start a new conversation with that context.',
+          'provider_record_missing',
+        )
       }
       // The supplied transcript is validated first and in full: a defective client record — a head without its
       // trajectory blob, a tail that is not the pending calls — is refused even when the cache holds a good copy.
