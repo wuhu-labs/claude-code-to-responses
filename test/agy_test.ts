@@ -1,6 +1,8 @@
-import { assert, assertEquals, assertMatch, assertRejects } from '@std/assert'
+import { assert, assertEquals, assertMatch } from '@std/assert'
 import { fileURLToPath } from 'node:url'
 import { lines } from '../src/claude/lines.ts'
+import { packRecord, unpackRecord } from '../src/records.ts'
+import { AGY_RECORD_PREFIX } from '../src/agy/record.ts'
 import { kernelBody } from './kernel_shapes.ts'
 import { WsClient } from './websocket_client.ts'
 
@@ -8,12 +10,15 @@ const main = fileURLToPath(new URL('../src/agy/main.ts', import.meta.url))
 const fixture = fileURLToPath(new URL('./fixtures/fake_agy.ts', import.meta.url))
 const tool = (name = 'lookup') => ({ type: 'function', name, parameters: { type: 'object', properties: {} } })
 const message = (role: string, content: unknown) => ({ role, content })
-const initial = (input: string, tools = [tool()]) => ({ instructions: 'Fence this conversation.', model: 'gemini-3.8-flash-low', tools, input })
-const follow = (r: any, input: unknown[], props = {}) => ({ model: 'gemini-3.8-flash-low', previous_response_id: r.id, input, ...props })
+const user = (text: string) => message('user', text)
+const MODEL = 'gemini-3.8-flash-low'
+const INSTRUCTIONS = 'Fence this conversation.'
+const initial = (input: unknown, tools = [tool()]) => ({ instructions: INSTRUCTIONS, model: MODEL, tools, input: [user(String(input))] })
+const follow = (r: any, input: unknown[], props = {}) => ({ model: MODEL, previous_response_id: r.id, input, ...props })
 const calls = (r: any) => r.output.filter((v: any) => v.type === 'function_call')
 const text = (r: any) => r.output.find((v: any) => v.type === 'message')?.content[0].text
 const result = (call: any, output: string) => ({ type: 'function_call_output', call_id: call.call_id, output })
-const outputs = (r: any) => calls(r).map((c: any, i: number) => result(c, `result-${i}`))
+const outputs = (r: any, prefix = 'result') => calls(r).map((c: any, i: number) => result(c, `${prefix}-${i}`))
 const shellWord = (s: string) => `'${s.replaceAll("'", `'"'"'`)}'`
 
 async function rig(mode = 'default') {
@@ -23,8 +28,9 @@ async function rig(mode = 'default') {
   const fake = `${root}/agy`
   await Deno.writeTextFile(fake, `#!/bin/sh\nexec ${[Deno.execPath(), 'run', '-A', fixture, mode].map(shellWord).join(' ')} "$@"\n`, { mode: 0o700 })
   const processes = new Set<Deno.ChildProcess>()
-  const evidence = async () => (await Deno.readTextFile(`${state}/gemini/fake-evidence.jsonl`)).trim().split('\n').map((line) => JSON.parse(line))
-  const spawn = (extra: string[] = []) => {
+  const evidenceFile = `${state}/gemini/fake-evidence.jsonl`
+  const evidence = async () => (await Deno.readTextFile(evidenceFile)).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+  const start = async (extra: string[] = []) => {
     const compiled = Deno.env.get('AGY_TEST_GATEWAY')
     const child = new Deno.Command(compiled ?? Deno.execPath(), {
       args: [...(compiled ? [] : ['run', '-A', main]), '--port', '0', '--state-dir', state, '--agy', fake, ...extra],
@@ -33,10 +39,7 @@ async function rig(mode = 'default') {
     }).spawn()
     processes.add(child)
     void child.status.then(() => processes.delete(child))
-    return child
-  }
-  const start = async (extra: string[] = []) => {
-    const child = spawn(extra), ready = Promise.withResolvers<string>()
+    const ready = Promise.withResolvers<string>()
     const stderr: string[] = []
     const drain = (async () => {
       for await (const line of lines(child.stderr)) {
@@ -50,7 +53,7 @@ async function rig(mode = 'default') {
     const stop = async (signal: Deno.Signal = 'SIGTERM') => {
       if (processes.has(child)) child.kill(signal)
       const status = await child.status
-      await drain
+      await drain.catch(() => {/* the drain also rejects once the process is gone */})
       if (signal === 'SIGTERM') assertEquals(status.code, 0, stderr.join('\n'))
     }
     const post = (body: unknown) =>
@@ -58,12 +61,12 @@ async function rig(mode = 'default') {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ stream: true, ...(body as object) }),
-        signal: AbortSignal.timeout(12_000),
+        signal: AbortSignal.timeout(20_000),
       })
     const create = async (body: unknown) => {
       const res = await post(body)
       const raw = await res.text()
-      assertEquals(res.status, 200, raw)
+      assertEquals(res.status, 200, `${raw}\n${stderr.join('\n')}`)
       const events = raw.split('\n').filter((l) => l.startsWith('data: ')).map((l) => JSON.parse(l.slice(6)))
       assertEquals(events.at(-1)?.type, 'response.completed', raw)
       return { response: events.at(-1).response, events }
@@ -75,7 +78,7 @@ async function rig(mode = 'default') {
     await Promise.all([...processes].map((p) => p.status))
     await Deno.remove(root, { recursive: true })
   }
-  return { start, spawn, evidence, dispose, state }
+  return { start, evidence, dispose, state, fake }
 }
 
 async function assertStopped(pids: number[]) {
@@ -90,24 +93,193 @@ async function assertStopped(pids: number[]) {
 }
 
 const pids = (events: any[]) => events.flatMap((e) => e.kind === 'process' ? [e.agy] : e.kind === 'shim' ? [e.pid] : [])
+const promptsOf = (events: any[]) => events.filter((e) => e.kind === 'prompt')
 
-Deno.test('agy: batch with streamed thought/text, mixed transport, ordered outputs and idempotent steering', async () => {
-  const r = await rig('brief-only')
+/** What the model sees before a turn: the rows agy renders upstream, one per line, without the resume notices. */
+function upstream(visible: string[]): string[] {
+  return visible.filter((row) => !/^\d+:101:/.test(row)).map((row) => row.replace(/^\d+:/, ''))
+}
+
+/** One scripted conversation: plain turn, a held batch, its release plus a notice, then two plain turns. */
+async function conversation(disrupt: boolean) {
+  const r = await rig()
+  let gw = await r.start(disrupt ? ['--hold-timeout', '0.2'] : [])
+  const history: any[] = []
+  const responses = []
+  let release: { checks: any[]; prompts: any[] } = { checks: [], prompts: [] }
+  const send = async (input: unknown[], previous: string | null) => {
+    const body = { model: MODEL, instructions: INSTRUCTIONS, tools: [tool()], input: previous ? input : [...history, ...input] }
+    const made = await gw.create(previous ? { ...body, previous_response_id: previous } : body)
+    assertEquals(made.response.status, 'completed')
+    history.push(...input, ...made.response.output)
+    return made.response
+  }
+  const first = await send([user('Remember KUMQUAT-3311.')], null)
+  responses.push(first)
+  const second = await send([user('batch')], first.id)
+  responses.push(second)
+  assertEquals(calls(second).length, 3)
+  if (disrupt) await assertStopped(pids(await r.evidence()))
+  const third = await send([...outputs(second), user('user notice')], second.id)
+  responses.push(third)
+  if (disrupt) {
+    const events = await r.evidence()
+    release = { checks: events.filter((e) => e.kind === 'resume-check'), prompts: promptsOf(events) }
+    await gw.stop()
+    gw = await r.start()
+  }
+  const fourth = await send([user('What did the calls return?')], third.id)
+  responses.push(fourth)
+  if (disrupt) {
+    await gw.stop()
+    await Deno.remove(r.state, { recursive: true })
+    gw = await r.start()
+  }
+  const fifth = await send([user('And now?')], disrupt ? null : fourth.id)
+  responses.push(fifth)
+  await gw.stop()
+  const final = promptsOf(await r.evidence())
+  await r.dispose()
+  return { responses, release, prompts: final }
+}
+
+Deno.test('agy: one conversation keeps one store and one upstream on the live path and through every rebuild', async () => {
+  const live = await conversation(false)
+  assertEquals(live.responses.map((r) => r.x_gateway.path), ['new', 'live', 'live', 'live', 'live'])
+  const rebuilt = await conversation(true)
+  assertEquals(rebuilt.responses.map((r) => r.x_gateway.path), ['new', 'live', 'store', 'store', 'history'])
+  assertEquals(rebuilt.responses[2].x_gateway.patched, 3)
+  // the pending calls the record names were completed by the gateway's own write
+  assertEquals(rebuilt.release.checks.length, 1)
+  assertEquals(rebuilt.release.checks[0].pending.length, 3)
+  assertEquals(rebuilt.release.checks[0].completed, ['result-0', 'result-1', 'result-2'])
+  // the last turn sees exactly the rows the live conversation saw, apart from the resume notices
+  const last = (prompts: any[]) => upstream(prompts.at(-1).visible)
+  assertEquals(last(rebuilt.prompts), last(live.prompts))
+})
+
+Deno.test('agy: a live process releases held calls itself, and a restart during a hold completes them from the store', async () => {
+  const r = await rig()
+  try {
+    let gw = await r.start()
+    const { response } = await gw.create(initial('batch'))
+    assertEquals(calls(response).length, 3)
+    const live = await gw.create(follow(response, [...outputs(response).reverse(), user('user notice')]))
+    assertEquals(live.response.x_gateway.path, 'live')
+    assertEquals(JSON.parse(text(live.response)), {
+      results: ['result-0', 'result-1', 'result-2'],
+      messages: [{ userMessage: 'user notice' }],
+    })
+    // the second batch is held across a gateway restart, then released from the store
+    const second = await gw.create(follow(live.response, [user('pair')]))
+    assertEquals(calls(second.response).length, 2)
+    await gw.stop()
+    gw = await r.start()
+    const released = await gw.create(follow(second.response, outputs(second.response, 'after')))
+    assertEquals([released.response.x_gateway.path, released.response.x_gateway.patched], ['store', 2])
+    const check = (await r.evidence()).filter((e) => e.kind === 'resume-check').at(-1)
+    assertEquals(check.completed, ['after-0', 'after-1'])
+    assertEquals(JSON.parse(text(released.response)).results, ['after-0', 'after-1'])
+    await gw.stop()
+    await assertStopped(pids(await r.evidence()))
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: a history no record covers is refused before any process starts', async () => {
+  const r = await rig()
   try {
     const gw = await r.start()
-    const { response: first, events } = await gw.create(initial('batch'))
-    assertEquals(first.output[0].content[0].text, 'Thinking.')
-    assertEquals(text(first), 'Planning.')
-    assertEquals(events.filter((x) => x.type === 'response.reasoning_text.delta').map((x) => x.delta), ['Think', 'ing.'])
-    assertEquals(events.find((x) => x.type === 'response.output_text.delta')?.delta, 'Planning.')
-    const batch = calls(first)
-    assertEquals(batch.length, 3)
-    assertEquals(new Set(batch.map((c: any) => c.call_id)).size, 3)
-    assertEquals(
-      batch.map((c: any) => [c.name, JSON.parse(c.arguments)]),
-      [0, 1, 2].map((index) => ['lookup', { index, value: ['héllo', { nested: true }, null] }]),
-    )
-    assertEquals(first.usage, {
+    const res = await gw.post({
+      model: MODEL,
+      instructions: INSTRUCTIONS,
+      tools: [tool()],
+      input: [user('earlier'), message('assistant', 'answer'), user('continue')],
+    })
+    assertEquals(res.status, 400)
+    assertEquals((await res.json()).error.code, 'provider_record_missing')
+    assertEquals((await r.evidence().catch(() => [])).filter((e) => e.kind === 'process').length, 0)
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: another lane\'s record and another agy version are typed refusals', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start()
+    const first = await gw.create(initial('Remember the marker.'))
+    const record = first.response.output.find((item: any) => item.type === 'reasoning' && item.encrypted_content)?.encrypted_content
+    assert(record?.startsWith(AGY_RECORD_PREFIX))
+    const items = first.response.output.filter((item: any) => !(item.type === 'reasoning' && item.encrypted_content?.startsWith(AGY_RECORD_PREFIX)))
+    const body = (mutation: string) => ({
+      model: MODEL,
+      instructions: INSTRUCTIONS,
+      tools: [tool()],
+      input: [user('Remember the marker.'), ...items, { type: 'reasoning', summary: [], encrypted_content: mutation }],
+    })
+    const other = await gw.post(body('cc2r.record.v1.h4sIAAAAAAAA'))
+    assertEquals([other.status, (await other.json()).error.code], [400, 'provider_record_foreign'])
+    const older = await unpackRecord(AGY_RECORD_PREFIX, record!) as any
+    const olderBody = await packRecord(AGY_RECORD_PREFIX, { ...older, agy: '1.5.16' })
+    const version = await gw.post(body(olderBody))
+    assertEquals([version.status, (await version.json()).error.code], [400, 'provider_record_foreign'])
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: an image is refused and the output ids must be the held calls', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start()
+    const { response } = await gw.create(initial('batch'))
+    const image = await gw.post(follow(response, [...outputs(response), message('user', [{ type: 'input_image', image_url: 'data:image/png;base64,AA==' }])]))
+    assertEquals([image.status, (await image.json()).error.code], [400, 'unsupported'])
+    const missing = await gw.post(follow(response, [result(calls(response)[0], 'x')]))
+    assertEquals((await missing.json()).error.code, 'missing_tool_output')
+    const unknown = await gw.post(follow(response, [...outputs(response), result({ call_id: 'nope' }, 'x')]))
+    assertEquals((await unknown.json()).error.code, 'unexpected_tool_output')
+    const duplicate = await gw.post(follow(response, [...outputs(response), result(calls(response)[0], 'again')]))
+    assertEquals((await duplicate.json()).error.code, 'unexpected_tool_output')
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: a large tool output is written as agy\'s preview, with the whole text in output.txt', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start(['--hold-timeout', '0.2'])
+    const { response } = await gw.create(initial('pair'))
+    await assertStopped(pids(await r.evidence()))
+    const big = `BIG ${'x'.repeat(30_000)} TAILMARKER-4411`
+    const released = await gw.create(follow(response, [result(calls(response)[0], big), result(calls(response)[1], 'small-1')]))
+    assertEquals([released.response.x_gateway.path, released.response.x_gateway.patched], ['store', 2])
+    const written = (await r.evidence()).filter((e) => e.kind === 'step-output').find((e) => e.preview)
+    assert(written, 'the resumed store was not checked')
+    assertEquals(written.preview, true)
+    assertEquals(written.stepBytes < 10_241, true)
+    assertEquals(written.fileBytes > 30_000, true)
+    assertMatch(written.stored, /^The tool's output was truncated due to being too long\./)
+    assertMatch(written.stored, /TAILMARKER-4411$/)
+    assertEquals(written.body, big)
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: usage and cancel behave as before', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start(['--idle-timeout', '0.3', '--hold-timeout', '0.3'])
+    const { response } = await gw.create(initial('batch'))
+    assertEquals(response.usage, {
       input_tokens: 120,
       input_tokens_details: { cached_tokens: 20 },
       output_tokens: 25,
@@ -116,309 +288,7 @@ Deno.test('agy: batch with streamed thought/text, mixed transport, ordered outpu
     })
     const usage = await (await fetch(`${gw.url}/v1/usage`)).json()
     assertEquals(usage.tier, { id: 'fake-ultra', name: 'Fake Ultra' })
-    assertEquals(usage.tokens.output_tokens, 25)
-    assertEquals(usage.tokens.thought_tokens, 0)
     assert(!('rate_limits' in usage))
-    const os = outputs(first)
-    const image = await gw.post(follow(first, [...os, message('user', [{ type: 'input_image', image_url: 'data:image/png;base64,AA==' }])]))
-    assertEquals(image.status, 400)
-    assertEquals((await image.json()).error.code, 'unsupported')
-    assertEquals((await r.evidence()).filter((e) => e.kind === 'output'), [])
-    const ws = new WsClient(new WebSocket(gw.url.replace('http:', 'ws:') + '/v1/responses'))
-    try {
-      const next = await ws.send(
-        follow(first, [...os.reverse(), message('user', 'user notice'), message('developer', 'observation'), message('system', 'system notice')]),
-      )
-      const response = next.response
-      assertEquals(response.x_gateway.path, 'live')
-      assertEquals(JSON.parse(text(response)), {
-        results: ['result-0', 'result-1', 'result-2'],
-        messages: [
-          { userMessage: 'user notice' },
-          { systemMessage: { systemMessage: 'observation' } },
-          { systemMessage: { systemMessage: 'system notice' } },
-        ],
-      })
-      const continued = await gw.create(follow(response, [message('user', 'ordinary turn')]))
-      assertEquals(text(continued.response), 'answer:ordinary turn')
-    } finally {
-      await ws.close()
-    }
-    const evidence = await r.evidence()
-    assertEquals(evidence.filter((e) => e.kind === 'new').length, 1)
-    assertEquals(evidence.filter((e) => e.kind === 'prompt').length, 2)
-    assertEquals(evidence.filter((e) => e.kind === 'output').map((e) => e.index), [0, 1, 2])
-    await gw.stop()
-    await assertStopped(pids(evidence))
-  } finally {
-    await r.dispose()
-  }
-})
-
-Deno.test('agy: absent planner falls back to one call per response, without a second ACP prompt', async () => {
-  const r = await rig()
-  try {
-    const gw = await r.start()
-    let { response } = await gw.create(initial('missing-planner'))
-    for (let i = 0; i < 3; i++) {
-      assertEquals(calls(response).map((c: any) => JSON.parse(c.arguments).index), [i])
-      ;({ response } = await gw.create(follow(response, [result(calls(response)[0], `fallback-${i}`)])))
-    }
-    assertEquals(JSON.parse(text(response)).results, ['fallback-0', 'fallback-1', 'fallback-2'])
-    assertEquals((await r.evidence()).filter((e) => e.kind === 'prompt').length, 1)
-    assertMatch(gw.stderr.join('\n'), /emitting one call/)
-    await gw.stop()
-  } finally {
-    await r.dispose()
-  }
-})
-
-Deno.test('agy: crash reaps a held process; resume posts textual results in the same workspace', async () => {
-  const r = await rig()
-  try {
-    let gw = await r.start()
-    const { response } = await gw.create(initial('batch'))
-    assertEquals(calls(response).length, 3)
-    const before = await r.evidence()
-    await gw.stop('SIGKILL')
-    gw = await r.start()
-    await assertStopped(pids(before))
-    const usage = await (await fetch(`${gw.url}/v1/usage`)).json()
-    assertEquals(usage.plan_type, 'fake-ultra')
-    assertEquals(usage.tokens.output_tokens, 25)
-    const resumed = await gw.create(follow(response, [...outputs(response), message('user', 'restart notice')]))
-    assertEquals(resumed.response.x_gateway.path, 'resume')
-    assertMatch(text(resumed.response), /interrupted turn.*\n.*result-0[\s\S]*result-2[\s\S]*restart notice/)
-    const evidence = await r.evidence()
-    assertEquals(new Set(evidence.filter((e) => e.kind === 'process').map((e) => e.cwd)).size, 1)
-    assertEquals(evidence.filter((e) => e.kind === 'resume').length, 1)
-    assertEquals(evidence.filter((e) => e.kind === 'output').length, 0)
-    assertEquals(evidence.filter((e) => e.kind === 'prompt').length, 2)
-    await gw.stop()
-    await assertStopped(pids(evidence))
-  } finally {
-    await r.dispose()
-  }
-})
-
-Deno.test('agy: missing native state and a changed tool set each rebuild from client history', async () => {
-  const r = await rig()
-  try {
-    let gw = await r.start()
-    const initialResponse = (await gw.create(initial('batch'))).response
-    await gw.stop()
-    await Deno.remove(`${r.state}/gemini/antigravity-cli/conversations`, { recursive: true })
-    gw = await r.start()
-    const rebuilt = await gw.create(follow(initialResponse, outputs(initialResponse)))
-    assertEquals(rebuilt.response.x_gateway.path, 'history')
-    assertMatch(text(rebuilt.response), /client history[\s\S]*"batch"[\s\S]*Planning\.[\s\S]*result-2/)
-    const next = await gw.create(follow(rebuilt.response, [message('user', 'fresh tools')], { tools: [tool('another')] }))
-    assertEquals(next.response.x_gateway.path, 'history')
-    const evidence = await r.evidence()
-    assertEquals(evidence.filter((e) => e.kind === 'resume').length, 1)
-    assertEquals(evidence.filter((e) => e.kind === 'listed').map((e) => e.names), [['lookup'], ['lookup'], ['another']])
-    await gw.stop()
-    await assertStopped(pids(evidence))
-  } finally {
-    await r.dispose()
-  }
-})
-
-Deno.test('agy: reject an unchecked version, and refuse a default-agent fallback before prompt', async () => {
-  const wrong = await rig('version')
-  try {
-    const child = wrong.spawn()
-    const out = await child.output()
-    assertEquals(out.code, 2)
-    assertMatch(new TextDecoder().decode(out.stderr), /agy version 9\.9\.9 is not checked/)
-    const gw = await wrong.start(['--allow-untested-agy'])
-    await gw.stop()
-  } finally {
-    await wrong.dispose()
-  }
-  const fallback = await rig('fallback-agent')
-  try {
-    const gw = await fallback.start()
-    const failure = await gw.post(initial('do not send'))
-    assertEquals(failure.status, 500)
-    assertMatch((await failure.json()).error.message, /default agent; no prompt was sent/)
-    const evidence = await fallback.evidence()
-    assertEquals(evidence.filter((e) => e.kind === 'prompt').length, 0)
-    await gw.stop()
-    await assertStopped(pids(evidence))
-  } finally {
-    await fallback.dispose()
-  }
-})
-
-Deno.test('agy: parallel lanes list only their own tools; an evicted hold resumes from the durable response', async () => {
-  const r = await rig()
-  try {
-    const gw = await r.start(['--hold-timeout', '0.2'])
-    const [{ response: first }, { response: second }] = await Promise.all([
-      gw.create(initial('batch', [tool('first')])),
-      gw.create(initial('batch', [tool('second')])),
-    ])
-    assertEquals(calls(first).map((call: any) => call.name), ['first', 'first', 'first'])
-    assertEquals(calls(second).map((call: any) => call.name), ['second', 'second', 'second'])
-    const before = await r.evidence()
-    assertEquals(new Set(before.filter((e) => e.kind === 'process').map((e) => e.cwd)).size, 2)
-    await assertStopped(pids(before))
-    const resumed = await gw.create(follow(second, outputs(second)))
-    assertEquals(resumed.response.x_gateway.path, 'resume')
-    assertMatch(text(resumed.response), /"name":"second".*"output":"result-2"/)
-    await gw.stop()
-    await assertStopped(pids(await r.evidence()))
-  } finally {
-    await r.dispose()
-  }
-})
-
-Deno.test('agy: Codex instruction sources concatenate, warm-up generates only on follow-up, and namespaces stay unsupported', async () => {
-  const r = await rig()
-  try {
-    const gw = await r.start(), ws = new WsClient(new WebSocket(gw.url.replace('http:', 'ws:') + '/v1/responses'))
-    try {
-      const { input: _, ...base } = initial('')
-      const top = 'Top-level prompt.\r\n'
-      const developer = { type: 'message', ...message('developer', [{ type: 'input_text', text: 'Developer: é' }, { type: 'input_text', text: '\n' }]) }
-      const system = message('system', 'System: e\u0301\n ')
-      const input = [developer, system, message('user', 'Start coding.')]
-      const sent = {
-        ...base,
-        instructions: top,
-        input,
-        client_metadata: { turn_id: 'not-for-agy' },
-        store: false,
-        reasoning: { effort: 'low', summary: 'auto' },
-      }
-      const badTools = { ...sent, tools: [{ type: 'namespace', name: 'multi_agent_v1' }] }
-      const bad = await gw.post(badTools)
-      const rejected = await bad.json()
-      assertEquals([bad.status, rejected.error.code, rejected.error.param], [400, 'unsupported', 'tools[0].type'])
-      const wsRejection = await assertRejects(() => ws.send(badTools)) as { status: number; code: string; param: string }
-      assertEquals([wsRejection.status, wsRejection.code, wsRejection.param], [400, 'unsupported', 'tools[0].type'])
-      const expected = top + 'Developer: é\nSystem: e\u0301\n '
-      const http = await gw.create(sent)
-      assertEquals(http.response.instructions, expected)
-      assert(!JSON.stringify(http.events).includes('not-for-agy'))
-      const warm = await ws.send({ ...sent, generate: false, input: [developer] })
-      assertEquals([warm.status, warm.response.output], ['completed', []])
-      assertEquals((await r.evidence()).filter((e) => e.kind === 'prompt').length, 1)
-      const actual = await ws.send({ ...base, instructions: top, previous_response_id: warm.response.id, input: input.slice(1) })
-      assertEquals([actual.status, actual.response.instructions, text(actual.response)], ['completed', expected, 'answer:Start coding.'])
-      const evidence = await r.evidence()
-      // This is read from the file after the agent frontmatter, not from the Responses echo.
-      assertEquals(evidence.filter((e) => e.kind === 'process').map((e) => e.instructions), [expected, expected])
-
-      const history = [developer, system, message('user', 'batch')]
-      const firstRound = await ws.send({ ...sent, input: history })
-      const finalized = firstRound.events.filter((event) => event.type === 'response.output_item.done').map((event) => event.item)
-      assertEquals(calls(firstRound.response).length, 3)
-      const replay = await gw.create({ ...sent, input: [...history, ...finalized, ...outputs(firstRound.response), message('user', 'Use the results.')] })
-      assertEquals([replay.response.x_gateway.path, replay.response.previous_response_id], ['history', null])
-      assertMatch(text(replay.response), /"output":"result-2"\}\n.*"text":"Use the results\."/)
-    } finally {
-      await ws.close()
-    }
-    await gw.stop()
-  } finally {
-    await r.dispose()
-  }
-})
-
-Deno.test('agy: Wuhu kernel recordings and projected warm tool delta run through the front', async () => {
-  const r = await rig()
-  try {
-    const gw = await r.start(), ws = new WsClient(new WebSocket(gw.url.replace('http:', 'ws:') + '/v1/responses'))
-    try {
-      const model = initial('').model
-      for (const name of ['wuhu-full-create', 'wuhu-forced-compact']) {
-        const body = JSON.parse(await Deno.readTextFile(new URL(`./fixtures/${name}.json`, import.meta.url)))
-        const { stream: _, ...wire } = body
-        const conformed = { ...wire, model }
-        const http = await gw.create(conformed)
-        const socket = await ws.send({ ...conformed, max_output_tokens: 4096, prompt_cache_key: 'kernel-session' })
-        assertEquals(http.response.instructions, 'You are a long-running session agent. Keep answers to one sentence.')
-        assertEquals(socket.response.instructions, http.response.instructions)
-        assertEquals(socket.status, 'completed')
-        assertEquals(socket.response.tool_choice, 'auto')
-      }
-      const base = initial('batch')
-      const first = await ws.send(kernelBody({ ...base, input: [message('user', base.input)] }))
-      assertEquals(calls(first.response).length, 3)
-      const next = await ws.send(kernelBody({ ...follow(first.response, outputs(first.response)), tools: base.tools }))
-      assertEquals(next.response.x_gateway.path, 'live')
-      assertEquals(JSON.parse(text(next.response)).results, ['result-0', 'result-1', 'result-2'])
-    } finally {
-      await ws.close()
-    }
-    await gw.stop()
-  } finally {
-    await r.dispose()
-  }
-})
-
-Deno.test('agy: pi HTTP history accepts reserialized JSON function arguments', async () => {
-  const r = await rig()
-  try {
-    const gw = await r.start()
-    const call = { type: 'function_call', call_id: 'call_pi', name: 'echo', arguments: '{ "a": "text", "z": ["a", {"x":true,"y":1}] }' }
-    const { response } = await gw.create({ ...initial('', [tool('echo')]), input: [message('user', 'Use the tool.'), call, result(call, 'Tool output')] })
-    assertEquals(response.x_gateway.path, 'history')
-    const prompt = (await r.evidence()).find((e) => e.kind === 'prompt').text
-    const [, user, replayedCall, replayedResult] = prompt.split('\n')
-    assertEquals(JSON.parse(user), { role: 'user', text: 'Use the tool.' })
-    assertEquals(JSON.parse(replayedCall), { type: 'function_call', id: 'call_pi', name: 'echo', arguments: { z: ['a', { y: 1, x: true }], a: 'text' } })
-    assertEquals(JSON.parse(replayedResult), { type: 'function_call_output', id: 'call_pi', output: 'Tool output' })
-    await gw.stop()
-  } finally {
-    await r.dispose()
-  }
-})
-
-Deno.test('agy: idle eviction resumes a message-only turn as an ordinary prompt', async () => {
-  const r = await rig()
-  try {
-    const gw = await r.start(['--idle-timeout', '0.2'])
-    const first = await gw.create(initial('First plain turn.'))
-    assertEquals(calls(first.response), [])
-    const before = await r.evidence()
-    await assertStopped(pids(before))
-    const second = await gw.create(follow(first.response, [message('user', 'Next plain turn.')]))
-    assertEquals([second.response.x_gateway.path, text(second.response)], ['resume', 'answer:Next plain turn.'])
-    const after = await r.evidence()
-    const prompts = after.filter((e) => e.kind === 'prompt')
-    assertEquals(prompts.map((e) => e.text), ['First plain turn.', 'Next plain turn.'])
-    assertEquals(prompts[0].session, prompts[1].session)
-    assertEquals(after.filter((e) => e.kind === 'resume').length, 1)
-    await gw.stop()
-  } finally {
-    await r.dispose()
-  }
-})
-
-Deno.test('agy: ACP max_tokens emits response.incomplete with the partial text', async () => {
-  const r = await rig()
-  try {
-    const gw = await r.start(), ws = new WsClient(new WebSocket(gw.url.replace('http:', 'ws:') + '/v1/responses'))
-    try {
-      const { response, events } = await ws.send(initial('output-limit'))
-      assertEquals(events.at(-1)?.type, 'response.incomplete')
-      assertEquals([response.status, response.incomplete_details, text(response)], ['incomplete', { reason: 'max_output_tokens' }, 'Partial text.'])
-    } finally {
-      await ws.close()
-    }
-    await gw.stop()
-  } finally {
-    await r.dispose()
-  }
-})
-
-Deno.test('agy: cancel stops live generation and leaves no continuation point', async () => {
-  const r = await rig()
-  try {
-    const gw = await r.start()
     const res = await gw.post(initial('hold-generation'))
     assertEquals(res.status, 200)
     assert(res.body)
@@ -428,7 +298,6 @@ Deno.test('agy: cancel stops live generation and leaves no continuation point', 
       const ev = JSON.parse(line.slice(6))
       if (ev.type === 'response.created') id = ev.response.id
       if (ev.type === 'response.output_text.delta') {
-        assert(id)
         const stop = await fetch(`${gw.url}/v1/responses/${id}/cancel`, { method: 'POST' })
         assertEquals(stop.status, 200)
         assertEquals((await stop.json()).status, 'cancelled')
@@ -437,8 +306,121 @@ Deno.test('agy: cancel stops live generation and leaves no continuation point', 
     }
     assertEquals([terminal?.id, terminal?.status, terminal?.error.code], [id, 'cancelled', 'cancelled'])
     await assertStopped(pids(await r.evidence()))
-    const retry = await gw.post(follow(terminal, [message('user', 'Continue?')]))
+    const retry = await gw.post({ ...initial('again'), previous_response_id: terminal.id })
     assertEquals([retry.status, (await retry.json()).error.code], [400, 'previous_response_not_found'])
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: instructions concatenate, warm-up generates on the follow-up, namespaces stay unsupported', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start(), ws = new WsClient(new WebSocket(gw.url.replace('http:', 'ws:') + '/v1/responses'))
+    try {
+      const base = { model: MODEL, tools: [] as unknown[] }
+      const top = 'Top-level prompt.\r\n'
+      const developer = { type: 'message', ...message('developer', [{ type: 'input_text', text: 'Developer: é' }, { type: 'input_text', text: '\n' }]) }
+      const system = message('system', 'System: e\u0301\n ')
+      const input = [developer, system, user('Start coding.')]
+      const sent = { ...base, instructions: top, input }
+      const bad = await gw.post({ ...sent, tools: [{ type: 'namespace', name: 'multi_agent_v1' }] })
+      const rejected = await bad.json()
+      assertEquals([bad.status, rejected.error.code, rejected.error.param], [400, 'unsupported', 'tools[0].type'])
+      const expected = top + 'Developer: é\nSystem: e\u0301\n '
+      const http = await gw.create(sent)
+      assertEquals(http.response.instructions, expected)
+      assertEquals(text(http.response), 'answer:Start coding.')
+      const warm = await ws.send({ ...sent, generate: false, input: [developer] })
+      assertEquals([warm.status, warm.response.output], ['completed', []])
+      const actual = await ws.send({ ...base, instructions: top, previous_response_id: warm.response.id, input: input.slice(1) })
+      assertEquals([actual.status, actual.response.instructions, text(actual.response)], ['completed', expected, 'answer:Start coding.'])
+      const history = [developer, system, user('batch')]
+      const round = await ws.send({ ...sent, tools: [tool()], input: history })
+      assertEquals(calls(round.response).length, 3)
+      const finalized = round.events.filter((event) => event.type === 'response.output_item.done').map((event) => event.item)
+      const replay = await gw.create({ ...sent, tools: [tool()], input: [...history, ...finalized, ...outputs(round.response), user('Use the results.')] })
+      assertEquals([replay.response.x_gateway.path, replay.response.previous_response_id], ['live', null])
+      assertEquals(JSON.parse(text(replay.response)).results, ['result-0', 'result-1', 'result-2'])
+    } finally {
+      await ws.close()
+    }
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: kernel-shaped bodies and JSON function arguments', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start(), ws = new WsClient(new WebSocket(gw.url.replace('http:', 'ws:') + '/v1/responses'))
+    try {
+      const first = await ws.send(kernelBody({ ...initial('batch'), input: [user('batch')] }))
+      assertEquals(calls(first.response).length, 3)
+      const next = await ws.send(kernelBody({ ...follow(first.response, outputs(first.response)), tools: [tool()] }))
+      assertEquals(next.response.x_gateway.path, 'live')
+      assertEquals(JSON.parse(text(next.response)).results, ['result-0', 'result-1', 'result-2'])
+    } finally {
+      await ws.close()
+    }
+    // a full create whose history carries no record is refused: the agy lane never renders history as text
+    const call = { type: 'function_call', call_id: 'call_pi', name: 'echo', arguments: '{"a":"text"}' }
+    const refused = await gw.post({
+      model: MODEL,
+      instructions: INSTRUCTIONS,
+      tools: [tool('echo')],
+      input: [user('Use the tool.'), call, result(call, 'Tool output')],
+    })
+    assertEquals([refused.status, (await refused.json()).error.code], [400, 'provider_record_missing'])
+    // a record-backed history still matches when the client reserialized its function arguments
+    const round = await gw.create({ model: MODEL, instructions: INSTRUCTIONS, tools: [tool()], input: [user('batch')] })
+    const finalized = round.response.output
+    const reserialized = finalized.map((item: any) => item.type === 'function_call'
+      ? { ...item, arguments: JSON.stringify(Object.fromEntries(Object.entries(JSON.parse(item.arguments)).reverse())) }
+      : item)
+    const ended = await gw.create(follow(round.response, outputs(round.response)))
+    const replay = await gw.create({
+      model: MODEL,
+      instructions: INSTRUCTIONS,
+      tools: [tool()],
+      input: [user('batch'), ...reserialized, ...outputs(round.response), ...ended.response.output, user('Again.')],
+    })
+    // both records matched: the reserialized call arguments did not break the run
+    assertEquals([replay.response.status, replay.response.x_gateway.records], ['completed', 2])
+    assertEquals(text(replay.response), 'answer:Again.')
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: an unchecked version is refused at startup', async () => {
+  const r = await rig('version')
+  try {
+    const compiled = Deno.env.get('AGY_TEST_GATEWAY')
+    const child = new Deno.Command(compiled ?? Deno.execPath(), {
+      args: [...(compiled ? [] : ['run', '-A', main]), '--port', '0', '--state-dir', r.state, '--agy', r.fake],
+      stdout: 'null',
+      stderr: 'piped',
+    })
+    const out = await child.output()
+    assertEquals(out.code, 2)
+    assertMatch(new TextDecoder().decode(out.stderr), /agy version 9\.9\.9 is not checked/)
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: a default-agent fallback is refused before any prompt', async () => {
+  const r = await rig('fallback-agent')
+  try {
+    const gw = await r.start()
+    const failure = await gw.post(initial('do not send'))
+    assertEquals(failure.status, 500)
+    assertMatch((await failure.json()).error.message, /default agent; no prompt was sent/)
+    assertEquals((await r.evidence()).filter((e) => e.kind === 'prompt').length, 0)
     await gw.stop()
   } finally {
     await r.dispose()

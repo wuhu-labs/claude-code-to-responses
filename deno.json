@@ -6,6 +6,7 @@
     "test": "deno test -A --no-check=remote test/",
     "test:deepseek": "deno test -A test_deepseek/",
     "probe": "deno test -A probe/",
+    "probe:agy": "deno test -A probe/agy_probe_test.ts",
     "compile": "deno compile -A --output .state/bin/claude-code-to-responses src/main.ts",
     "count-unknown-tools": "deno run --allow-read scripts/count_unknown_tools.ts",
     "compile:count-unknown-tools": "deno compile --allow-read --output .state/bin/count-unknown-tools scripts/count_unknown_tools.ts",

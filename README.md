@@ -624,9 +624,10 @@ deno task start:agy --state-dir ~/.local/state/agy-to-responses --agy ~/.local/b
 `--agy` defaults to `agy` on `PATH`; the port defaults to `18331`. `--auth-token-env VAR` adds a bearer gate.
 `--allow-untested-agy` overrides the version check, not the wire and fence checks. `--idle-timeout` and
 `--hold-timeout` evict live processes after 1800 and 600 seconds respectively by default. Each state directory
-is exclusive to one gateway; it holds request and response text, the isolated agy state, one workspace per chain,
-and the last usage report. Shutdown and eviction kill the dedicated agy process group, including its stdio and
-hook helpers. Startup reaps old groups by their state path and per-workspace agent name.
+is exclusive to one gateway. It holds the provider records (`responses/`), the one agy state folder (`gemini/`,
+whose path agy puts in every prompt), one working folder per chain (`workspaces/<chain>/`, also in the prompt), and
+the last usage report. Shutdown and eviction kill the dedicated agy process group, including its stdio and hook
+helpers. Startup reaps old groups by their state path and per-workspace agent name.
 
 Use an exact agy model selection value as `model`, such as `gemini-3.8-flash-low`. The agy model selection owns
 its effort; the Responses `reasoning.effort` and `max_output_tokens` do not configure agy. For Codex CLI, use the
@@ -635,22 +636,63 @@ The agy gateway accepts both top-level `instructions` and leading developer/syst
 It writes the top-level text first, then those messages in order, without adding separators or changing their bytes.
 Non-function tools (including a Codex `namespace` tool) are still `400 unsupported`, just as on the Claude gateway.
 
-**Tool rounds.** A `function_call` response ends as soon as the first matching MCP call is held, but it contains
-all the client calls from that inference's planner line. The first ID is ACP's `toolCallId`; later calls do not have
-ACP IDs yet, so the gateway assigns stable IDs and checks actual executions against the planned order and
-arguments. Post one output per ID (over either transport, in any order). User messages alongside outputs become
-user turns before the next inference; developer and system messages become system notices. They are queued
-before any result is released. With no pending outputs a new message goes through an ordinary ACP prompt;
-non-user roles are labeled in its text. An image anywhere in the input is `400 unsupported`. Absent or mismatched planner
-lines fall back to one call per response and a diagnostic; usage is absent where it cannot be attributed.
+**The transcript is the state; agy's store is a cache.** Every response carries a **provider record** in the same
+trailing `reasoning` item the Claude lane uses. A record holds agy's own `steps` rows that changed since the parent
+response (the prompt's user row, its planner row, its tool-call rows — including the rows the gateway itself
+completed), and, on a chain's first response, the `trajectory_meta` row and `trajectory_metadata_blob`. It never
+carries `gen_metadata` or `executor_metadata`: resume does not need them and their prompt copy is not reproducible.
+A record also carries the chain id and, on the head, its instructions, model and tools; the agy conversation id;
+how the response ended; its calls (agy's own call id and the step that holds each result); the client call ids
+bound to them; and a digest of the items it covers, with a second digest that compares function arguments as JSON
+values, so a client that reserialized them still matches.
 
-**Restart.** A `previous_response_id` continues the live process or resumes its persisted conversation in the same
-workspace. ACP does not re-issue interrupted tools; after an evicted hold or restart the gateway sends their results
-and any new messages as text in one prompt. On missing native state, changed tools/instructions/model, or a native
-session ahead of the selected response, the gateway starts a fresh native session and renders the recorded client
-history as text. An ACP resume error also takes this path. Without `previous_response_id` it always starts fresh, rendering any supplied history as text.
-This is not byte-identical replay; no Claude provider records are created. An omitted `tools` on a continuation
-inherits the last set; an explicit empty list removes it.
+Then a conversation can be reopened from the first of: **a live process** sitting at the named response (a finished
+turn takes the next prompt, a held batch its outputs), **the gateway's response store**, or **the records in the
+client's history**. The last two assemble the same thing: agy's full seven-table schema with every pragma, the
+recorded rows inserted, the same conversation id, no `brain/` folder — then `session/resume`. The chain's working
+folder, the gemini dir and the conversation id are fixed per chain and reproduced exactly, so the prompt agy renders
+(system instruction, tools, prior contents) is the one the live conversation had; only the resume notice and the
+restart prompt come after it.
+
+**Tool rounds.** A `function_call` response ends as soon as the first matching MCP call is held, and contains all the
+client calls of that inference's planner line. The first ID is ACP's `toolCallId`; later calls do not have ACP IDs
+yet, so the gateway assigns ids and agy's own ids bind to them in the record. Post one output per id (either
+transport, any order).
+
+- **Live process at the parent:** the outputs are the answers to agy's held MCP calls, exactly as agy expects;
+  user messages that came with them are injected as the `PreInvocation` hook's `injectSteps` before the next
+  inference. Nothing is restarted.
+- **No live process** (evicted, gateway restarted, state folder lost, an earlier response named): the conversation is
+  reopened only when **every output of the pending calls is in hand**. The gateway checks that the stored tail is
+  exactly the pending calls the record names (their steps, in order, with agy's call ids), writes each output into its
+  step the way agy writes a native one — status `3`, the completion timestamp, the text with agy's
+  `Created At:` / `Completed At:` header, `Executed`, the rendered markdown and the `file://…/output.txt` — resumes and
+  prompts. The messages that came with the outputs are that prompt; with none it is a single space. ACP does not
+  re-issue interrupted calls, so they are never re-run.
+- **Large outputs.** agy stores an `output.txt` whole up to 10,240 bytes and otherwise keeps a 10,240-byte preview:
+  a notice naming the file, the first ~4.9 KB, one `<truncated N of M bytes from the middle of the output>` line and
+  the last ~4.9 KB. The gateway writes exactly that preview (and the whole text to `output.txt`), so the upstream
+  tool response is the one a native call would have produced. `preview()` in `src/agy/step.ts` is the one place.
+
+An image anywhere in the input is `400 unsupported` (until images have their own issue). An absent or mismatched
+planner line still falls back to one call per response with a diagnostic; usage is absent where it cannot be
+attributed. `x_gateway` reports `path` (`new`, `live`, `store`, `history`), the chain, the conversation, how many
+records a rebuild used and how many steps it completed.
+
+**Marked cleanly.** History is never rendered as text. A full create whose history carries items no record covers,
+a record from the other lane or from another agy version, a stored tail that is not the pending calls its record
+names, and a step that is not agy 1.5.17's tool-call layout are all refused before any process starts:
+
+| Code | When |
+|---|---|
+| `provider_record_missing` | A full create's history has a response group no usable agy record covers, or the chain head carries no trajectory rows. It cannot be rebuilt as one conversation; start a new one. |
+| `provider_record_foreign` | A reasoning item in the history is the Claude lane's record, or an agy record from another agy version. |
+| `store_mismatch` | The stored tail is not the pending calls the response names, or a call has no step in the store. |
+| `step_layout_unknown` | A step that must be completed is not the tool-call layout agy 1.5.17 writes. |
+| `store_unreadable` | `500`: agy refused the conversation assembled from the records, or its store has another layout. |
+
+An omitted `tools` on a continuation inherits the chain's set; an explicit different set, a different model or
+different instructions start a new chain (`previous_response_not_found`).
 
 **Usage.** `GET /v1/usage` returns `plan_type` (agy's tier id), `tier` (`name`, `id`), and `tokens` (the last
 attributable input, cache, output and thought counts), or `null` until reported. No quota windows, reset times,
@@ -674,10 +716,12 @@ stream-json restarting with a replayed call, unlike ACP.
 
 ### agy known limits
 
-- Full-history clients that omit `previous_response_id` (such as Codex over HTTP in the trial) start a fresh agy session on each round, forfeiting native session continuity and paying to render and re-ingest the history as text.
+- A client that sends full history without provider records (Codex over HTTP in the trial, or a Wuhu forced compaction that changes the chain and resends the old history) is refused with `provider_record_missing`: the agy lane cannot rebuild a conversation across chains, and it never renders history as text. Such a client must start a new conversation.
+- agy's upstream request also carries `labels.last_execution_id` from its `executor_metadata`, which the gateway does not record: a rebuilt request differs there (and in its request identity fields) from the live one. System instruction, tools and prior contents are identical.
 - The custom agent limits exposed tools but is not an OS sandbox. agy still supplies base-prompt text and may declare a few small built-ins; read-only built-ins need not send a permission request. Tool schemas must be accepted by Gemini (the probe's array without `items` failed). The planner does not control agy's internal autonomous inferences.
 - The real Mac trial confirmed the fence, 52 planner lines for 52 responses, long holds, steering, resume, eviction, concurrent conversations and usage on 1.5.17. Codex 0.153 completed a full-history tool conversation in that trial with function tools and neutral trial instructions; its stock identity prompt was not sent to agy. The automated suite uses `test/fixtures/fake_agy.ts`, not the real binary.
-- The real ACP error for a lost native conversation and the behavior of `session/resume` with a missing agent file have not been measured. The fake covers the history rebuild on an ACP resume error. Startup rewrites the agent file and checks the current process's own log for default-agent fallback.
+- The pinned layout is measured on 1.5.17 only: the DDL, the step field numbers and the preview rule are constants of that version, and another version's store is refused rather than patched. Startup rewrites the agent file and checks the current process's own log for default-agent fallback.
+- The model cannot read `output.txt` with the fenced tool set: asked for the middle of a 300 KB result it tried `list_resources`/`read_resource` and reported that it only had the preview.
 
 ## Tests
 
@@ -692,6 +736,8 @@ to use a different install (for example `CLAUDE_BINARY=$PWD/.state/vendors/claud
 The probes use the same setting. The binary must still be 2.1.322. Gateway tests isolate state under `.state/`, with
 working folders under `/tmp/cc2r-test`. Each probe owns a unique `/tmp/cc2r-probe-*` root for its configuration, logs
 and working folders; cleanup removes only that root. Tests use ports 18300-18399 and fail if any Claude Code process outlives them.
+
+`test/agy_test.ts` runs the agy lane against `test/fixtures/fake_agy.ts`, a strict ACP double that keeps a **real SQLite store** in agy 1.5.17's layout and recreates the planner transcript on resume. One conversation runs live and again with an eviction, a gateway restart that keeps the store and a restart that loses the whole state folder; every prompt's evidence carries what agy would render upstream, and the last turn's rows must be the live run's, apart from the resume notices. The same suite covers a held batch released by a live process, a restart during a hold (the gateway's step write, checked by the double), the preview for a 30 KB output, the typed refusals above and the shared 400s. `deno task probe:agy` is the per-release run against the real binary and its `--cloud_code_endpoint` capture.
 
 The byte assertions (`test/core_test.ts`, `test/hold_test.ts`, `test/matrix_test.ts`) run over both HTTP/SSE and
 persistent WebSockets: one conversation runs twice,

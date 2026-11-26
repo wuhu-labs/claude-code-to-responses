@@ -1,5 +1,6 @@
 import type { InItem } from './api/request.ts'
-import { ItemDigest } from './records.ts'
+import { recordLogTemplates } from './replay.ts'
+import { ItemDigest, type ProviderRecord } from './records.ts'
 
 export type CallAliases = [string, string][]
 
@@ -32,4 +33,23 @@ export function matchItems(
   const next = [...map.entries()]
   const { digest, jsonArgumentDigest } = new ItemDigest(remapItems(items, next)).finish()
   return record.digest === digest || (record.jsonArgumentDigest !== undefined && record.jsonArgumentDigest === jsonArgumentDigest) ? next : null
+}
+
+/** The Claude lane's provider call ids: its logged tool_use blocks, in order, minus the calls it answered natively. */
+export function providerCallIds(record: ProviderRecord): string[] {
+  const calls: string[] = []
+  const native = new Set(record.nativeCalls ?? [])
+  for (const line of recordLogTemplates(record)) {
+    const entry = JSON.parse(line.text)
+    if (entry.type !== 'assistant' || !Array.isArray(entry.message?.content)) continue
+    for (const block of entry.message.content) {
+      if (block.type === 'tool_use' && typeof block.id === 'string' && !native.has(block.id)) calls.push(block.id)
+    }
+  }
+  return calls
+}
+
+/** The Claude lane's record matching: its provider ids come from the log the record carries. */
+export function matchRecordItems(items: InItem[], record: ProviderRecord, aliases: CallAliases): CallAliases | null {
+  return matchItems(items, record, providerCallIds(record), aliases)
 }

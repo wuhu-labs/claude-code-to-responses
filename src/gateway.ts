@@ -1,9 +1,9 @@
-import { replayLog, recordLogTemplates } from './replay.ts'
+import { replayLog } from './replay.ts'
 // Routes each Responses request to a lane: the live process when it sits at the previous response, otherwise a
 // process rebuilt from the response store or from the client's history and the provider records it carries.
 import type { InItem, NormRequest, Part } from './api/request.ts'
 import { type EventSink, GatedSink, ResponseState, SseSink } from './api/stream.ts'
-import { type CallAliases, matchItems, remapItems } from './call_ids.ts'
+import { type CallAliases, providerCallIds, remapItems } from './call_ids.ts'
 import { Bridge } from './bridge.ts'
 import { Chains, type Reservation } from './chains.ts'
 import {
@@ -372,7 +372,7 @@ export class Gateway {
       session: (record) => record.session,
       // Continuation records omit instructions: the chain key already covers them.
       continues: (r) => r.chain === chain.key && (r.instructions === undefined || r.instructions === chain.instructions),
-      providerCalls,
+      providerCalls: providerCallIds,
       state: async (record, items, aliases) => {
         try {
           return replayLog(record, this.store, remapItems(items, aliases))
@@ -616,19 +616,7 @@ async function clientRecord(s: string): Promise<ProviderRecord | null> {
   }
 }
 
-/** The provider tool_use ids behind a record's client calls, in order: what a client's call ids are matched against. */
-function providerCalls(record: ProviderRecord): string[] {
-  const calls: string[] = []
-  const native = new Set(record.nativeCalls ?? [])
-  for (const line of recordLogTemplates(record)) {
-    const entry = JSON.parse(line.text)
-    if (entry.type !== 'assistant' || !Array.isArray(entry.message?.content)) continue
-    for (const block of entry.message.content) {
-      if (block.type === 'tool_use' && typeof block.id === 'string' && !native.has(block.id)) calls.push(block.id)
-    }
-  }
-  return calls
-}
+
 
 /**
  * What the new input asks of Claude Code given where its log stops. A new turn must carry something (`isNew`; a

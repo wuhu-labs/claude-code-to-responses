@@ -6,7 +6,7 @@ import { Chains, type Reservation } from '../chains.ts'
 import { asGatewayError, GatewayError, invalid, previousResponseNotFound, serverError, unsupported } from '../errors.ts'
 import { type Group, matchHistory, segment } from '../history.ts'
 import { type CallAliases, remapItems } from '../call_ids.ts'
-import { ItemDigest, RecordError } from '../records.ts'
+import { ItemDigest, RECORD_PREFIX, RecordError } from '../records.ts'
 import { handler, type ResponsesEndpoint } from '../server.ts'
 import { RecordStore } from '../store.ts'
 import { agyEnvironment, reapOrphans } from './acp.ts'
@@ -319,7 +319,14 @@ export class AgyGateway implements ResponsesEndpoint {
       }
       if (path === 'live' && delivery.kind === 'outputs') {
         const notices = req.input.filter((it) => it.kind === 'message') as Extract<InItem, { kind: 'message' }>[]
-        await lane.continue(attempt, delivery.outputs, injection(notices))
+        // The inputs are canonicalised to agy's call ids; the live process's calls are the client's.
+        const results = new Map<string, string>()
+        for (const [client, provider] of head?.callAliases ?? []) {
+          const value = delivery.outputs.get(provider)
+          if (value !== undefined) results.set(client, value)
+        }
+        for (const [id, value] of delivery.outputs) if (!results.has(id)) results.set(id, value)
+        await lane.continue(attempt, results, injection(notices))
         return
       }
       const prompt = delivery.kind === 'turn' ? delivery.text : (delivery.messages ?? ' ')
@@ -359,6 +366,9 @@ export class AgyGateway implements ResponsesEndpoint {
     const { groups } = segment(req.input)
     const match = await matchHistory<AgyRecord, null>(groups, req.input, {
       decode: async (content) => {
+        if (content.startsWith(RECORD_PREFIX)) {
+          throw invalid('input', "A provider record in the history belongs to the other lane; this gateway continues agy conversations only.", 'provider_record_foreign')
+        }
         try {
           return await decodeAgyRecord(content)
         } catch (e) {
@@ -644,7 +654,7 @@ function deliveryFor(head: AgyRecord | null, input: InItem[]): Delivery {
   input.forEach((it, i) => {
     if (it.kind === 'function_call_output') {
       if (!want.has(it.callId)) throw invalid(`input[${i}].call_id`, `No tool call '${it.callId}' is waiting for output.`, 'unexpected_tool_output')
-      if (outputs.has(it.callId)) throw invalid(`input[${i}].call_id`, `Duplicate output for '${it.callId}'.`)
+      if (outputs.has(it.callId)) throw invalid(`input[${i}].call_id`, `Duplicate output for '${it.callId}'.`, 'unexpected_tool_output')
       outputs.set(it.callId, text(it.parts))
     } else if (it.kind === 'message' && it.role === 'user') {
       if (it.parts.some((p) => p.type === 'text' && p.text.trim() !== '')) messages.push(text(it.parts))
