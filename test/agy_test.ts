@@ -991,6 +991,144 @@ Deno.test('agy: calls agy bound to one provider id fail the response instead of 
   }
 })
 
+/** The step indexes a conversation's store holds right now. */
+function storedIndexes(state: string, conversation: string): number[] {
+  const db = new DatabaseSync(`${state}/gemini/antigravity-cli/conversations/${conversation}.db`, { readOnly: true })
+  try {
+    return readSteps(db).map((row) => row.idx)
+  } finally {
+    db.close()
+  }
+}
+
+/** The full history a client resends for one agy response: its user turn, the response's items and its own record. */
+function historyOf(prompt: string, response: any, record: string, extra: unknown[] = []) {
+  const items = response.output.filter((item: any) => !(item.type === 'reasoning' && item.encrypted_content?.startsWith(AGY_RECORD_PREFIX)))
+  return { model: MODEL, instructions: INSTRUCTIONS, tools: [tool()], input: [user(prompt), ...items, { type: 'reasoning', summary: [], encrypted_content: record }, ...extra] }
+}
+
+Deno.test('agy: a torn cache file is a miss — the transcript rebuilds, the file is refilled and the next restart works', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start(['--idle-timeout', '0.2'])
+    const first = await gw.create(initial('Remember the marker TORN-9001.'))
+    await assertStopped(pids(await r.evidence()))
+    const record = first.response.output.find((item: any) => item.type === 'reasoning' && item.encrypted_content)?.encrypted_content
+    const responses = `${r.state}/responses`
+    // the cache's copy of this response is torn bytes, and a sibling response must survive untouched
+    const sibling = `${responses}/resp_a_sibling.json`
+    await Deno.writeTextFile(sibling, '{"not":"a record"}')
+    await Deno.writeTextFile(`${responses}/${first.response.id}.json`, `${AGY_RECORD_PREFIX}not json at all`)
+    const rebuilt = await gw.create(historyOf('Remember the marker TORN-9001.', first.response, record, [user('Again.')]))
+    assertEquals([rebuilt.response.status, rebuilt.response.x_gateway.path], ['completed', 'history'])
+    // refilled by the id the request named, as a valid record again
+    const refilled = JSON.parse(await Deno.readTextFile(`${responses}/${first.response.id}.json`))
+    assertEquals(refilled.id, first.response.id)
+    assertEquals(await Deno.readTextFile(sibling), '{"not":"a record"}')
+    // and the next restart serves a delta from that refilled cache
+    await assertStopped(pids(await r.evidence()))
+    await gw.stop()
+    const next = await r.start()
+    const delta = await next.create(follow(rebuilt.response, [user('Once more.')]))
+    assertEquals([delta.response.status, delta.response.x_gateway.path], ['completed', 'store'])
+    await next.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test("agy: a torn ancestor does not stop the live parent, and a rebuild without the chain asks for the history", async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start(['--idle-timeout', '0.2'])
+    const first = await gw.create(initial('Remember one.'))
+    const second = await gw.create(follow(first.response, [user('Second turn.')]))
+    assertEquals(second.response.x_gateway.path, 'live')
+    await Deno.writeTextFile(`${r.state}/responses/${first.response.id}.json`, '{torn')
+    // the healthy process at the parent serves the delta; the torn ancestor is only a cache miss
+    const third = await gw.create(follow(second.response, [user('Third turn.')]))
+    assertEquals([third.response.status, third.response.x_gateway.path], ['completed', 'live'])
+    // with the process gone, a delta needs the chain: the client is told to resend the history
+    await assertStopped(pids(await r.evidence()))
+    const refused = await gw.post(follow(third.response, [user('Again.')]))
+    assertEquals([refused.status, (await refused.json()).error.code], [400, 'previous_response_not_found'])
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: a `store` rebuild assembles the cached rows, a `history` rebuild the transcript\'s', async () => {
+  const a = await rig(), b = await rig()
+  try {
+    const mark = async (r: Awaited<ReturnType<typeof rig>>, gw: any, extra: boolean) => {
+      const first = await gw.create(initial('Remember the marker MARK-3300.'))
+      await assertStopped(pids(await r.evidence()))
+      const record = first.response.output.find((item: any) => item.type === 'reasoning' && item.encrypted_content)?.encrypted_content
+      const path = `${r.state}/responses/${first.response.id}.json`
+      const copy = JSON.parse(await Deno.readTextFile(path))
+      const marker = Math.max(...copy.steps.map((step: any) => step.idx)) + 7
+      if (extra) {
+        // the cache's copy carries a row the transcript never had; a store rebuild must assemble it
+        copy.steps.push({ ...copy.steps.find((step: any) => step.step_type === 15), idx: marker })
+        await Deno.writeTextFile(path, JSON.stringify(copy))
+      } else {
+        // torn: the transcript is the only state there is
+        await Deno.writeTextFile(path, '{torn')
+      }
+      const rebuilt = await gw.create(historyOf('Remember the marker MARK-3300.', first.response, record, [user('Again.')]))
+      return { marker, rebuilt, conversation: rebuilt.response.x_gateway.conversation }
+    }
+    const fromStore = await a.start(['--idle-timeout', '0.2']).then((gw) => mark(a, gw, true).then((out) => ({ gw, out })))
+    assertEquals([fromStore.out.rebuilt.response.status, fromStore.out.rebuilt.response.x_gateway.path], ['completed', 'store'])
+    assert(storedIndexes(a.state, fromStore.out.conversation).includes(fromStore.out.marker), "the store rebuild did not assemble the cached row")
+    await fromStore.gw.stop()
+    const fromHistory = await b.start(['--idle-timeout', '0.2']).then((gw) => mark(b, gw, false).then((out) => ({ gw, out })))
+    assertEquals([fromHistory.out.rebuilt.response.status, fromHistory.out.rebuilt.response.x_gateway.path], ['completed', 'history'])
+    assertEquals(storedIndexes(b.state, fromHistory.out.conversation).includes(fromHistory.out.marker), false, "the history rebuild assembled a row the transcript never had")
+    await fromHistory.gw.stop()
+  } finally {
+    await a.dispose()
+    await b.dispose()
+  }
+})
+
+Deno.test('agy: a completed step between the pending calls is refused before any write', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start(['--hold-timeout', '0.2'])
+    const { response } = await gw.create(initial('batch'))
+    await assertStopped(pids(await r.evidence()))
+    const conversation = response.x_gateway.conversation
+    const db = `${r.state}/gemini/antigravity-cli/conversations/${conversation}.db`
+    const record = response.output.find((item: any) => item.type === 'reasoning' && item.encrypted_content)?.encrypted_content
+    const decoded = await unpackRecord(AGY_RECORD_PREFIX, record!) as any
+    const calls = decoded.calls as any[]
+    // a completed step sits between the first pending call and the second one: the store's final slice is not the
+    // pending calls, even though no step follows them
+    const cut = calls[1].step
+    const planner = decoded.steps.find((step: any) => step.step_type === 15)
+    const steps = [
+      ...decoded.steps.filter((step: any) => step.idx < cut),
+      { ...planner, idx: cut },
+      ...decoded.steps.filter((step: any) => step.idx >= cut).map((step: any) => ({ ...step, idx: step.idx + 1 })),
+    ]
+    const moved = calls.map((call) => (call.step >= cut ? { ...call, step: call.step + 1 } : call))
+    const tampered = await packRecord(AGY_RECORD_PREFIX, { ...decoded, steps, calls: moved })
+    const before = createHash('sha256').update(await Deno.readFile(db)).digest('hex')
+    const processes = (await r.evidence()).filter((e) => e.kind === 'process').length
+    // the cache's copy is torn, so the transcript's rows are the ones the rebuild uses
+    await Deno.writeTextFile(`${r.state}/responses/${response.id}.json`, '{torn')
+    const refused = await gw.post(historyOf('batch', response, tampered, [...outputs(response), user('Again.')]))
+    assertEquals([refused.status, (await refused.json()).error.code], [400, 'store_mismatch'])
+    assertEquals(createHash('sha256').update(await Deno.readFile(db)).digest('hex'), before, 'the refused request wrote to the store')
+    assertEquals((await r.evidence()).filter((e) => e.kind === 'process').length, processes, 'the refused request started a process')
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
 Deno.test('agy: a second create on a chain in progress is 409 conversation_busy', async () => {
   const r = await rig()
   try {

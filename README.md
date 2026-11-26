@@ -665,7 +665,10 @@ transport, any order).
 - **Routing order, every request:** a live process sitting exactly at the named parent, else the gateway's store, else
   the records in the request's history. The store is a cache in both directions: one that has lost an ancestor still
   serves the live process (a record's rows are complete for what it wrote, and rows below them cannot change), and a
-  stored copy that fails validation is dropped and refilled from the transcript, which then reports `history`.
+  stored copy that is absent, torn (not JSON at all) or fails validation is a miss, refilled from the transcript by the
+  id the request named; the transcript is validated in full first, so a defective client record is never rescued by a
+  cache hit. A rebuild needs the whole chain: a delta whose chain is incomplete and whose parent has no live process
+  answers `previous_response_not_found`, and the client resends the history.
 - **No live process** (evicted, gateway restarted, state folder lost, an earlier response named): the conversation is
   reopened only when **every output of the pending calls is in hand**. The gateway checks that the stored tail is
   exactly the pending calls the record names (their steps, in order, with agy's call ids), writes each output into its

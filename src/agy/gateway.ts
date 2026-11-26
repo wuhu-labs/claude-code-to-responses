@@ -220,9 +220,15 @@ export class AgyGateway implements ResponsesEndpoint {
     let input = req.input
     let cached = prev !== null
     let identity: Identity | null = null
+    let complete = true
     if (prev) {
-      chainRecords = this.chainUpTo(prev)
+      const walked = this.chainUpTo(prev)
+      chainRecords = walked.records
+      complete = walked.complete
       identity = this.identityOf(chainRecords, laneAt)
+      // A delta needs the whole stored chain or the live process at its parent. Without either, nothing here can be
+      // reproduced: the client resends the history instead of being served a partial conversation.
+      if (!complete && !laneAt) throw previousResponseNotFound(prev.id, 'its chain is incomplete in the gateway store; send the full history')
       if (identity && !continues(identity, req)) {
         throw previousResponseNotFound(prev.id, 'instructions, tools or the model changed, which starts a new agy chain; send a create without history')
       }
@@ -240,29 +246,31 @@ export class AgyGateway implements ResponsesEndpoint {
       if (match.synth.length) {
         throw invalid('input', 'The history carries responses this lane cannot place in one conversation; start a new conversation.', 'provider_record_missing')
       }
-      // The history's records are the state and the rows a rebuild uses. The store is a cache: a copy it holds is
-      // read (and validated) to decide whether this is a store-route hit, and a copy that fails is dropped so this
-      // rebuild puts the transcript's own record back in its place — a corrupt cache never decides a request.
-      let copies = 0
-      for (const record of match.records) {
-        const copy = this.records.get(record.id)
-        if (!copy) continue
+      // The supplied transcript is validated first and in full: a defective client record — a head without its
+      // trajectory blob, a tail that is not the pending calls — is refused even when the cache holds a good copy.
+      this.planRebuild(match.records, match.head, deliveryFor(match.head, match.tail))
+      // The supplied transcript is validated first (matchRecords read every record through the validator) and stays
+      // the state: a defective client record is never rescued by a cache hit. The cache's copies are read tolerantly
+      // — absent, torn or unusable is a miss — and only when every record has a valid copy do those copies serve the
+      // rebuild, which is what makes the `store` label true.
+      const copies = match.records.map((record) => {
+        const copy = this.cached(record.id)
+        if (!copy) return null
         try {
-          this.stored(copy)
-          copies++
+          return this.stored(copy)
         } catch {
-          this.records.remove(copy.id)
+          return null
         }
-      }
-      chainRecords = match.records
-      cached = copies === chainRecords.length
-      head = match.head
+      })
+      cached = copies.every((copy) => copy !== null)
+      chainRecords = cached ? copies as AgyRecord[] : match.records
+      head = chainRecords[chainRecords.length - 1]
       chain = head.chain
       input = match.tail
       // a cancelled request must not touch the store: the client is gone and the chain's live process must survive
       if (sink.isClosed) return
-      // a rebuild refills the store, so the next previous_response_id finds the whole chain
-      for (const record of chainRecords) if (!this.records.has(record.id)) this.records.put(record)
+      // every miss is refilled by the id the request named, over whatever bytes stood there: the cache is the cache
+      if (!cached) for (let i = 0; i < match.records.length; i++) if (!copies[i]) this.records.put(match.records[i])
     }
     identity ??= this.identityOf(chainRecords, laneAt)
     const instructions = identity?.instructions ?? req.instructions
@@ -321,6 +329,10 @@ export class AgyGateway implements ResponsesEndpoint {
         lane.head = head.id
         path = 'live'
       } else {
+        // a rebuild is only correct from the chain's first record; a partial one would assemble a partial store
+        if (previous !== null && !complete) {
+          throw previousResponseNotFound(previous, 'its chain is incomplete in the gateway store; send the full history')
+        }
         if (abandoned()) return
         await this.chains.evict(chain, 'superseded')
         if (abandoned()) return
@@ -393,28 +405,29 @@ export class AgyGateway implements ResponsesEndpoint {
   }
 
   /**
-   * The stored chain ending at `prev`, as far back as the store still has it. A missing or unusable ancestor is a
-   * cache miss: the parent record and the live process are the state a request at `prev` actually needs.
+   * The stored chain ending at `prev`, as far back as the cache still has it. A missing, torn or unusable ancestor is
+   * a cache miss: `complete` says whether the walk reached the chain's first record, and a live process at the parent
+   * can still serve a partial chain.
    */
-  private chainUpTo(prev: AgyRecord): AgyRecord[] {
+  private chainUpTo(prev: AgyRecord): { records: AgyRecord[]; complete: boolean } {
     const out: AgyRecord[] = [prev]
     const seen = new Set<string>([prev.id])
     let cur = prev
     while (cur.prev !== null) {
-      if (seen.has(cur.prev)) break
-      const stored = this.records.get(cur.prev)
-      if (!stored) break
+      if (seen.has(cur.prev)) return { records: out.reverse(), complete: false }
+      const cached = this.cached(cur.prev)
+      if (!cached) return { records: out.reverse(), complete: false }
       let record: AgyRecord
       try {
-        record = this.stored(stored)
+        record = this.stored(cached)
       } catch {
-        break
+        return { records: out.reverse(), complete: false }
       }
       seen.add(record.id)
       out.push(record)
       cur = record
     }
-    return out.reverse()
+    return { records: out.reverse(), complete: true }
   }
 
   /** The live process sitting exactly at a response, if any: the only process a request at it can reuse. */
@@ -430,10 +443,22 @@ export class AgyGateway implements ResponsesEndpoint {
     return lane ? { instructions: lane.instructions, model: lane.model, tools: lane.tools } : null
   }
 
-  /** A stored response by id, validated; null when the store has none. */
+  /** A stored response by id, validated; null when the store has none or its file is torn (a cache miss). */
   private byId(id: string): AgyRecord | null {
-    const record = this.records.get(id)
+    const record = this.cached(id)
     return record === null ? null : this.stored(record)
+  }
+
+  /**
+   * A record as the cache has it, or null when the file is absent or not JSON: a torn file is a cache miss, never an
+   * internal error, and the caller refills it by the id it asked for (never by an id read out of broken bytes).
+   */
+  private cached(id: string): AgyRecord | null {
+    try {
+      return this.records.get(id)
+    } catch {
+      return null
+    }
   }
 
   /** A record the gateway stored itself, re-validated: the store is a cache, never a bypass of the record rules. */
@@ -505,8 +530,11 @@ export class AgyGateway implements ResponsesEndpoint {
     return { records, head: records[records.length - 1] ?? null, tail: match.tail, synth: match.synth }
   }
 
-  /** A lane at a record's conversation: the store assembled from the chain's records, with pending calls completed. */
-  private laneFromRecords(chain: string, identity: Identity, chainRecords: AgyRecord[], head: AgyRecord, delivery: Delivery): { lane: Lane; patched: number } {
+  /**
+   * What a rebuild of this chain would write, and every check that must pass before it does: the chain's trajectory,
+   * the terminal slice of pending calls, and the step layout of each output. Pure — it plans, it does not touch disk.
+   */
+  private planRebuild(chainRecords: AgyRecord[], head: AgyRecord, delivery: Delivery): { conversation: string; steps: StepsRow[]; files: { path: string; content: Uint8Array }[] } {
     if (this.version !== AGY_VERSION) {
       throw serverError('store_unreadable', `agy ${this.version} is not the measured ${AGY_VERSION}: its store is never assembled or patched.`)
     }
@@ -520,11 +548,11 @@ export class AgyGateway implements ResponsesEndpoint {
     if (!recorded.blob) {
       throw invalid('input', 'The chain head record carries no trajectory blob, so its store cannot be rebuilt: the prompt would differ.', 'provider_record_missing')
     }
-    const trajectory = trajectoryFromJson(recorded)
+    trajectoryFromJson(recorded)
     const steps = [...rows.values()].sort((a, b) => a.idx - b.idx)
     const pending = steps.filter((row) => row.step_type === 132 && (row.status === 1 || row.status === 2))
     // Before any write: the store's pending calls are exactly the ones the record names, call id, name and
-    // conversation included. A pending step the record does not name would be cancelled by agy's own resume.
+    // conversation included, and they are its terminal slice — agy's resume opens whatever the store ends with.
     if (head.end === 'calls') {
       if (delivery.kind !== 'outputs') throw invalid('input', 'The response holds tool calls whose outputs are missing.', 'missing_tool_output')
       if (pending.length !== head.calls.length) {
@@ -539,12 +567,12 @@ export class AgyGateway implements ResponsesEndpoint {
           throw invalid('input', `The stored step ${row.idx} is not the pending call '${call.id}' in this conversation.`, 'store_mismatch')
         }
       }
-      // The named calls are the tail of the store: a step after them means the record is not what the store ended on,
-      // and agy's resume would open a conversation the response does not describe.
-      const last = pending[pending.length - 1].idx
-      const after = steps.find((row) => row.idx > last)
-      if (after) {
-        throw invalid('input', `The store holds a step ${after.idx} after the pending calls this response names.`, 'store_mismatch')
+      // The named calls must be the store's exact terminal slice: nothing after them, nothing between them (a completed
+      // step there means the response does not describe how the store ends).
+      const named = head.calls.map((call) => call.step)
+      const tail = steps.slice(steps.length - named.length)
+      if (tail.length !== named.length || tail.some((row, i) => row.idx !== named[i])) {
+        throw invalid('input', `The store does not end with the pending calls this response names (${tail.map((row) => row.idx).join(', ')}).`, 'store_mismatch')
       }
     } else if (pending.length) {
       throw invalid('input', `The store holds ${pending.length} pending tool steps, but the response names no pending call.`, 'store_mismatch')
@@ -569,12 +597,19 @@ export class AgyGateway implements ResponsesEndpoint {
         files.push({ path: file.path, content: outputFileText(output) })
       }
     }
-    this.store.assemble(conversation, { steps: [...rows.values()].sort((a, b) => a.idx - b.idx), trajectory })
-    for (const file of files) {
+    return { conversation, steps: [...rows.values()].sort((a, b) => a.idx - b.idx), files }
+  }
+
+  /** A lane at a record's conversation: the store assembled from the chain's records, with pending calls completed. */
+  private laneFromRecords(chain: string, identity: Identity, chainRecords: AgyRecord[], head: AgyRecord, delivery: Delivery): { lane: Lane; patched: number } {
+    const plan = this.planRebuild(chainRecords, head, delivery)
+    const recorded = chainRecords[0].trajectory!
+    this.store.assemble(plan.conversation, { steps: plan.steps, trajectory: trajectoryFromJson(recorded) })
+    for (const file of plan.files) {
       Deno.mkdirSync(dirname(file.path), { recursive: true, mode: 0o700 })
       Deno.writeFileSync(file.path, file.content, { mode: 0o600 })
     }
-    return { lane: this.launch(chain, identity.model, identity.instructions, identity.tools), patched: files.length }
+    return { lane: this.launch(chain, identity.model, identity.instructions, identity.tools), patched: plan.files.length }
   }
 
   /**
