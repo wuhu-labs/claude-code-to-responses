@@ -21,7 +21,9 @@ if (
 ) throw new Error('wrong agy flags')
 const cwd = Deno.cwd()
 const app = `${gemini}/antigravity-cli`
-const evidence = `${gemini}/fake-evidence.jsonl`
+// The evidence is the test's own record of what the model was shown; it lives where the test says, never inside the
+// state folder the lost-store cases delete.
+const evidence = Deno.env.get('FAKE_AGY_EVIDENCE') ?? `${gemini}/fake-evidence.jsonl`
 const record = (kind: string, data: Record<string, unknown> = {}) =>
   Deno.writeTextFileSync(evidence, JSON.stringify({ kind, ...data }) + '\n', { append: true })
 const config = JSON.parse(await Deno.readTextFile(`${gemini}/config/mcp_config.json`))
@@ -114,8 +116,8 @@ function appendTranscript(brief: unknown, full = brief) {
 
 const dbPath = () => `${conversations}/${session}.db`
 const second = () => Math.floor(Date.now() / 1000)
-const stamp = (): Field[] => [{ field: 1, wt: 0, value: second() }, { field: 2, wt: 0, value: 1_000_000 }]
-const int = (field: number, value: number): Field => ({ field, wt: 0, value })
+const stamp = (): Field[] => [{ field: 1, wt: 0, value: BigInt(second()) }, { field: 2, wt: 0, value: 1_000_000n }]
+const int = (field: number, value: number): Field => ({ field, wt: 0, value: BigInt(value) })
 const str = (field: number, value: string): Field => ({ field, wt: 2, value: new TextEncoder().encode(value) })
 const sub_ = (field: number, tree: Field[]): Field => ({ field, wt: 2, value: encode(tree) })
 
@@ -330,7 +332,8 @@ const plannerCall = (name: string, i: number, full: boolean) => ({
 function planCalls(name: string, count: number): { idx: number; id: string; args: Record<string, unknown>; i: number }[] {
   const planned = []
   for (let i = 0; i < count; i++) {
-    const id = `call_${session.replaceAll('-', '')}_${++toolNum}`
+    // `alias-conflict`: agy wrote two client calls under one provider call id, which a record cannot express
+    const id = mode === 'alias-conflict' && i > 0 ? `call_${session.replaceAll('-', '')}_${toolNum}` : `call_${session.replaceAll('-', '')}_${++toolNum}`
     const args = rawArgs(i)
     const args140 = Object.entries({ toolSummary: args.toolSummary, ...Object.fromEntries(Object.entries(args).filter(([k]) => k !== 'toolSummary')) })
       .map(([k, v]) => sub_(1, [str(1, k), str(2, typeof v === 'string' ? v : JSON.stringify(v))]))
@@ -435,6 +438,9 @@ function visibleRows(): string[] {
       const render = message(sub(payload, 140), 2)
       const output = render ? text(render, 1) : null
       shown = output === null ? '' : output.replace(/^Created At: [^\n]*\nCompleted At: [^\n]*\n/, '')
+    } else if (row.step_type === 14) {
+      // a user turn keeps its text in its step metadata (5.19.2); the planner line keeps it in the payload (19.2)
+      shown = text(sub(message(payload, 5) ?? [], 19), 2) ?? ''
     } else {
       shown = text(sub(payload, 19), 2) ?? ''
     }
@@ -444,6 +450,9 @@ function visibleRows(): string[] {
 
 let recovered: string[] = []
 
+/** What the model sees for the inference about to start: the whole transcript, in store order. */
+const inference = () => record('inference', { session, visible: visibleRows(), steps: rows.size })
+
 async function prompt(id: unknown, promptText: string) {
   if (prompting) throw new Error('overlapping ACP prompts')
   prompting = true
@@ -452,6 +461,7 @@ async function prompt(id: unknown, promptText: string) {
   appendTranscript({ step_index: step, type: 'USER_INPUT', content: promptText })
   step++
   flush()
+  inference()
   await invoke(0)
   if (promptText === 'hold-generation') {
     await chunk('agent_message_chunk', 'Still generating.')
@@ -475,6 +485,8 @@ async function prompt(id: unknown, promptText: string) {
     const results = []
     for (const call of planned) results.push(await issue(call, name))
     const messages = await invoke(1)
+    // the second inference of this prompt follows the tool results: snapshot what the model sees then
+    inference()
     answer = JSON.stringify({ results, messages })
   }
   planner(step, answer, '', null)
@@ -550,6 +562,7 @@ for await (const line of lines(Deno.stdin.readable)) {
     }
     case 'session/set_config_option':
       if (p.sessionId !== session || p.configId !== 'model' || p.value !== 'gemini-3.8-flash-low') throw new Error('wrong model selection')
+      record('config', { model: p.value })
       await reply(msg.id, {})
       break
     case 'session/prompt':

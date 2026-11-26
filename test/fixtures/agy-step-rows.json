@@ -1,0 +1,82 @@
+{
+ "from": "a fake-agy conversation store (agy 1.5.17 layout), rows as agy wrote them",
+ "rows": [
+  {
+   "idx": 0,
+   "step_type": 14,
+   "status": 3,
+   "has_subtrajectory": 0,
+   "metadata": "CgoI35Wg2AYQwIQ9GAJYqApiJDlmZGUxMzRkLTY1ZGEtNGNhYS05MGI2LTMwZTc2NTRjNmM1YaIBUAokZDUyNTQ2NzQtZDIyYi00ODhlLTk5MjktNDc3MmY3ZWNlMjNhEAAYAiIkMWFmNzNlNjQtNTU3Ni00MjhlLWE0NTQtZGUyYmUwYjYyMGFkmgIgN2FhOWVlNDQwODFlNDBiYWFkZTZiMTM5OGVhODU0NTSwAgOaAQcSBWJhdGNo",
+   "error_details": null,
+   "permissions": null,
+   "task_details": null,
+   "render_info": null,
+   "step_payload": "CA4gAyq6AQoKCN+VoNgGEMCEPRgCWKgKYiQ5ZmRlMTM0ZC02NWRhLTRjYWEtOTBiNi0zMGU3NjU0YzZjNWGiAVAKJGQ1MjU0Njc0LWQyMmItNDg4ZS05OTI5LTQ3NzJmN2VjZTIzYRAAGAIiJDFhZjczZTY0LTU1NzYtNDI4ZS1hNDU0LWRlMmJlMGI2MjBhZJoCIDdhYTllZTQ0MDgxZTQwYmFhZGU2YjEzOThlYTg1NDU0sAIDmgEHEgViYXRjaA==",
+   "step_format": 0
+  },
+  {
+   "idx": 1,
+   "step_type": 15,
+   "status": 3,
+   "has_subtrajectory": 0,
+   "metadata": "CgoI35Wg2AYQwIQ9GAJYqApiJDQxNDVmYzkxLTBjZjktNGFhNy05NTYxLWU0YjRlNWUzYmQ3MaIBUAokZDUyNTQ2NzQtZDIyYi00ODhlLTk5MjktNDc3MmY3ZWNlMjNhEAEYAiIkMWFmNzNlNjQtNTU3Ni00MjhlLWE0NTQtZGUyYmUwYjYyMGFkmgIgNGFhMTg2NmFhODU4NDM4ZTkyOTJhMmZmOTM5Mjg3ZjOwAgMyCgjflaDYBhDAhD1KBAhkEBk=",
+   "error_details": null,
+   "permissions": null,
+   "task_details": null,
+   "render_info": null,
+   "step_payload": "CA8gAyrCAQoKCN+VoNgGEMCEPRgCWKgKYiQ0MTQ1ZmM5MS0wY2Y5LTRhYTctOTU2MS1lNGI0ZTVlM2JkNzGiAVAKJGQ1MjU0Njc0LWQyMmItNDg4ZS05OTI5LTQ3NzJmN2VjZTIzYRABGAIiJDFhZjczZTY0LTU1NzYtNDI4ZS1hNDU0LWRlMmJlMGI2MjBhZJoCIDRhYTE4NjZhYTg1ODQzOGU5MjkyYTJmZjkzOTI4N2YzsAIDMgoI35Wg2AYQwIQ9SgQIZBAZmgELEglQbGFubmluZy4=",
+   "step_format": 0
+  },
+  {
+   "idx": 2,
+   "step_type": 132,
+   "status": 2,
+   "has_subtrajectory": 0,
+   "metadata": "CgoI35Wg2AYQwIQ9GAJYqApiJDg1ODI3MDkwLWI0OTItNGQ2OS1hY2JmLWQ5MjA0N2Q1MWNmOKIBUAokZDUyNTQ2NzQtZDIyYi00ODhlLTk5MjktNDc3MmY3ZWNlMjNhEAIYAiIkMWFmNzNlNjQtNTU3Ni00MjhlLWE0NTQtZGUyYmUwYjYyMGFkmgIgZGE4ZWMxNGUxN2E5NGM2ZmFkODA0NTQwMzQzMzc4NmGwAgMilQEKJ2NhbGxfMWFmNzNlNjQ1NTc2NDI4ZWE0NTRkZTJiZTBiNjIwYWRfMRIUbWNwX3Jlc3BvbnNlc19sb29rdXAaVHsiaW5kZXgiOjAsInZhbHVlIjpbImjDqWxsbyIseyJuZXN0ZWQiOnRydWV9LG51bGxdLCJ0b29sU3VtbWFyeSI6IkdlbmVyYXRlZCBjYWxsIDAifTIKCN+VoNgGEMCEPToKCN+VoNgGEMCEPQ==",
+   "error_details": null,
+   "permissions": null,
+   "task_details": null,
+   "render_info": null,
+   "step_payload": "CIQBIAIq4AIKCgjflaDYBhDAhD0YAlioCmIkODU4MjcwOTAtYjQ5Mi00ZDY5LWFjYmYtZDkyMDQ3ZDUxY2Y4ogFQCiRkNTI1NDY3NC1kMjJiLTQ4OGUtOTkyOS00NzcyZjdlY2UyM2EQAhgCIiQxYWY3M2U2NC01NTc2LTQyOGUtYTQ1NC1kZTJiZTBiNjIwYWSaAiBkYThlYzE0ZTE3YTk0YzZmYWQ4MDQ1NDAzNDMzNzg2YbACAyKVAQonY2FsbF8xYWY3M2U2NDU1NzY0MjhlYTQ1NGRlMmJlMGI2MjBhZF8xEhRtY3BfcmVzcG9uc2VzX2xvb2t1cBpUeyJpbmRleCI6MCwidmFsdWUiOlsiaMOpbGxvIix7Im5lc3RlZCI6dHJ1ZX0sbnVsbF0sInRvb2xTdW1tYXJ5IjoiR2VuZXJhdGVkIGNhbGwgMCJ9MgoI35Wg2AYQwIQ9OgoI35Wg2AYQwIQ9qgg0EjIKFwoDbWNwEhByZXNwb25zZXMvbG9va3VwEAEqA21jcDIQcmVzcG9uc2VzL2xvb2t1cJoJeQpGqgFDChcKA21jcBIQcmVzcG9uc2VzL2xvb2t1cCokUnVuIGxvb2t1cCBmcm9tIE1DUCBzZXJ2ZXIgcmVzcG9uc2VzMgIIBRIvCiRkNTI1NDY3NC1kMjJiLTQ4OGUtOTkyOS00NzcyZjdlY2UyM2EQAqoBBAgBIgDiCHYKHwoLdG9vbFN1bW1hcnkSEEdlbmVyYXRlZCBjYWxsIDAKCgoFaW5kZXgSATAKKAoFdmFsdWUSH1siaMOpbGxvIix7Im5lc3RlZCI6dHJ1ZX0sbnVsbF0SHRobKglFeGVjdXRpbmcyBWJ1aWxkOgdhY3Rpb25z",
+   "step_format": 0
+  },
+  {
+   "idx": 3,
+   "step_type": 132,
+   "status": 1,
+   "has_subtrajectory": 0,
+   "metadata": "CgoI35Wg2AYQwIQ9GAJYqApiJGNhMTY0NDQ5LThhNWEtNDM4ZC05OTU0LTJkMDc5MmYzMjJjMqIBUAokZDUyNTQ2NzQtZDIyYi00ODhlLTk5MjktNDc3MmY3ZWNlMjNhEAMYAiIkMWFmNzNlNjQtNTU3Ni00MjhlLWE0NTQtZGUyYmUwYjYyMGFkmgIgYmY3NzRhYzQwYTNkNGI5ZjlhMDM4ZWEyY2Q5MWYwMmSwAgMilQEKJ2NhbGxfMWFmNzNlNjQ1NTc2NDI4ZWE0NTRkZTJiZTBiNjIwYWRfMhIUbWNwX3Jlc3BvbnNlc19sb29rdXAaVHsiaW5kZXgiOjEsInZhbHVlIjpbImjDqWxsbyIseyJuZXN0ZWQiOnRydWV9LG51bGxdLCJ0b29sU3VtbWFyeSI6IkdlbmVyYXRlZCBjYWxsIDEifQ==",
+   "error_details": null,
+   "permissions": null,
+   "task_details": null,
+   "render_info": null,
+   "step_payload": "CIQBIAEqyAIKCgjflaDYBhDAhD0YAlioCmIkY2ExNjQ0NDktOGE1YS00MzhkLTk5NTQtMmQwNzkyZjMyMmMyogFQCiRkNTI1NDY3NC1kMjJiLTQ4OGUtOTkyOS00NzcyZjdlY2UyM2EQAxgCIiQxYWY3M2U2NC01NTc2LTQyOGUtYTQ1NC1kZTJiZTBiNjIwYWSaAiBiZjc3NGFjNDBhM2Q0YjlmOWEwMzhlYTJjZDkxZjAyZLACAyKVAQonY2FsbF8xYWY3M2U2NDU1NzY0MjhlYTQ1NGRlMmJlMGI2MjBhZF8yEhRtY3BfcmVzcG9uc2VzX2xvb2t1cBpUeyJpbmRleCI6MSwidmFsdWUiOlsiaMOpbGxvIix7Im5lc3RlZCI6dHJ1ZX0sbnVsbF0sInRvb2xTdW1tYXJ5IjoiR2VuZXJhdGVkIGNhbGwgMSJ94ghXCh8KC3Rvb2xTdW1tYXJ5EhBHZW5lcmF0ZWQgY2FsbCAxCgoKBWluZGV4EgExCigKBXZhbHVlEh9bImjDqWxsbyIseyJuZXN0ZWQiOnRydWV9LG51bGxd",
+   "step_format": 0
+  },
+  {
+   "idx": 4,
+   "step_type": 132,
+   "status": 1,
+   "has_subtrajectory": 0,
+   "metadata": "CgoI35Wg2AYQwIQ9GAJYqApiJDljOWZhOTcxLWQ3OTMtNGY3MC1hZDU0LTE4NDA2MzUzYWIyM6IBUAokZDUyNTQ2NzQtZDIyYi00ODhlLTk5MjktNDc3MmY3ZWNlMjNhEAQYAiIkMWFmNzNlNjQtNTU3Ni00MjhlLWE0NTQtZGUyYmUwYjYyMGFkmgIgYzYzMmJkOThlZDAyNGE1MzlhM2EyNzVlMDYxOTNjZGGwAgMilQEKJ2NhbGxfMWFmNzNlNjQ1NTc2NDI4ZWE0NTRkZTJiZTBiNjIwYWRfMxIUbWNwX3Jlc3BvbnNlc19sb29rdXAaVHsiaW5kZXgiOjIsInZhbHVlIjpbImjDqWxsbyIseyJuZXN0ZWQiOnRydWV9LG51bGxdLCJ0b29sU3VtbWFyeSI6IkdlbmVyYXRlZCBjYWxsIDIifQ==",
+   "error_details": null,
+   "permissions": null,
+   "task_details": null,
+   "render_info": null,
+   "step_payload": "CIQBIAEqyAIKCgjflaDYBhDAhD0YAlioCmIkOWM5ZmE5NzEtZDc5My00ZjcwLWFkNTQtMTg0MDYzNTNhYjIzogFQCiRkNTI1NDY3NC1kMjJiLTQ4OGUtOTkyOS00NzcyZjdlY2UyM2EQBBgCIiQxYWY3M2U2NC01NTc2LTQyOGUtYTQ1NC1kZTJiZTBiNjIwYWSaAiBjNjMyYmQ5OGVkMDI0YTUzOWEzYTI3NWUwNjE5M2NkYbACAyKVAQonY2FsbF8xYWY3M2U2NDU1NzY0MjhlYTQ1NGRlMmJlMGI2MjBhZF8zEhRtY3BfcmVzcG9uc2VzX2xvb2t1cBpUeyJpbmRleCI6MiwidmFsdWUiOlsiaMOpbGxvIix7Im5lc3RlZCI6dHJ1ZX0sbnVsbF0sInRvb2xTdW1tYXJ5IjoiR2VuZXJhdGVkIGNhbGwgMiJ94ghXCh8KC3Rvb2xTdW1tYXJ5EhBHZW5lcmF0ZWQgY2FsbCAyCgoKBWluZGV4EgEyCigKBXZhbHVlEh9bImjDqWxsbyIseyJuZXN0ZWQiOnRydWV9LG51bGxd",
+   "step_format": 0
+  }
+ ],
+ "trajectory": {
+  "meta": {
+   "trajectory_id": "d5254674-d22b-488e-9929-4772f7ece23a",
+   "cascade_id": "1af73e64-5576-428e-a454-de2be0b620ad",
+   "trajectory_type": 4,
+   "source": 17
+  },
+  "blob": {
+   "id": "main",
+   "data": "cmlnIGJsb2IgMWFmNzNlNjQtNTU3Ni00MjhlLWE0NTQtZGUyYmUwYjYyMGFk"
+  }
+ }
+}

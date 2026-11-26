@@ -1,9 +1,11 @@
 import { assert, assertEquals, assertMatch } from '@std/assert'
 import { createHash } from 'node:crypto'
+import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 import { lines } from '../src/claude/lines.ts'
 import { packRecord, unpackRecord } from '../src/records.ts'
 import { AGY_RECORD_PREFIX } from '../src/agy/record.ts'
+import { readSteps, writeSteps } from '../src/agy/rows.ts'
 import { kernelBody } from './kernel_shapes.ts'
 import { WsClient } from './websocket_client.ts'
 
@@ -27,9 +29,15 @@ async function rig(mode = 'default') {
   const root = await Deno.realPath(await Deno.makeTempDir({ dir: '.state/test', prefix: 'agy-' }))
   const state = `${root}/state with spaces`
   const fake = `${root}/agy`
-  await Deno.writeTextFile(fake, `#!/bin/sh\nexec ${[Deno.execPath(), 'run', '-A', fixture, mode].map(shellWord).join(' ')} "$@"\n`, { mode: 0o700 })
+  // the fake's evidence of what the model was shown lives beside the state folder: the lost-store cases delete the
+  // state, and the assertions after them are about the whole run
+  const evidenceFile = `${root}/evidence.jsonl`
+  await Deno.writeTextFile(
+    fake,
+    `#!/bin/sh\nexport FAKE_AGY_EVIDENCE=${shellWord(evidenceFile)}\nexec ${[Deno.execPath(), 'run', '-A', fixture, mode].map(shellWord).join(' ')} "$@"\n`,
+    { mode: 0o700 },
+  )
   const processes = new Set<Deno.ChildProcess>()
-  const evidenceFile = `${state}/gemini/fake-evidence.jsonl`
   const evidence = async () => (await Deno.readTextFile(evidenceFile)).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
   const start = async (extra: string[] = []) => {
     const compiled = Deno.env.get('AGY_TEST_GATEWAY')
@@ -732,6 +740,7 @@ Deno.test('agy: one validator, one outcome for every kind of unusable reasoning,
     const oldEnvelope = await packRecord('agy2r.record.v0.', decoded)
     const badBase64 = await packRecord(AGY_RECORD_PREFIX, { ...decoded, steps: [{ ...decoded.steps[0], step_payload: 'A' }] })
     const corrupt = `${AGY_RECORD_PREFIX}not-gzip`
+    const aliased = await packRecord(AGY_RECORD_PREFIX, { ...decoded, callAliases: [['client-a', 'provider-x'], ['client-b', 'provider-x']] })
     const notARecord = encodeThinkingText()
     const cases: [string, string, string | null][] = [
       ['a corrupt record', corrupt, 'invalid_provider_record'],
@@ -739,6 +748,7 @@ Deno.test('agy: one validator, one outcome for every kind of unusable reasoning,
       ["the Claude lane's record", claude, 'provider_record_foreign'],
       ['an older agy envelope', oldEnvelope, 'provider_record_foreign'],
       ['invalid base64 in a row', badBase64, 'invalid_provider_record'],
+      ['call aliases that are not one-to-one', aliased, 'invalid_provider_record'],
       ['a thinking item', notARecord, null],
     ]
     for (const [name, content, code] of cases) {
@@ -777,9 +787,13 @@ function connection(gw: { url: string; create: (body: unknown) => Promise<{ resp
   return { send: async (body: any) => (await ws.send(body)).response, close: () => ws.close() }
 }
 
-/** The transcript the model was shown: user turns, planner lines and resume notices, in order. */
-function transcript(visible: string[]): string[] {
-  return visible.filter((row) => /^\d+:(14|15|101):/.test(row)).map((row) => row.replace(/^\d+:/, ''))
+/**
+ * What the model was shown for one inference, in store order: user turns, planner lines, tool-call rows and agy's own
+ * notices. Only the row's index is dropped (a rebuilt store renumbers nothing, but the number is not model input);
+ * every other byte has to repeat, so a rebuild that renders a tool result differently is caught here.
+ */
+function modelRows(visible: string[]): string[] {
+  return visible.filter((row) => /^\d+:(14|15|101|132):/.test(row)).map((row) => row.replace(/^\d+:/, ''))
 }
 
 const USER1 = 'Remember the marker KUMQUAT-3311.'
@@ -825,17 +839,21 @@ for (const transport of ['sse', 'ws'] as const) {
             const checks = events.filter((e) => e.kind === 'resume-check')
             assertEquals(checks.at(-1).completed.length >= 3, true)
           }
-          // every inference's transcript starts with the one before it
-          const promptsSeen = promptsOf(events).map((p) => transcript(p.visible))
-          for (let i = 1; i < promptsSeen.length; i++) {
-            const before = promptsSeen[i - 1], now = promptsSeen[i]
-            assert(now.length >= before.length, `prompt ${i}: ${now.length} rows, before ${before.length}`)
-            for (let j = 0; j < before.length; j++) assertEquals(now[j], before[j], `prompt ${i} changed transcript row ${j}`)
+          // Every simulated inference — the one after a tool result included — starts with the transcript the model
+          // saw for the one before it. agy appends only its own restart notice, which is a new row at the end.
+          const seen = events.filter((e) => e.kind === 'inference').map((e) => modelRows(e.visible))
+          // four sends, and the live release's inference is the batch prompt's own second one (after the tool results)
+          assert(seen.length >= 4, `only ${seen.length} inferences were captured`)
+          for (let i = 1; i < seen.length; i++) {
+            const before = seen[i - 1], now = seen[i]
+            assert(now.length >= before.length, `inference ${i}: ${now.length} rows, before ${before.length}`)
+            for (let j = 0; j < before.length; j++) assertEquals(now[j], before[j], `inference ${i} changed the model's row ${j}`)
           }
-          // the system part is one thing for the whole conversation: agent text, working folder and tool set
+          // the system part is one thing for the whole conversation: working folder, agent text, model and tool set
           const processes = events.filter((e) => e.kind === 'process')
           assertEquals(new Set(processes.map((p) => p.cwd)).size, 1, 'the working folder changed within the chain')
           assertEquals(new Set(processes.map((p) => p.instructions)).size, 1, 'the agent text changed within the chain')
+          assertEquals(new Set(events.filter((e) => e.kind === 'config').map((e) => e.model)).size, 1, 'the model changed within the chain')
           assertEquals(new Set(events.filter((e) => e.kind === 'listed').map((e) => JSON.stringify(e.names))).size, 1, 'the tool set changed')
         } finally {
           await conn.close().catch(() => {})
@@ -848,6 +866,130 @@ for (const transport of ['sse', 'ws'] as const) {
     })
   }
 }
+
+Deno.test("agy: a delta at the live parent is served when the store lost the chain's ancestors", async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start()
+    const first = await gw.create(initial('Remember one.'))
+    const second = await gw.create(follow(first.response, [user('Second turn.')]))
+    assertEquals(second.response.x_gateway.path, 'live')
+    // the store is a cache and this one has lost the ancestor: the live process sits exactly at the parent
+    await Deno.remove(`${r.state}/responses/${first.response.id}.json`)
+    const third = await gw.create(follow(second.response, [user('Third turn.')]))
+    assertEquals([third.response.status, third.response.x_gateway.path], ['completed', 'live'])
+    // and the response's record holds what it wrote, not the ancestor's rows the cache lost
+    const record = third.response.output.find((item: any) => item.type === 'reasoning' && item.encrypted_content)?.encrypted_content
+    const decoded = await unpackRecord(AGY_RECORD_PREFIX, record!) as any
+    assertEquals(decoded.prev, second.response.id)
+    assert(decoded.steps.length <= 4, `the record re-holds ${decoded.steps.length} rows`)
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test("agy: a full history rebuilds from the transcript when the store's copy is unusable, and refills it", async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start(['--idle-timeout', '0.2'])
+    const first = await gw.create(initial('Remember the marker KUMQUAT-4402.'))
+    await assertStopped(pids(await r.evidence()))
+    const record = first.response.output.find((item: any) => item.type === 'reasoning' && item.encrypted_content)?.encrypted_content
+    const items = first.response.output.filter((item: any) => !(item.type === 'reasoning' && item.encrypted_content?.startsWith(AGY_RECORD_PREFIX)))
+    // the cache's copy of this response is corrupt; the transcript is the state, so the rebuild uses it and puts it back
+    const path = `${r.state}/responses/${first.response.id}.json`
+    const copy = JSON.parse(await Deno.readTextFile(path))
+    await Deno.writeTextFile(path, JSON.stringify({ ...copy, steps: [] }))
+    const rebuilt = await gw.create({
+      model: MODEL,
+      instructions: INSTRUCTIONS,
+      tools: [tool()],
+      input: [user('Remember the marker KUMQUAT-4402.'), ...items, { type: 'reasoning', summary: [], encrypted_content: record }, user('Again.')],
+    })
+    assertEquals([rebuilt.response.status, rebuilt.response.x_gateway.path], ['completed', 'history'])
+    // refilled: the store now holds the transcript's record, so a delta at the rebuilt response is a store hit
+    await assertStopped(pids(await r.evidence()))
+    const next = await gw.create(follow(rebuilt.response, [user('Once more.')]))
+    assertEquals([next.response.status, next.response.x_gateway.path], ['completed', 'store'])
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: a rebuild at a later response is not marked moved when only the chain head carries the paths', async () => {
+  const r = await rig()
+  try {
+    const a = await r.start()
+    const first = await a.create(initial('Remember one.'))
+    const second = await a.create(follow(first.response, [user('Second turn.')]))
+    assertEquals(second.response.x_gateway.path, 'live')
+    await a.stop()
+    // the process is gone, so naming the second response rebuilds its conversation: only the first record names the
+    // paths, and the configured ones have not changed
+    const b = await r.start()
+    const third = await b.create(follow(second.response, [user('Third turn.')]))
+    assertEquals([third.response.status, third.response.x_gateway.path, third.response.x_gateway.paths], ['completed', 'store', undefined])
+    await b.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: a store whose tail has a step after the pending calls is refused before any write', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start(['--hold-timeout', '0.2'])
+    const { response } = await gw.create(initial('batch'))
+    await assertStopped(pids(await r.evidence()))
+    const conversation = response.x_gateway.conversation
+    const db = `${r.state}/gemini/antigravity-cli/conversations/${conversation}.db`
+    const record = response.output.find((item: any) => item.type === 'reasoning' && item.encrypted_content)?.encrypted_content
+    const decoded = await unpackRecord(AGY_RECORD_PREFIX, record!) as any
+    const items = response.output.filter((item: any) => !(item.type === 'reasoning' && item.encrypted_content?.startsWith(AGY_RECORD_PREFIX)))
+    // the response's own record carries a completed row after the calls it names, which agy's resume would open
+    // the conversation without: the response is not the store's tail any more
+    const last = decoded.steps[decoded.steps.length - 1]
+    const tampered = await packRecord(AGY_RECORD_PREFIX, {
+      ...decoded,
+      steps: [...decoded.steps, { ...last, idx: last.idx + 1, step_type: 15, status: 3, metadata: null, render_info: null, step_payload: null }],
+    })
+    const before = createHash('sha256').update(await Deno.readFile(db)).digest('hex')
+    const processes = (await r.evidence()).filter((e) => e.kind === 'process').length
+    const refused = await gw.post({
+      model: MODEL,
+      instructions: INSTRUCTIONS,
+      tools: [tool()],
+      input: [user('batch'), ...items, { type: 'reasoning', summary: [], encrypted_content: tampered }, ...outputs(response), user('Again.')],
+    })
+    assertEquals([refused.status, (await refused.json()).error.code], [400, 'store_mismatch'])
+    assertEquals(createHash('sha256').update(await Deno.readFile(db)).digest('hex'), before, 'the refused request wrote to the store')
+    assertEquals((await r.evidence()).filter((e) => e.kind === 'process').length, processes, 'the refused request started a process')
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: calls agy bound to one provider id fail the response instead of writing a record that cannot replay', async () => {
+  const r = await rig('alias-conflict')
+  try {
+    const gw = await r.start()
+    const res = await gw.post({ ...initial('batch'), stream: true })
+    assertEquals(res.status, 200)
+    const raw = await res.text()
+    const events = raw.split('\n').filter((line) => line.startsWith('data: ')).map((line) => JSON.parse(line.slice(6)))
+    const terminal = events.at(-1)
+    assertEquals(terminal.type, 'response.failed')
+    assertEquals(terminal.response.error.code, 'store_mismatch')
+    // nothing unreplayable was emitted: no provider record item, and no record file for this response
+    assertEquals(terminal.response.output.filter((item: any) => item.type === 'reasoning' && item.encrypted_content), [])
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
 
 Deno.test('agy: a second create on a chain in progress is 409 conversation_busy', async () => {
   const r = await rig()
@@ -890,6 +1032,10 @@ Deno.test('agy: naming an earlier response rebuilds at it while a later process 
     // the live process sits at the second response; naming the first one rebuilds at it
     const earlier = await gw.create(follow(first.response, [user('From the first response again.')]))
     assertEquals([earlier.response.status, earlier.response.x_gateway.path], ['completed', 'store'])
+    // the rebuilt conversation is the first response's, not the live one's: the later turn is not in the model's input
+    const branch = modelRows((await r.evidence()).filter((e) => e.kind === 'inference').at(-1)!.visible)
+    assert(branch.some((row) => row.includes('Remember one.')) && branch.some((row) => row.includes('From the first response again.')))
+    assert(!branch.some((row) => row.includes('Second turn.')), `the branch's model input carries the later turn: ${JSON.stringify(branch)}`)
     // and the rebuilt conversation continues normally
     const next = await gw.create(follow(earlier.response, [user('Onward.')]))
     assertEquals(next.response.status, 'completed')

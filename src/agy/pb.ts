@@ -6,30 +6,31 @@ export type WireType = 0 | 1 | 2 | 5
 export interface Field {
   field: number
   wt: WireType
-  value: number | Uint8Array
+  /** A varint keeps its exact value as a bigint (agy writes up to 19 digits, past a JS number's precision). */
+  value: bigint | Uint8Array
 }
 
 export class ProtobufError extends Error {}
 
-function readVarint(bytes: Uint8Array, at: number): [number, number] {
-  let shift = 0
-  let value = 0
+function readVarint(bytes: Uint8Array, at: number): [bigint, number] {
+  let shift = 0n
+  let value = 0n
   let i = at
   while (true) {
     if (i >= bytes.length) throw new ProtobufError('truncated varint')
     const byte = bytes[i++]
-    value += (byte & 0x7f) * 2 ** shift
+    value |= BigInt(byte & 0x7f) << shift
     if (!(byte & 0x80)) return [value, i]
-    shift += 7
-    if (shift > 63) throw new ProtobufError('varint too long')
+    shift += 7n
+    if (shift > 63n) throw new ProtobufError('varint too long')
   }
 }
 
-function writeVarint(out: number[], value: number): void {
+function writeVarint(out: number[], value: bigint): void {
   let v = value
   for (;;) {
-    const byte = v % 128
-    v = Math.floor(v / 128)
+    const byte = Number(v & 0x7fn)
+    v >>= 7n
     if (v) out.push(byte | 0x80)
     else {
       out.push(byte)
@@ -44,15 +45,17 @@ export function decode(bytes: Uint8Array): Field[] {
   while (i < bytes.length) {
     const [key, next] = readVarint(bytes, i)
     i = next
-    const field = Math.floor(key / 8)
-    const wt = (key % 8) as WireType
+    const field = Number(key >> 3n)
+    const wt = Number(key & 7n) as WireType
     if (field <= 0) throw new ProtobufError('bad field number')
     if (wt === 0) {
       const [value, at] = readVarint(bytes, i)
       i = at
       out.push({ field, wt, value })
     } else if (wt === 2) {
-      const [length, at] = readVarint(bytes, i)
+      const [size, at] = readVarint(bytes, i)
+      if (size > BigInt(bytes.length)) throw new ProtobufError('truncated length-delimited field')
+      const length = Number(size)
       if (at + length > bytes.length) throw new ProtobufError('truncated length-delimited field')
       out.push({ field, wt, value: bytes.subarray(at, at + length) })
       i = at + length
@@ -69,14 +72,14 @@ export function decode(bytes: Uint8Array): Field[] {
 export function encode(fields: Field[]): Uint8Array {
   const out: number[] = []
   for (const f of fields) {
-    writeVarint(out, f.field * 8 + f.wt)
+    writeVarint(out, BigInt(f.field * 8 + f.wt))
     if (f.wt === 0) {
-      writeVarint(out, f.value as number)
+      writeVarint(out, f.value as bigint)
       continue
     }
     const bytes = f.value as Uint8Array
     // only a length-delimited field carries its length; fixed64/fixed32 are their own bytes
-    if (f.wt === 2) writeVarint(out, bytes.length)
+    if (f.wt === 2) writeVarint(out, BigInt(bytes.length))
     for (const b of bytes) out.push(b)
   }
   return new Uint8Array(out)
@@ -111,7 +114,7 @@ export function text(fields: Field[], field: number): string | null {
 }
 
 export function integer(fields: Field[], field: number): number | null {
-  for (const f of fields) if (f.field === field && f.wt === 0) return f.value as number
+  for (const f of fields) if (f.field === field && f.wt === 0) return Number(f.value as bigint)
   return null
 }
 
@@ -124,7 +127,7 @@ export function setMessage(fields: Field[], field: number, tree: Field[]): Field
 }
 
 export function setInteger(fields: Field[], field: number, value: number): Field[] {
-  return setField(fields, { field, wt: 0, value })
+  return setField(fields, { field, wt: 0, value: BigInt(value) })
 }
 
 function setField(fields: Field[], next: Field): Field[] {
@@ -141,4 +144,19 @@ function setField(fields: Field[], next: Field): Field[] {
 /** A binary or string field of a nested message, as an empty list when absent. */
 export function sub(fields: Field[], field: number): Field[] {
   return message(fields, field) ?? []
+}
+
+/**
+ * A nested message field the way agy's rows distinguish its cases: null when the field is absent, `[]` when it is
+ * present and empty (agy writes that), and a ProtobufError when it is present and is not exactly one message — an
+ * opaque or corrupt block is never read as "no block" and silently rewritten.
+ */
+export function nested(fields: Field[], field: number): Field[] | null {
+  const f = fields.find((f) => f.field === field && f.wt === 2)
+  if (!f) return null
+  const bytes = f.value as Uint8Array
+  if (!bytes.length) return []
+  const tree = decode(bytes)
+  if (!tree.length || !same(encode(tree), bytes)) throw new ProtobufError(`field ${field} is not a message`)
+  return tree
 }

@@ -662,6 +662,10 @@ transport, any order).
 - **Live process at the parent:** the outputs are the answers to agy's held MCP calls, exactly as agy expects;
   user messages that came with them are injected as the `PreInvocation` hook's `injectSteps` before the next
   inference. Nothing is restarted.
+- **Routing order, every request:** a live process sitting exactly at the named parent, else the gateway's store, else
+  the records in the request's history. The store is a cache in both directions: one that has lost an ancestor still
+  serves the live process (a record's rows are complete for what it wrote, and rows below them cannot change), and a
+  stored copy that fails validation is dropped and refilled from the transcript, which then reports `history`.
 - **No live process** (evicted, gateway restarted, state folder lost, an earlier response named): the conversation is
   reopened only when **every output of the pending calls is in hand**. The gateway checks that the stored tail is
   exactly the pending calls the record names (their steps, in order, with agy's call ids), writes each output into its
@@ -724,6 +728,7 @@ stream-json restarting with a replayed call, unlike ACP.
 - The custom agent limits exposed tools but is not an OS sandbox. agy still supplies base-prompt text and may declare a few small built-ins; read-only built-ins need not send a permission request. Tool schemas must be accepted by Gemini (the probe's array without `items` failed). The planner does not control agy's internal autonomous inferences.
 - The real Mac trial confirmed the fence, 52 planner lines for 52 responses, long holds, steering, resume, eviction, concurrent conversations and usage on 1.5.17. Codex 0.153 completed a full-history tool conversation in that trial with function tools and neutral trial instructions; its stock identity prompt was not sent to agy. The automated suite uses `test/fixtures/fake_agy.ts`, not the real binary.
 - The pinned layout is measured on 1.5.17 only: the DDL, the step field numbers and the preview rule are constants of that version, and another version's store is refused rather than patched. Startup rewrites the agent file and checks the current process's own log for default-agent fallback.
+- The chain's gemini dir and workspace are recorded on its first response only (every later response inherits them), so the `paths: elsewhere` mark is decided from that record. A transcript whose first response was dropped from the client's history shows no mark — the rebuild still stops at the usable head, which is the one record that carries them.
 - The model cannot read `output.txt` with the fenced tool set: asked for the middle of a 300 KB result it tried `list_resources`/`read_resource` and reported that it only had the preview.
 
 ## Tests

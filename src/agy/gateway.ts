@@ -211,18 +211,24 @@ export class AgyGateway implements ResponsesEndpoint {
     const previous = req.previousResponseId
     const prev = previous === null ? null : this.byId(previous)
     if (previous !== null && !prev) throw previousResponseNotFound(previous, 'not in the agy response store')
+    // The live process sitting exactly at the named parent is the state itself; its ancestors' records are the cache,
+    // and a cache the gateway's store has lost is not a reason to refuse a request the process can serve.
+    const laneAt = previous === null ? null : this.laneAt(previous)
     let chain = prev?.chain ?? ''
     let chainRecords: AgyRecord[] = []
     let head: AgyRecord | null = prev
     let input = req.input
     let cached = prev !== null
+    let identity: Identity | null = null
     if (prev) {
-      chainRecords = this.chainOf(prev.id)
-      const identity = chainIdentity(chainRecords[0])
-      if (!continues(identity, req)) {
+      chainRecords = this.chainUpTo(prev)
+      identity = this.identityOf(chainRecords, laneAt)
+      if (identity && !continues(identity, req)) {
         throw previousResponseNotFound(prev.id, 'instructions, tools or the model changed, which starts a new agy chain; send a create without history')
       }
       input = remapItems(await this.withoutOwnReasoning(req.input, chainRecords), prev.callAliases ?? [])
+      // cancellation while the echoed reasoning decodes: the request stops here, before it reserves or touches a lane
+      if (sink.isClosed) return
     } else if (segment(req.input).groups.length === 0) {
       chain = newId('chain')
     } else {
@@ -234,17 +240,31 @@ export class AgyGateway implements ResponsesEndpoint {
       if (match.synth.length) {
         throw invalid('input', 'The history carries responses this lane cannot place in one conversation; start a new conversation.', 'provider_record_missing')
       }
+      // The history's records are the state and the rows a rebuild uses. The store is a cache: a copy it holds is
+      // read (and validated) to decide whether this is a store-route hit, and a copy that fails is dropped so this
+      // rebuild puts the transcript's own record back in its place — a corrupt cache never decides a request.
+      let copies = 0
+      for (const record of match.records) {
+        const copy = this.records.get(record.id)
+        if (!copy) continue
+        try {
+          this.stored(copy)
+          copies++
+        } catch {
+          this.records.remove(copy.id)
+        }
+      }
       chainRecords = match.records
+      cached = copies === chainRecords.length
       head = match.head
       chain = head.chain
       input = match.tail
       // a cancelled request must not touch the store: the client is gone and the chain's live process must survive
       if (sink.isClosed) return
-      // the store is a cache: a rebuild refills it, so the next previous_response_id finds the whole chain
-      cached = chainRecords.every((record) => this.records.has(record.id))
+      // a rebuild refills the store, so the next previous_response_id finds the whole chain
       for (const record of chainRecords) if (!this.records.has(record.id)) this.records.put(record)
     }
-    const identity = chainRecords.length ? chainIdentity(chainRecords[0]) : null
+    identity ??= this.identityOf(chainRecords, laneAt)
     const instructions = identity?.instructions ?? req.instructions
     if (!instructions) throw invalid('instructions', 'Instructions are required.')
     const tools = identity?.tools ?? req.tools
@@ -254,11 +274,15 @@ export class AgyGateway implements ResponsesEndpoint {
     const output = new Output({ ...req, instructions, tools, model }, sink)
     let lane: Lane | undefined
     let settled = false
+    // The reservation belongs to the request from here to its terminal commit (or its failure). While the request is
+    // still planning, a cancellation marks it settled but must not hand the chain to another request that would touch
+    // the same store; the release happens where the request stops touching it.
+    let planning = true
     const detach = () => {
       settled = true
       sink.onCancel = null
-      this.chains.release(reservation)
       this.active.delete(output.id)
+      if (!planning) this.chains.release(reservation)
     }
     const fail = (e: unknown, cancelled = false) => {
       if (settled) return output.object()
@@ -275,12 +299,13 @@ export class AgyGateway implements ResponsesEndpoint {
     const cancel = () => fail(new GatewayError(409, 'conflict_error', 'cancelled', 'The response was cancelled.'), true)
     sink.onCancel = cancel
     this.active.set(output.id, cancel)
-    // A cancelled request does nothing further: no eviction, no store write, no launch. The chain's live process
-    // belongs to the client that is still there.
+    // A cancelled request does nothing further: no eviction, no store write, no launch, and no stopping of a process
+    // it did not start. The chain's live process belongs to the client that is still there.
     const abandoned = () => settled || sink.isClosed
     this.assertOpen()
     try {
       this.chains.reserve(chain, reservation)
+      if (abandoned()) return
       const live = this.chains.get(chain)
       const atHead = live !== undefined && !live.dead && !live.busy && live.head === (head?.id ?? null)
       let path: 'new' | 'live' | 'store' | 'history'
@@ -299,7 +324,7 @@ export class AgyGateway implements ResponsesEndpoint {
         if (abandoned()) return
         await this.chains.evict(chain, 'superseded')
         if (abandoned()) return
-        moved = this.pathsMoved(chain, head)
+        moved = this.pathsMoved(chain, chainRecords)
         if (moved) console.error(`paths_moved: chain ${chain} was recorded under another state folder; its prompt differs (one cold cache miss)`)
         const rebuilt = this.laneFromRecords(chain, identity!, chainRecords, head, delivery)
         lane = rebuilt.lane
@@ -314,7 +339,8 @@ export class AgyGateway implements ResponsesEndpoint {
         path = cached ? 'store' : 'history'
       }
       if (abandoned()) {
-        await lane.stop()
+        // only the process this request launched is stopped: a lane it merely sits at is the chain's
+        if (path !== 'live') await lane.stop()
         return
       }
       this.assertOpen()
@@ -359,16 +385,49 @@ export class AgyGateway implements ResponsesEndpoint {
     } catch (e) {
       fail(e)
     } finally {
-      // the request no longer holds the chain once it is attached to a lane (busy) or has stopped
-      this.chains.release(reservation)
+      planning = false
+      // a request that never attached to a lane holds the chain no longer; an attached one releases at its terminal
+      // commit, so the chain stays busy through the record write even after the lane has no active exchange
+      if (!lane) this.chains.release(reservation)
     }
   }
 
-  /** The chain ending at `id` in the gateway's store; every record read from the store goes through the validator. */
-  private chainOf(id: string): AgyRecord[] {
-    const chain = this.records.chain(id)
-    if (!chain || !chain.length) throw previousResponseNotFound(id, 'its chain is incomplete in the store')
-    return chain.map((record) => this.stored(record))
+  /**
+   * The stored chain ending at `prev`, as far back as the store still has it. A missing or unusable ancestor is a
+   * cache miss: the parent record and the live process are the state a request at `prev` actually needs.
+   */
+  private chainUpTo(prev: AgyRecord): AgyRecord[] {
+    const out: AgyRecord[] = [prev]
+    const seen = new Set<string>([prev.id])
+    let cur = prev
+    while (cur.prev !== null) {
+      if (seen.has(cur.prev)) break
+      const stored = this.records.get(cur.prev)
+      if (!stored) break
+      let record: AgyRecord
+      try {
+        record = this.stored(stored)
+      } catch {
+        break
+      }
+      seen.add(record.id)
+      out.push(record)
+      cur = record
+    }
+    return out.reverse()
+  }
+
+  /** The live process sitting exactly at a response, if any: the only process a request at it can reuse. */
+  private laneAt(id: string): Lane | null {
+    for (const lane of this.chains.lanes.values()) if (!lane.dead && lane.head === id) return lane
+    return null
+  }
+
+  /** A chain's identity: its first record, or the live process when the store has lost the chain's head record. */
+  private identityOf(chainRecords: AgyRecord[], lane: Lane | null): Identity | null {
+    const first = chainRecords[0]
+    if (first && first.instructions !== undefined && first.model !== undefined && first.tools !== undefined) return chainIdentity(first)
+    return lane ? { instructions: lane.instructions, model: lane.model, tools: lane.tools } : null
   }
 
   /** A stored response by id, validated; null when the store has none. */
@@ -398,9 +457,14 @@ export class AgyGateway implements ResponsesEndpoint {
     }
   }
 
-  /** Whether a rebuild runs under the paths the chain was recorded at (both are in agy's prompt). */
-  private pathsMoved(chain: string, head: AgyRecord): boolean {
-    return head.workspace !== this.store.workspace(chain) || head.gemini !== this.store.gemini
+  /**
+   * Whether a rebuild runs under the paths the chain was recorded at (both are in agy's prompt). Only the chain's
+   * first record carries them: every later response inherits them, so the head is not the place to look.
+   */
+  private pathsMoved(chain: string, chainRecords: AgyRecord[]): boolean {
+    const recorded = chainRecords.find((record) => record.gemini !== undefined && record.workspace !== undefined)
+    if (!recorded) return false
+    return recorded.workspace !== this.store.workspace(chain) || recorded.gemini !== this.store.gemini
   }
 
   /**
@@ -474,6 +538,13 @@ export class AgyGateway implements ResponsesEndpoint {
         if (!own || own.provider !== call.id || own.tool !== call.name || own.conversation !== conversation) {
           throw invalid('input', `The stored step ${row.idx} is not the pending call '${call.id}' in this conversation.`, 'store_mismatch')
         }
+      }
+      // The named calls are the tail of the store: a step after them means the record is not what the store ended on,
+      // and agy's resume would open a conversation the response does not describe.
+      const last = pending[pending.length - 1].idx
+      const after = steps.find((row) => row.idx > last)
+      if (after) {
+        throw invalid('input', `The store holds a step ${after.idx} after the pending calls this response names.`, 'store_mismatch')
       }
     } else if (pending.length) {
       throw invalid('input', `The store holds ${pending.length} pending tool steps, but the response names no pending call.`, 'store_mismatch')
@@ -562,16 +633,28 @@ export class AgyGateway implements ResponsesEndpoint {
     try {
       const conversation = lane.session
       const recorded = new Map<number, string>()
-      for (const ancestor of o.chainRecords) for (const row of ancestor.steps) recorded.set(row.idx, stepsHash(row))
+      // Rows up to the highest index the records in hand cover were written before this response. agy's steps are
+      // append-only, so an unrecorded row below that floor is an ancestor's unchanged row the store has lost, never
+      // something this response wrote: it is neither re-recorded nor taken for one of this response's calls.
+      let floor = -1
+      for (const ancestor of o.chainRecords) {
+        for (const row of ancestor.steps) {
+          recorded.set(row.idx, stepsHash(row))
+          floor = Math.max(floor, row.idx)
+        }
+      }
       // a response's own calls are the tool-call rows it changed and no ancestor record already names
       const named = new Set<number>()
       for (const ancestor of o.chainRecords) for (const call of ancestor.calls) named.add(call.step)
-      const snapshot = await this.snapshotFor(conversation, named, o.calls.length)
+      const ownCalls = (steps: StepsRow[]) =>
+        steps.filter((row) => row.step_type === 132 && !named.has(row.idx) && (recorded.has(row.idx) || row.idx > floor || row.status === 1))
+          .sort((a, b) => a.idx - b.idx)
+      const snapshot = await this.snapshotFor(conversation, ownCalls, o.calls.length)
       if (!snapshot) throw serverError('store_unreadable', `agy wrote no conversation store for ${conversation}.`)
-      const fresh = snapshot.steps.filter((row) => recorded.get(row.idx) !== stepsHash(stepsRowJson(row)))
+      const fresh = snapshot.steps.filter((row) => row.idx > floor || (recorded.has(row.idx) && recorded.get(row.idx) !== stepsHash(stepsRowJson(row))))
       // the response's own calls: the tool-call rows no ancestor record names, in agy's order. One may be a queued
       // row that has not executed yet (the one-call fallback), so this reads the whole store, not only the changes.
-      const callSteps = snapshot.steps.filter((row) => row.step_type === 132 && !named.has(row.idx)).sort((a, b) => a.idx - b.idx)
+      const callSteps = ownCalls(snapshot.steps)
       const refs: CallRef[] = o.calls.map((call, i) => {
         const row = callSteps[i]
         const own = row ? callOf(row) : null
@@ -581,10 +664,10 @@ export class AgyGateway implements ResponsesEndpoint {
         return { id: own.provider, name: call.name, step: row.idx }
       })
       const aliases = [...(head?.callAliases ?? [])]
-      try {
-        bindCalls(aliases, refs.map((ref, i) => [o.calls[i].callId, ref.id] as [string, string]))
-      } catch (e) {
-        throw serverError('store_mismatch', message(e))
+      // The alias helper refuses a pair set that is not one-to-one both ways; a record it cannot express would not
+      // replay its own response, so nothing is written at all.
+      if (!bindCalls(aliases, refs.map((ref, i) => [o.calls[i].callId, ref.id] as [string, string]))) {
+        throw serverError('store_mismatch', `agy's store bound this response's tool calls many-to-one, which cannot be replayed.`)
       }
       const digest = new ItemDigest(remapItems(o.input, aliases)).finish(remapItems(history, aliases))
       record = {
@@ -641,14 +724,13 @@ export class AgyGateway implements ResponsesEndpoint {
   }
 
   /** The store's rows once they hold every call's step; agy writes them just before it calls the tool. */
-  private async snapshotFor(conversation: string, named: Set<number>, calls: number) {
+  private async snapshotFor(conversation: string, ownCalls: (steps: StepsRow[]) => StepsRow[], calls: number) {
     const deadline = performance.now() + 2000
     for (;;) {
       const snapshot = this.store.snapshot(conversation)
       if (!snapshot) return null
       if (!calls) return snapshot
-      const own = snapshot.steps.filter((row) => row.step_type === 132 && !named.has(row.idx))
-      if (own.length >= calls) return snapshot
+      if (ownCalls(snapshot.steps).length >= calls) return snapshot
       if (performance.now() > deadline) return snapshot
       await new Promise((resolve) => setTimeout(resolve, 25))
     }

@@ -108,7 +108,11 @@ export function checkAgyRecord(r: unknown, version: string): AgyRecord {
     if (typeof call.name !== 'string' || !TOOL_NAME.test(call.name)) fail('bad call name')
     if (!Number.isSafeInteger(call.step) || (call.step as number) < 0) fail('bad call step')
   }
-  checkCallAliases(record.callAliases)
+  try {
+    checkCallAliases(record.callAliases)
+  } catch (e) {
+    fail((e as Error).message)
+  }
   if (typeof record.digest !== 'string' || !HEX64.test(record.digest)) fail('bad digest')
   if (record.jsonArgumentDigest !== undefined && (typeof record.jsonArgumentDigest !== 'string' || !HEX64.test(record.jsonArgumentDigest))) {
     fail('bad JSON argument digest')

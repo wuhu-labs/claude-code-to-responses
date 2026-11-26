@@ -2,7 +2,7 @@
 // completion timestamp, the output text with agy's `Created At` / `Completed At` header, "Executed", the rendered
 // markdown and the `file://` output.txt (with the preview rule for large outputs). Queued steps (a second call of one
 // planner line agy had not started) lack the tool identity and render blocks; they are built from the measured shape.
-import { decode, encode, type Field, integer, message, setInteger, setMessage, setText, sub, text } from './pb.ts'
+import { decode, encode, type Field, integer, message, nested, setInteger, setMessage, setText, sub, text } from './pb.ts'
 import type { StepsRow } from './rows.ts'
 
 /** agy 1.5.17 stores an output whole up to this many bytes of `output.txt`; above it, a 10,240-byte middle preview. */
@@ -60,8 +60,7 @@ export function preview(full: Uint8Array, outputUrl: string): string {
     head = nextHead
     tail = nextTail
   }
-  const decoder = new TextDecoder()
-  return notice + decoder.decode(full.subarray(0, head)) + middle(total - head - tail) + decoder.decode(full.subarray(total - tail))
+  return notice + utf8.decode(full.subarray(0, head)) + middle(total - head - tail) + utf8.decode(full.subarray(total - tail))
 }
 
 /** The longest prefix of at most `bytes` bytes that ends on a UTF-8 character boundary. */
@@ -81,8 +80,14 @@ function wholeSuffix(bytes: Uint8Array, budget: number): number {
 /** The `140.2.1` value (and the `**Result**` body) for an output: whole when it fits, else the preview. */
 export function storedOutput(output: StepOutput): string {
   const file = outputFileText(output)
-  return file.length > MAX_STORED_OUTPUT_BYTES ? preview(file, output.outputUrl) : new TextDecoder().decode(file)
+  return file.length > MAX_STORED_OUTPUT_BYTES ? preview(file, output.outputUrl) : utf8.decode(file)
 }
+
+/**
+ * A tool's own bytes are never reinterpreted: a `U+FEFF` the tool printed at the start of the retained suffix is
+ * that character, not a BOM to strip, so every byte of the output survives into the step.
+ */
+const utf8 = new TextDecoder('utf-8', { ignoreBOM: true })
 
 /** The tool call a step holds: agy's own call id, the tool without its MCP prefix, and the step's conversation. */
 export function callOf(row: StepsRow): { provider: string; tool: string; conversation: string } | null {
@@ -146,7 +151,12 @@ export function completeStep(row: StepsRow, output: StepOutput): StepsRow {
   // identity (133), render metadata (147) and an Executing render block; a queued step (status 1) only its arguments.
   const identity = message(payload, 133)
   const renderInfo = message(payload, 147)
-  const existing = sub(payload, 140)
+  let existing: Field[]
+  try {
+    existing = nested(payload, 140) ?? []
+  } catch (e) {
+    throw new StepLayoutError(`step ${row.idx}'s result block is not a message: ${(e as Error).message}`)
+  }
   const executing = message(sub(existing, 2), 3)
   if (row.status === 2 && (!identity || !renderInfo || !executing || text(executing, 5) !== 'Executing')) {
     throw new StepLayoutError(`step ${row.idx} is not the measured pending tool-call layout`)
@@ -159,6 +169,7 @@ export function completeStep(row: StepsRow, output: StepOutput): StepsRow {
   for (const block of existing) {
     if (block.field === 2 && block.wt === 2) {
       if (++renderBlocks > 1) throw new StepLayoutError(`step ${row.idx} holds two render blocks`)
+      if (!message([block], 2)) throw new StepLayoutError(`step ${row.idx}'s render block is not a message`)
       continue
     }
     if (block.field !== 1 || block.wt !== 2) throw new StepLayoutError(`step ${row.idx} holds an unrecognized result block`)
@@ -175,14 +186,19 @@ export function completeStep(row: StepsRow, output: StepOutput): StepsRow {
   const now = output.completed.getTime()
   const seconds = Math.floor(now / 1000)
   const nanos = Math.round((now % 1000) * 1e6)
-  const completedStamp = [{ field: 1, wt: 0 as const, value: seconds }, { field: 2, wt: 0 as const, value: nanos }]
+  const completedStamp = [{ field: 1, wt: 0 as const, value: BigInt(seconds) }, { field: 2, wt: 0 as const, value: BigInt(nanos) }]
 
   setInteger(payload, 4, 3)
   setMessage(step5, 8, completedStamp)
   setMessage(payload, 5, step5)
 
   // The result block: arguments (140.1) are already there; 140.2 is the result agy renders.
-  const result = sub(payload, 140)
+  let result: Field[]
+  try {
+    result = nested(payload, 140) ?? []
+  } catch (e) {
+    throw new StepLayoutError(`step ${row.idx}'s result block is not a message: ${(e as Error).message}`)
+  }
   const rendered = storedOutput(output)
   const body = `**Arguments**\n\`\`\`json\n${JSON.stringify(argumentsOf(result), null, 2)}\n\`\`\`\n\n**Result**\n\`\`\`\n${rendered}\n\`\`\``
   const render = message(result, 2) ?? []
@@ -224,7 +240,7 @@ function argumentsOf(result: Field[]): Record<string, string> {
 /** Message field helpers: a length-delimited string, a nested message, a varint. */
 const textField = (field: number, text: string): Field => ({ field, wt: 2, value: new TextEncoder().encode(text) })
 const messageField = (field: number, tree: Field[]): Field => ({ field, wt: 2, value: encode(tree) })
-const intField = (field: number, value: number): Field => ({ field, wt: 0, value })
+const intField = (field: number, value: number): Field => ({ field, wt: 0, value: BigInt(value) })
 
 /** `mcp` / `<server>/<tool>`, as agy names an MCP tool call. */
 function serverTool(name: string): { server: string; tool: string; pair: Field[] } {

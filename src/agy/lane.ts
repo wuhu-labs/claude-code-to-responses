@@ -132,6 +132,19 @@ export class Lane {
     return this.spec.chain
   }
 
+  /** The chain's identity as this process was launched with it (a rebuild may name an earlier response). */
+  get model(): string {
+    return this.spec.model
+  }
+
+  get instructions(): string {
+    return this.spec.instructions
+  }
+
+  get tools(): FnTool[] {
+    return this.spec.tools
+  }
+
   get busy(): boolean {
     return this.active !== null
   }
