@@ -13,6 +13,15 @@ const PREVIEW_BYTES = 10_240
 
 export class StepLayoutError extends Error {}
 
+/** An image a tool returned, offloaded to the step's own folder by agy; the client's bytes are kept as sent. */
+export interface StepImage {
+  /** `file://…/brain/<conversation>/.system_generated/steps/<idx>/media_<n>.<ext>` */
+  url: string
+  mimeType: string
+  /** base64, exactly what the client sent. */
+  data: string
+}
+
 export interface StepOutput {
   /** The tool's output text as the client sent it, without agy's header. */
   text: string
@@ -21,6 +30,20 @@ export interface StepOutput {
   completed: Date
   /** `file://…/brain/<conversation>/.system_generated/steps/<idx>/output.txt` */
   outputUrl: string
+  /** Images offloaded to files next to `output.txt`; agy names each one in the output text. */
+  images?: StepImage[]
+}
+
+/** The output text agy stores for a tool result that carried images: the tool's text, then one pointer line each. */
+export function outputText(output: StepOutput): string {
+  return [output.text, ...(output.images ?? []).map((image) => `[Resource offloaded to ${image.url}]`)].filter((line) => line !== '').join('\n')
+}
+
+/** agy's own media file extension for the image kinds it accepts from a tool (measured on PNG and JPEG). */
+export function mediaExtension(mimeType: string): string {
+  if (mimeType === 'image/jpeg') return 'jpg'
+  if (mimeType === 'image/png') return 'png'
+  throw new StepLayoutError(`agy has no media extension for '${mimeType}'`)
 }
 
 /** `YYYY-MM-DDTHH:MM:SS+08:00`, agy's own stamp shape in the machine's own zone. */
@@ -32,9 +55,9 @@ export function stamp(date: Date): string {
   }${pad(Math.floor(Math.abs(offset) / 60))}:${pad(Math.abs(offset) % 60)}`
 }
 
-/** `output.txt`'s content: agy's two header lines, then the output text. */
+/** `output.txt`'s content: agy's two header lines, then the output text (pointers to offloaded images included). */
 export function outputFileText(output: StepOutput): Uint8Array {
-  return new TextEncoder().encode(`Created At: ${stamp(output.created)}\nCompleted At: ${stamp(output.completed)}\n${output.text}`)
+  return new TextEncoder().encode(`Created At: ${stamp(output.created)}\nCompleted At: ${stamp(output.completed)}\n${outputText(output)}`)
 }
 
 /**

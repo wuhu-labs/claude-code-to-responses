@@ -3,6 +3,7 @@
 // plus `trajectory_meta` and `trajectory_metadata_blob` on the chain's first response. `gen_metadata` and
 // `executor_metadata` are never recorded: resume does not need them and their prompt copy is not reproducible.
 import type { DatabaseSync } from 'node:sqlite'
+import { createHash } from 'node:crypto'
 import { STEPS_COLUMNS, TRAJECTORY_BLOB_COLUMNS, TRAJECTORY_META_COLUMNS } from './schema.ts'
 
 export interface StepsRow {
@@ -95,7 +96,7 @@ export function stepsKey(row: StepsRowJson): string {
 }
 
 export function stepsHash(row: StepsRowJson): string {
-  return JSON.stringify(STEPS_COLUMNS.map((column) => row[column]))
+  return createHash('sha256').update(JSON.stringify(STEPS_COLUMNS.map((column) => row[column]))).digest('hex')
 }
 
 export function readSteps(db: DatabaseSync): StepsRow[] {

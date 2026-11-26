@@ -1,4 +1,6 @@
 // The pinned ACP/MCP subset. Do not infer permissions from ACP titles (they may be shell text).
+import type { Part } from '../api/request.ts'
+
 export const MCP_NAME = 'responses'
 export const MCP_PREFIX = `mcp_${MCP_NAME}_`
 export const BRIDGE_PATH = '/_agy'
@@ -23,10 +25,20 @@ export const rpcError = (id: RpcId, code: number, message: string) => ({ jsonrpc
 export type AcpCall = { id: string; name: string; args: JsonObject }
 export type ToolSignature = { name: string; args: JsonObject }
 export type HookStep = { userMessage: string } | { systemMessage: { systemMessage: string } }
-export type ToolResult = { content: { type: 'text'; text: string }[]; isError: boolean }
+/** One MCP result item, the shape agy accepts from a tool. Images are passed through byte for byte. */
+export type ToolContent = { type: 'text'; text: string } | { type: 'image'; mimeType: string; data: string }
+export type ToolResult = { content: ToolContent[]; isError: boolean }
 
 export function toolResult(text: string, isError = false): ToolResult {
   return { content: [{ type: 'text', text }], isError }
+}
+
+/** The client's tool output as agy's MCP result: agy offloads each image to a file and names it in the output text. */
+export function toolResultOf(parts: Part[]): ToolResult {
+  return {
+    content: parts.map((part) => part.type === 'text' ? { type: 'text', text: part.text } : { type: 'image', mimeType: part.mediaType, data: part.data }),
+    isError: false,
+  }
 }
 
 export function toolArgs(args: JsonObject): JsonObject {

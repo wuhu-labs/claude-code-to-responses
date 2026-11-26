@@ -1,4 +1,5 @@
 import { assert, assertEquals, assertMatch } from '@std/assert'
+import { Buffer } from 'node:buffer'
 import { createHash } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
@@ -6,6 +7,7 @@ import { lines } from '../src/claude/lines.ts'
 import { packRecord, unpackRecord } from '../src/records.ts'
 import { AGY_RECORD_PREFIX } from '../src/agy/record.ts'
 import { readSteps, writeSteps } from '../src/agy/rows.ts'
+import { IMAGE, PNG } from './images.ts'
 import { kernelBody } from './kernel_shapes.ts'
 import { WsClient } from './websocket_client.ts'
 
@@ -241,12 +243,12 @@ Deno.test('agy: another lane\'s record and another agy version are typed refusal
   }
 })
 
-Deno.test('agy: an image is refused and the output ids must be the held calls', async () => {
+Deno.test('agy: another image kind is refused and the output ids must be the held calls', async () => {
   const r = await rig()
   try {
     const gw = await r.start()
     const { response } = await gw.create(initial('batch'))
-    const image = await gw.post(follow(response, [...outputs(response), message('user', [{ type: 'input_image', image_url: 'data:image/png;base64,AA==' }])]))
+    const image = await gw.post(follow(response, [...outputs(response), message('user', [{ type: 'input_image', image_url: 'data:image/gif;base64,AA==' }])]))
     assertEquals([image.status, (await image.json()).error.code], [400, 'unsupported'])
     const missing = await gw.post(follow(response, [result(calls(response)[0], 'x')]))
     assertEquals((await missing.json()).error.code, 'missing_tool_output')
@@ -1177,6 +1179,164 @@ Deno.test('agy: naming an earlier response rebuilds at it while a later process 
     // and the rebuilt conversation continues normally
     const next = await gw.create(follow(earlier.response, [user('Onward.')]))
     assertEquals(next.response.status, 'completed')
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+// ---- images -----------------------------------------------------------------------------------------------------
+
+const PNG_BYTES = Buffer.from(PNG, 'base64')
+const PNG_DIGEST = createHash('sha256').update(PNG_BYTES).digest('hex').slice(0, 16)
+
+function imageOutput(call: any, text: string) {
+  return { type: 'function_call_output', call_id: call.call_id, output: [{ type: 'input_text', text }, IMAGE] }
+}
+
+async function recordOf(response: any): Promise<any> {
+  const item = response.output.find((v: any) => v.type === 'reasoning' && v.encrypted_content?.startsWith(AGY_RECORD_PREFIX))
+  return await unpackRecord(AGY_RECORD_PREFIX, item.encrypted_content)
+}
+
+function payload(record: any, idx: number): Buffer {
+  return Buffer.from(record.steps.find((step: any) => step.idx === idx).step_payload, 'base64')
+}
+
+Deno.test('agy: a user image goes to agy as the client sent it, and its record leaves the bytes out', async () => {
+  const r = await rig()
+  try {
+    let gw = await r.start()
+    const body = { model: MODEL, instructions: INSTRUCTIONS, tools: [tool()], input: [message('user', [{ type: 'input_text', text: 'What is this?' }, IMAGE])] }
+    const first = await gw.create(body)
+    assertEquals(text(first.response), 'answer:What is this?')
+    const prompts = (await r.evidence()).filter((e) => e.kind === 'prompt')
+    assertEquals(prompts[0].images, [PNG_DIGEST])
+    const record = await recordOf(first.response)
+    assertEquals(record.crops.length, 1)
+    assert(record.hashes && record.hashes[String(record.crops[0].idx)])
+    assert(!payload(record, record.crops[0].idx).includes(PNG_BYTES), 'the record repeats the client image bytes')
+    assert(!JSON.stringify(record).includes(PNG), 'the record carries the client image base64')
+    // the store is gone; the history's record and its image item rebuild the conversation, image bytes included
+    await gw.stop()
+    await Deno.remove(r.state, { recursive: true })
+    gw = await r.start()
+    const rebuilt = await gw.create({
+      ...body,
+      input: [...body.input, ...first.response.output, user('Again.')],
+    })
+    assertEquals([rebuilt.response.status, rebuilt.response.x_gateway.path], ['completed', 'history'])
+    assertEquals(text(rebuilt.response), 'answer:Again.')
+    const inferences = (await r.evidence()).filter((e) => e.kind === 'inference')
+    const imageRow = (event: any) => event.visible.find((row: string) => row.includes(PNG_DIGEST))
+    assertEquals(imageRow(inferences.at(-1)), imageRow(inferences[0]))
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: a tool image is offloaded by agy, read with read_file inside the response, and rebuilt', async () => {
+  const r = await rig()
+  try {
+    let gw = await r.start()
+    const first = await gw.create(initial('image'))
+    const call = calls(first.response)[0]
+    assertEquals(calls(first.response).length, 1)
+    const output = imageOutput(call, 'here is the picture')
+    const second = await gw.create(follow(first.response, [output]))
+    assertEquals(second.response.x_gateway.path, 'live')
+    assertEquals(calls(second.response).length, 0, 'read_file is agy\'s own call, not a Responses function call')
+    const answer = text(second.response)
+    assert(answer.includes('Looking at the image.'), answer)
+    assert(answer.includes('here is the picture'), answer)
+    // the tool's step names the offloaded file; the read_file step keeps the picture, and the record keeps neither's
+    // client bytes
+    const record = await recordOf(second.response)
+    const readFile = record.steps.find((step: any) => Buffer.from(step.step_payload, 'base64').includes(Buffer.from('read_file')))
+    assert(readFile, 'the read_file step is not in the record')
+    assert(!Buffer.from(readFile.step_payload, 'base64').includes(PNG_BYTES), 'the record repeats the read_file image bytes')
+    assertEquals(record.crops.length, 1)
+    // lost state: the records in the history rebuild the conversation with the same image bytes at the same place
+    await gw.stop()
+    await Deno.remove(r.state, { recursive: true })
+    gw = await r.start()
+    const rebuilt = await gw.create({
+      model: MODEL,
+      instructions: INSTRUCTIONS,
+      tools: [tool()],
+      input: [user('image'), ...first.response.output, output, ...second.response.output, user('What did you see?')],
+    })
+    assertEquals([rebuilt.response.status, rebuilt.response.x_gateway.path, rebuilt.response.x_gateway.records], ['completed', 'history', 2])
+    const inferences = (await r.evidence()).filter((e) => e.kind === 'inference')
+    const imageRows = (event: any) => event.visible.filter((row: string) => row.includes(PNG_DIGEST))
+    assertEquals(imageRows(inferences.at(-1)).length, 1, JSON.stringify(imageRows(inferences.at(-1))))
+    assert(imageRows(inferences.at(-1))[0].startsWith('3:132:'), 'the restored store lost the read_file step')
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: a lost store is rebuilt at a held call whose output carries an image, as agy writes one', async () => {
+  const r = await rig()
+  try {
+    let gw = await r.start()
+    const first = await gw.create(initial('image'))
+    const call = calls(first.response)[0]
+    await gw.stop()
+    await Deno.remove(r.state, { recursive: true })
+    gw = await r.start()
+    const released = await gw.create({
+      model: MODEL,
+      instructions: INSTRUCTIONS,
+      tools: [tool()],
+      input: [user('image'), ...first.response.output, imageOutput(call, 'the shared picture')],
+    })
+    assertEquals([released.response.status, released.response.x_gateway.path, released.response.x_gateway.patched], ['completed', 'history', 1])
+    const check = (await r.evidence()).filter((e) => e.kind === 'resume-check').at(-1)
+    assertMatch(check.completed[0], /\[Resource offloaded to file:\/\/.*\/media_0\.png\]$/)
+    assert(check.completed[0].startsWith('the shared picture\n'), check.completed[0])
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: a gif or webp image is refused before a process starts', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start()
+    for (const mime of ['image/gif', 'image/webp']) {
+      const res = await gw.post({
+        model: MODEL,
+        instructions: INSTRUCTIONS,
+        tools: [tool()],
+        input: [message('user', [{ type: 'input_image', image_url: `data:${mime};base64,${PNG}` }])],
+      })
+      assertEquals([res.status, (await res.json()).error.code], [400, 'unsupported'], mime)
+    }
+    assertEquals((await r.evidence().catch(() => [])).filter((e) => e.kind === 'process').length, 0)
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: a delta that cannot carry its chain\'s image bytes is refused with the full-history remedy', async () => {
+  const r = await rig()
+  try {
+    let gw = await r.start()
+    const body = { model: MODEL, instructions: INSTRUCTIONS, tools: [tool()], input: [message('user', [{ type: 'input_text', text: 'Look.' }, IMAGE])] }
+    const first = await gw.create(body)
+    await gw.create(follow(first.response, [user('Second.')]))
+    // the gateway store keeps the records; the delta carries neither the history nor the image bytes
+    await gw.stop()
+    gw = await r.start()
+    const refused = await gw.post(follow(first.response, [user('From the first response.')]))
+    const failure = await refused.json()
+    assertEquals([refused.status, failure.error.code], [400, 'previous_response_not_found'])
+    assertMatch(failure.error.message, /image bytes/)
     await gw.stop()
   } finally {
     await r.dispose()

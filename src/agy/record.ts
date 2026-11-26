@@ -5,6 +5,7 @@ import type { FnTool } from '../api/request.ts'
 import type { CallAliases } from '../call_ids.ts'
 import { checkCallAliases, packRecord, RECORD_PREFIX, registerRecordPrefix, RESPONSE_ID, unpackRecord } from '../records.ts'
 import type { StepsRowJson, TrajectoryJson } from './rows.ts'
+import type { StepCrop } from './images.ts'
 
 export const AGY_RECORD_PREFIX = 'agy2r.record.v1.'
 export const AGY_RECORD_FAMILY = 'agy2r.record.'
@@ -47,6 +48,10 @@ export interface AgyRecord {
   /** The agy version whose store layout these rows belong to; another version's store is refused, never patched. */
   agy: string
   steps: StepsRowJson[]
+  /** Image runs the record leaves out: the client's history carries those bytes and puts them back on a rebuild. */
+  crops?: StepCrop[]
+  /** For a row a crop changed, the hash of the row as agy wrote it, so no later response re-records it. */
+  hashes?: Record<string, string>
   trajectory?: TrajectoryJson
 }
 
@@ -123,10 +128,12 @@ export function checkAgyRecord(r: unknown, version: string): AgyRecord {
   if (record.workspace !== undefined && (typeof record.workspace !== 'string' || !record.workspace.startsWith('/'))) fail('bad workspace')
   if (!Array.isArray(record.steps) || !record.steps.length) fail('bad steps')
   let previous = -1
+  const rows = new Map<number, Record<string, unknown>>()
   for (const step of record.steps as Record<string, unknown>[]) {
     if (typeof step !== 'object' || step === null) fail('bad step')
     if (!Number.isSafeInteger(step.idx) || (step.idx as number) <= previous) fail('bad step index')
     previous = step.idx as number
+    rows.set(step.idx as number, step)
     if (!Number.isSafeInteger(step.step_type) || !Number.isSafeInteger(step.status)) fail('bad step type or status')
     for (const column of ['metadata', 'error_details', 'permissions', 'task_details', 'render_info', 'step_payload']) {
       const value = step[column]
@@ -137,6 +144,34 @@ export function checkAgyRecord(r: unknown, version: string): AgyRecord {
       } catch {
         fail(`bad step ${column}`)
       }
+    }
+  }
+  if (record.crops !== undefined) {
+    if (!Array.isArray(record.crops)) fail('bad image crops')
+    let lastIdx = -1, lastAt = -1
+    for (const crop of record.crops as Record<string, unknown>[]) {
+      if (typeof crop !== 'object' || crop === null) fail('bad image crop')
+      const idx = crop.idx as number, at = crop.at as number
+      if (!Number.isSafeInteger(idx) || idx < 0 || idx < lastIdx) fail('bad image crop step')
+      if (!Number.isSafeInteger(at) || at < 0 || (idx === lastIdx && at < lastAt)) fail('bad image crop offset')
+      if (!Number.isSafeInteger(crop.length) || (crop.length as number) < 1) fail('bad image crop length')
+      if (typeof crop.digest !== 'string' || !HEX64.test(crop.digest)) fail('bad image digest')
+      const row = rows.get(idx)
+      const payload = typeof row?.step_payload === 'string' ? row.step_payload : null
+      if (payload === null) fail('image crop names no step payload')
+      const bytes = atob(payload as string)
+      if (at > bytes.length) fail('image crop offset is past the payload')
+      const hashes = record.hashes as Record<string, unknown> | undefined
+      if (!hashes || typeof hashes[String(idx)] !== 'string') fail('image crop names no row hash')
+      lastIdx = idx
+      lastAt = at
+    }
+  }
+  if (record.hashes !== undefined) {
+    if (typeof record.hashes !== 'object' || record.hashes === null || Array.isArray(record.hashes)) fail('bad step hashes')
+    for (const [idx, value] of Object.entries(record.hashes as Record<string, unknown>)) {
+      if (!/^\d+$/.test(idx) || !rows.has(Number(idx))) fail('bad step hash key')
+      if (typeof value !== 'string' || !HEX64.test(value)) fail('bad step hash')
     }
   }
   if (record.trajectory !== undefined) {
