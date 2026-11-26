@@ -45,7 +45,9 @@ function upstreamProxy() {
       body: req.method === 'POST' ? body : undefined,
       redirect: 'manual',
     })
-    return new Response(upstream.body, { status: upstream.status, headers: upstream.headers })
+    // fetch has already decoded the body: the upstream's encoding and length headers no longer describe it
+    const headers = new Headers([...upstream.headers].filter(([key]) => !['content-encoding', 'content-length'].includes(key.toLowerCase())))
+    return new Response(upstream.body, { status: upstream.status, headers })
   })
   return { url: `http://127.0.0.1:${server.addr.port}`, bodies, close: () => server.shutdown() }
 }
@@ -60,7 +62,12 @@ async function rig(proxy: string, extra: string[] = []) {
   const root = await Deno.realPath(await Deno.makeTempDir({ prefix: 'agy-probe-' }))
   const state = `${root}/state`
   const wrapper = `${root}/agy`
-  await Deno.writeTextFile(wrapper, `#!/bin/sh\nexec ${shellWord(agy)} --cloud_code_endpoint ${shellWord(proxy)} "$@"\n`, { mode: 0o700 })
+  // agy takes the endpoint override as an option of its `acp` subcommand, after the subcommand's own flags.
+  await Deno.writeTextFile(
+    wrapper,
+    `#!/bin/sh\nif [ "$1" = "acp" ]; then shift; exec ${shellWord(agy)} acp --cloud_code_endpoint ${shellWord(proxy)} "$@"; fi\nexec ${shellWord(agy)} "$@"\n`,
+    { mode: 0o700 },
+  )
   const processes = new Set<Deno.ChildProcess>()
   const start = async () => {
     const child = new Deno.Command(Deno.execPath(), {
@@ -160,10 +167,21 @@ Deno.test({
       await r.dispose()
       await proxy.close()
     }
-    const generate = proxy.bodies.filter((body) => body.json?.request?.contents && body.json?.model)
-    assert(generate.length >= 6, `only ${generate.length} generate requests were captured`)
-    const system = new Set(generate.map((g) => JSON.stringify(g.json.request.systemInstruction)))
-    assertEquals(system.size, 1, 'the system instruction changed across the conversation')
+    // the agent's own inferences only: agy also asks a title generator, which is not this conversation
+    const generate = proxy.bodies.filter((body) => body.json?.requestType === 'custom_agent' && body.json?.request?.contents)
+    assert(generate.length >= 5, `only ${generate.length} generate requests were captured`)
+    const instructions = generate.map((g) => typeof g.json.request.systemInstruction === 'string' ? g.json.request.systemInstruction : JSON.stringify(g.json.request.systemInstruction))
+    const baseline = instructions[0]
+    const differing = instructions.findIndex((text) => text !== baseline)
+    if (differing > 0) {
+      const other = instructions[differing]
+      let at = 0
+      while (at < baseline.length && baseline[at] === other[at]) at++
+      console.error(`system instruction differs in request ${differing} at ${at} of ${baseline.length}/${other.length}:`)
+      console.error(`  ${JSON.stringify(baseline.slice(Math.max(0, at - 60), at + 120))}`)
+      console.error(`  ${JSON.stringify(other.slice(Math.max(0, at - 60), at + 120))}`)
+    }
+    assertEquals(differing, -1, 'the system instruction changed across the conversation')
     const tools = new Set(generate.map((g) => JSON.stringify(g.json.request.tools)))
     assertEquals(tools.size, 1, 'the tool declarations changed across the conversation')
     const contents = generate.map((g) => g.json.request.contents.map((part: any) => normalize(JSON.stringify(part))))

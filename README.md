@@ -716,7 +716,7 @@ stream-json restarting with a replayed call, unlike ACP.
 
 ### agy known limits
 
-- A client that sends full history without provider records (Codex over HTTP in the trial, or a Wuhu forced compaction that changes the chain and resends the old history) is refused with `provider_record_missing`: the agy lane cannot rebuild a conversation across chains, and it never renders history as text. Such a client must start a new conversation.
+- A full create whose history carries no chain head of this lane (no record with `prev: null` that the following items continue) is refused with `provider_record_missing`: the agy lane can only rebuild one agy conversation, and it never renders history as text. The client starts a new conversation.
 - agy's upstream request also carries `labels.last_execution_id` from its `executor_metadata`, which the gateway does not record: a rebuilt request differs there (and in its request identity fields) from the live one. System instruction, tools and prior contents are identical.
 - The custom agent limits exposed tools but is not an OS sandbox. agy still supplies base-prompt text and may declare a few small built-ins; read-only built-ins need not send a permission request. Tool schemas must be accepted by Gemini (the probe's array without `items` failed). The planner does not control agy's internal autonomous inferences.
 - The real Mac trial confirmed the fence, 52 planner lines for 52 responses, long holds, steering, resume, eviction, concurrent conversations and usage on 1.5.17. Codex 0.153 completed a full-history tool conversation in that trial with function tools and neutral trial instructions; its stock identity prompt was not sent to agy. The automated suite uses `test/fixtures/fake_agy.ts`, not the real binary.

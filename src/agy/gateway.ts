@@ -596,6 +596,8 @@ export class AgyGateway implements ResponsesEndpoint {
       idleMs: this.config.idleMs,
       holdMs: this.config.holdMs,
     }, () => {
+      // the process is gone: the lane stops serving and a rebuild may wait for it
+      this.chains.dead(lane)
       this.tokens.delete(lane.token)
     })
     this.chains.add(lane)
