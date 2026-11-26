@@ -2,7 +2,7 @@
 // record whose covered items the client visibly changed is a typed 400, not a silent synthesis.
 import { assertEquals, assertRejects } from '@std/assert'
 import { type Exchange, text } from './fake.ts'
-import { send, unmark, user } from './harness.ts'
+import { assertPrefix, send, unmark, user } from './harness.ts'
 import { INSTRUCTIONS, MODEL, Run, TOOLS } from './scenario.ts'
 
 const body = { model: MODEL, instructions: INSTRUCTIONS, tools: TOOLS }
@@ -26,6 +26,16 @@ async function twoTurns(run: Run): Promise<{ a: string; x: unknown[]; b: string;
 }
 
 const spoken = (t: { a: string; x: unknown[]; b: string; y: unknown[] }, a = 'A', b = 'B', x = 'X') => [user(a), ...t.x, user(b), ...t.y, user(x)]
+/** The client's items without the provider records, keeping every visible output. */
+const visibleOnly = (items: unknown[]) => items.filter((it) => (it as { type?: string }).type !== 'reasoning')
+
+/** Three completed text turns; A's record is the one the gap test omits. */
+async function threeTurns(run: Run) {
+  const t = await twoTurns(run)
+  run.fake.reply({ blocks: [text('reply C')] })
+  const c = await run.turn('C')
+  return { ...t, z: c.response.output }
+}
 
 Deno.test('history: unchanged prefix plus a new tail continues from the earlier response, never the later live one', async () => {
   const run = new Run('prefix-branch', false, { mode: 'history' })
@@ -44,6 +54,23 @@ Deno.test('history: unchanged prefix plus a new tail continues from the earlier 
       { role: 'assistant', text: ['reply B'] },
       { role: 'user', text: ['X'] },
     ])
+  })
+})
+
+Deno.test('history: a record whose parent was not sent is compared with its own span; only an edit is a 400', async () => {
+  const run = new Run('prefix-gap', false, { mode: 'history' })
+  await run.run(async () => {
+    const t = await threeTurns(run)
+    const history = (c: string) => [user('A'), ...visibleOnly(t.x), user('B'), ...t.y, user(c), ...t.z, user('next')]
+    // the unedited control: nothing is reusable with A's record missing, and nothing is called edited either
+    run.fake.reply({ blocks: [text('reply next')] })
+    const plain = await send(run.tg.client, { ...body, input: history('C') })
+    assertEquals([plain.status, plain.response.x_gateway.records, plain.response.x_gateway.synthesized_groups], ['completed', 0, 3])
+    // the edit to C's own turn is visible through C's record, whose parent B is right there
+    const before = run.fake.main().length
+    const err = bad(await assertRejects(() => send(run.tg.client, { ...body, input: history('C edited') })))
+    assertEquals([err.status, err.code ?? err.error?.code], [400, 'history_mismatch'])
+    assertEquals(run.fake.main().length, before)
   })
 })
 
@@ -67,6 +94,26 @@ Deno.test('history: a changed tool set alone does not stand in for an edit, and 
     run.fake.reply({ blocks: [text('reply X')] })
     const plain = await send(run.tg.client, { ...body, tools, input: spoken(t) })
     assertEquals([plain.status, plain.response.x_gateway.records, plain.response.x_gateway.synthesized_groups], ['completed', 0, 2])
+    // the synthesised X is a root record over that whole history: the next create must reuse it, not synthesize again
+    run.fake.reply({ blocks: [text('reply next')] })
+    const reused = await send(run.tg.client, { ...body, tools, input: [...spoken(t), ...plain.response.output, user('next')] })
+    assertEquals([reused.status, reused.response.x_gateway.path, reused.response.x_gateway.records, reused.response.x_gateway.synthesized_groups], [
+      'completed',
+      'history',
+      1,
+      0,
+    ])
+    assertEquals(run.tg.gw.store.get(reused.response.id)!.prev, plain.response.id)
+    assertEquals(turns(run.fake.main().at(-1)!), [
+      { role: 'user', text: ['A'] },
+      { role: 'assistant', text: ['reply A'] },
+      { role: 'user', text: ['B'] },
+      { role: 'assistant', text: ['reply B'] },
+      { role: 'user', text: ['X'] },
+      { role: 'assistant', text: ['reply X'] },
+      { role: 'user', text: ['next'] },
+    ])
+    assertPrefix(run.fake.main()[2], run.fake.main()[3])
     // the same tool change with an edited prompt: the edit is still visible through the record's own comparison
     const before = run.fake.main().length
     const err = bad(await assertRejects(() => send(run.tg.client, { ...body, tools, input: spoken(t, 'A edited') })))

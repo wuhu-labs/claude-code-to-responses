@@ -514,12 +514,14 @@ response is attached, so simultaneous requests never rebuild it twice. The next 
   as when Wuhu commits provider calls under kernel UUIDs. The gateway derives the original ordered tool ids from
   each record's unchanged framing, binds the client ids bijectively, then verifies the digest after translating
   those ids. Apart from the argument reserialization above, item order, names, outputs, text and images must still match exactly.
-  A record whose `prev` names a response the request also carries claims the items between them, and its own digest
-  decides whether they are the ones it was issued for; whether it is reusable under this request's instructions, tools
-  and model is a separate question. A disagreement is `400 history_mismatch` — a changed tool set is not evidence that
-  the content changed, and not a reason to skip the comparison — and so are conflicting/many-to-one call ids and two
-  readable records sent in an order (or a grouping) their `prev` links contradict: a response cannot come before its
-  parent, and two chained records cannot share one response group, whose missing input would be the deleted boundary. Dropping that
+  A record whose `prev` names a response the request also carries claims the items between them, a record with no
+  parent claims the whole request, and its own digest decides whether they are the ones it was issued for; whether it is
+  reusable under this request's instructions, tools and model is a separate question. A disagreement is `400
+  history_mismatch` — a changed tool set is not evidence that the content changed, and not a reason to skip the comparison
+  — and so are conflicting/many-to-one call ids and two readable records sent in an order (or a grouping) their `prev`
+  links contradict: a response cannot come before its parent, and two chained records cannot share one response group,
+  whose missing input would be the deleted boundary. An output whose call the request cannot map is not compared at all,
+  never reported as a changed digest. Dropping that
   reasoning item and the later ones makes the remaining history synthesis, which is how a client continues from a
   changed context; the agy lane, which never replays history from text, then refuses it with `provider_record_missing`.
   A group with no record, or a record whose parent is not in the supplied prefix, is not a contradiction and is

@@ -1307,6 +1307,36 @@ Deno.test('agy: a changed tool set alone is not a content change, and does not h
   }
 })
 
+Deno.test('agy: a record whose parent was not sent is compared with its own span; only an edit is a 400', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start(['--idle-timeout', '0.2'])
+    const first = await gw.create(initial('Remember the prefix.'))
+    const second = await gw.create(follow(first.response, [user('Turn B.')]))
+    const third = await gw.create(follow(second.response, [user('Turn C.')]))
+    await assertStopped(pids(await r.evidence()))
+    const withoutA = first.response.output.filter((item: any) => item.type !== 'reasoning')
+    const history = (c: string) => [
+      user('Remember the prefix.'),
+      ...withoutA,
+      user('Turn B.'),
+      ...second.response.output,
+      user(c),
+      ...third.response.output,
+      user('Next.'),
+    ]
+    // unedited: A's missing record blocks every replay, and nothing is called edited either
+    const control = await gw.post({ model: MODEL, instructions: INSTRUCTIONS, tools: [tool()], input: history('Turn C.') })
+    assertEquals([control.status, (await control.json()).error.code], [400, 'provider_record_missing'])
+    // C's own turn edited: its parent B is carried, so the disagreement is visible
+    const edited = await gw.post({ model: MODEL, instructions: INSTRUCTIONS, tools: [tool()], input: history('Turn C, edited.') })
+    assertEquals([edited.status, (await edited.json()).error.code], [400, 'history_mismatch'])
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
 Deno.test('agy: a lost state folder rebuilds from the history the client carries', async () => {
   const r = await rig()
   try {

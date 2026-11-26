@@ -98,8 +98,8 @@ export async function matchHistory<R extends MatchRecord, S>(
     session = null
     pending = [...groups]
   }
-  /** The item chain the request itself shows: the last record whose covered items were verified, and where it was. */
-  let chain: { id: string | null; group: number; aliases: CallAliases } = { id: null, group: -1, aliases: [] }
+  /** The aliases each compared record was verified with, by response id, for the records that follow it. */
+  const verified = new Map<string, CallAliases>()
   /** The group each readable record was sent in; a record's `prev` names one of them. */
   const groupOf = new Map<string, number>()
   /** A parent a child was already sent under: a parent cannot come after its child. */
@@ -128,15 +128,22 @@ export async function matchHistory<R extends MatchRecord, S>(
       if (record.prev !== null) childOf.set(record.prev, record.id)
     }
     const record = records[records.length - 1]!
-    // A record is comparable when it is the group's only record and names the last verified record as its parent (or,
-    // at the start, starts the log). Whether it may be reused under this request's instructions, tools and model is a
-    // separate question: a changed tool set is not evidence that the content changed, and not a reason to skip the
-    // comparison either. A record whose parent is not in the request is no evidence at all.
-    const comparable = records.length === 1 && record.prev === chain.id && (record.prev !== null || chain.group === -1)
-    const covers = comparable ? groups.slice(chain.group + 1, gi + 1).flatMap((x) => [...x.inputs, ...x.outputs]) : []
-    const providerCalls = comparable ? o.providerCalls(record) : null
-    const matched = providerCalls === null ? null : matchItems(covers, record, providerCalls, [...chain.aliases])
-    if (comparable && providerCalls !== null && matched === null) {
+    // The record's parent fixes the span it claims: the groups after that record's own position, or the whole request for
+    // a root. Comparison is separate from reuse: the record's existing digest decides the span, and a changed tool set is
+    // not evidence that the content changed, nor a reason to skip the comparison. A parent the request does not carry is
+    // no evidence at all.
+    const boundary = record.prev === null ? -1 : groupOf.get(record.prev)
+    const comparable = records.length === 1 && boundary !== undefined && boundary < gi
+    const covers = comparable ? groups.slice(boundary + 1, gi + 1).flatMap((x) => [...x.inputs, ...x.outputs]) : []
+    const available = record.prev === null ? [] : verified.get(record.prev) ?? []
+    // An output whose call the request cannot map — a call before the boundary that no compared record bound — makes the
+    // items incomparable; that is not evidence of an edited digest.
+    const callIds = new Set(available.map(([client]) => client))
+    for (const it of covers) if (it.kind === 'function_call') callIds.add(it.callId)
+    const mappable = covers.every((it) => it.kind !== 'function_call_output' || callIds.has(it.callId))
+    const providerCalls = comparable && mappable ? o.providerCalls(record) : null
+    const matched = providerCalls === null ? null : matchItems(covers, record, providerCalls, [...available])
+    if (comparable && mappable && providerCalls !== null && matched === null) {
       throw invalid(
         'input',
         `The history carries the reasoning record of response '${record.id}', but the input it covers is not the input it was issued for. ` +
@@ -144,7 +151,7 @@ export async function matchHistory<R extends MatchRecord, S>(
         'history_mismatch',
       )
     }
-    if (matched !== null) chain = { id: record.id, group: gi, aliases: matched }
+    if (matched !== null) verified.set(record.id, matched)
     const linked = record.prev === (head?.responseId ?? null)
     const reusable = linked && matched !== null && o.continues(record) && (session === null || o.session(record) === session)
     if (!reusable) continue
