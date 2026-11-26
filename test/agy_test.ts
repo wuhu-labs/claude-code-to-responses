@@ -1182,7 +1182,6 @@ Deno.test('agy: naming an earlier response rebuilds at it while a later process 
     await r.dispose()
   }
 })
-const turns = (visible: string[]) => visible.filter((row) => /^\d+:14:/.test(row)).map((row) => row.replace(/^\d+:14:/, ''))
 
 Deno.test('agy: a full history that keeps a prefix and sends a new tail continues from it, not from the later live turn', async () => {
   const r = await rig()
@@ -1200,8 +1199,14 @@ Deno.test('agy: a full history that keeps a prefix and sends a new tail continue
       input: [user('Remember the prefix.'), ...first.response.output, user('Turn B.'), ...second.response.output, user('Branch X.')],
     })
     assertEquals([branch.response.status, branch.response.x_gateway.path, branch.response.x_gateway.records], ['completed', 'store', 2])
-    const seen = turns((await r.evidence()).filter((e) => e.kind === 'inference').at(-1)!.visible)
-    assertEquals(seen, ['Remember the prefix.', 'Turn B.', 'Branch X.'])
+    const seen = modelRows((await r.evidence()).filter((e) => e.kind === 'inference').at(-1)!.visible).filter((row) => !row.startsWith('101:'))
+    assertEquals(seen, [
+      '14:Remember the prefix.',
+      '15:answer:Remember the prefix.',
+      '14:Turn B.',
+      '15:answer:Turn B.',
+      '14:Branch X.',
+    ])
     await gw.stop()
   } finally {
     await r.dispose()
@@ -1249,6 +1254,59 @@ Deno.test('agy: two readable records sent in an order their own links contradict
   }
 })
 
+Deno.test('agy: a record sent in the same group as its parent is a typed 400 before any process starts', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start(['--idle-timeout', '0.2'])
+    const first = await gw.create(initial('Remember the prefix.'))
+    const second = await gw.create(follow(first.response, [user('Turn B.')]))
+    await assertStopped(pids(await r.evidence()))
+    const processes = (await r.evidence()).filter((e) => e.kind === 'process').length
+    // B's user message is deleted, so the linked records A and B land in one output group
+    const refused = await gw.post({
+      model: MODEL,
+      instructions: INSTRUCTIONS,
+      tools: [tool()],
+      input: [user('Remember the prefix.'), ...first.response.output, ...second.response.output, user('Branch X.')],
+    })
+    assertEquals([refused.status, (await refused.json()).error.code], [400, 'history_mismatch'])
+    assertEquals((await r.evidence()).filter((e) => e.kind === 'process').length, processes)
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
+Deno.test('agy: a changed tool set alone is not a content change, and does not hide one', async () => {
+  const r = await rig()
+  try {
+    const gw = await r.start(['--idle-timeout', '0.2'])
+    const first = await gw.create(initial('Remember the prefix.'))
+    const second = await gw.create(follow(first.response, [user('Turn B.')]))
+    await assertStopped(pids(await r.evidence()))
+    const tools = [tool('echo')]
+    // the unchanged items under a new tool set: no record is reusable in this chain, and no content is called changed
+    const plain = await gw.post({
+      model: MODEL,
+      instructions: INSTRUCTIONS,
+      tools,
+      input: [user('Remember the prefix.'), ...first.response.output, user('Turn B.'), ...second.response.output, user('Branch X.')],
+    })
+    assertEquals([plain.status, (await plain.json()).error.code], [400, 'provider_record_missing'])
+    // the same tool change with an edited prompt: the edit is visible through the record's own comparison
+    const edited = await gw.post({
+      model: MODEL,
+      instructions: INSTRUCTIONS,
+      tools,
+      input: [user('Remember the prefix, edited.'), ...first.response.output, user('Turn B.'), ...second.response.output, user('Branch X.')],
+    })
+    assertEquals([edited.status, (await edited.json()).error.code], [400, 'history_mismatch'])
+    await gw.stop()
+  } finally {
+    await r.dispose()
+  }
+})
+
 Deno.test('agy: a lost state folder rebuilds from the history the client carries', async () => {
   const r = await rig()
   try {
@@ -1266,8 +1324,14 @@ Deno.test('agy: a lost state folder rebuilds from the history the client carries
       input: [user('Remember the prefix.'), ...first.response.output, user('Turn B.'), ...second.response.output, user('Branch X.')],
     })
     assertEquals([rebuilt.response.status, rebuilt.response.x_gateway.path, rebuilt.response.x_gateway.records], ['completed', 'history', 2])
-    const seen = turns((await r.evidence()).filter((e) => e.kind === 'inference').at(-1)!.visible)
-    assertEquals(seen, ['Remember the prefix.', 'Turn B.', 'Branch X.'])
+    const seen = modelRows((await r.evidence()).filter((e) => e.kind === 'inference').at(-1)!.visible).filter((row) => !row.startsWith('101:'))
+    assertEquals(seen, [
+      '14:Remember the prefix.',
+      '15:answer:Remember the prefix.',
+      '14:Turn B.',
+      '15:answer:Turn B.',
+      '14:Branch X.',
+    ])
     await gw.stop()
   } finally {
     await r.dispose()
@@ -1282,7 +1346,7 @@ Deno.test('agy: ordinary consecutive user messages start a conversation in the r
     assertEquals([fresh.response.status, fresh.response.x_gateway.path], ['completed', 'new'])
     const prompt = (await r.evidence()).filter((e) => e.kind === 'prompt').at(-1)!
     assertEquals(prompt.text, 'first\n\nsecond')
-    assertEquals(turns((await r.evidence()).filter((e) => e.kind === 'inference').at(-1)!.visible), ['first\n\nsecond'])
+    assertEquals(modelRows((await r.evidence()).filter((e) => e.kind === 'inference').at(-1)!.visible), ['14:first\n\nsecond'])
     // history with an assistant turn is not something an agy conversation can be rebuilt from: say what cannot be represented
     const refused = await gw.post({
       model: MODEL,

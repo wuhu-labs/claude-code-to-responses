@@ -77,8 +77,9 @@ export function isOutput(i: InItem): boolean {
 
 /**
  * The longest run of groups whose records chain onto each other and match their items. A group no record covers is
- * synthesized (or refused by a lane that cannot represent it). A record that does chain onto the run but whose items
- * disagree with what it covers is positive evidence of a changed prefix: that is a 400, never a silent synthesis.
+ * synthesized (or refused by a lane that cannot represent it). Positive evidence of a changed prefix is a 400: a linked
+ * record whose items disagree with what it covers, or two readable records whose own `prev` links contradict the order
+ * and grouping they were sent in.
  */
 export async function matchHistory<R extends MatchRecord, S>(
   groups: Group[],
@@ -97,7 +98,12 @@ export async function matchHistory<R extends MatchRecord, S>(
     session = null
     pending = [...groups]
   }
-  const known = new Map<string, R>()
+  /** The item chain the request itself shows: the last record whose covered items were verified, and where it was. */
+  let chain: { id: string | null; group: number; aliases: CallAliases } = { id: null, group: -1, aliases: [] }
+  /** The group each readable record was sent in; a record's `prev` names one of them. */
+  const groupOf = new Map<string, number>()
+  /** A parent a child was already sent under: a parent cannot come after its child. */
+  const childOf = new Map<string, string>()
   for (let gi = 0; gi < groups.length; gi++) {
     const group = groups[gi]
     pending.push(group)
@@ -105,23 +111,32 @@ export async function matchHistory<R extends MatchRecord, S>(
     const encrypted = [...new Set(group.outputs.filter((i) => i.kind === 'reasoning' && i.encrypted).map((i) => (i as { encrypted: string }).encrypted))]
     const records = (await Promise.all(encrypted.map((e) => o.decode(e, gi)))).filter((r) => r !== null)
     if (records.length === 0) continue
-    // Two readable records whose own prev links disagree with the order they were sent in are a visible contradiction:
-    // a response cannot follow its own parent. A response sent twice is still one record and keeps its first position.
+    // A record sent in the same response group as its parent, or after its own child, contradicts the boundary its own
+    // `prev` link names: the input that separated them is gone. A response sent twice is still one record.
     for (const record of records) {
-      if (known.has(record.id)) continue
-      const child = [...known.values()].find((r) => r.prev === record.id)
-      if (child) throw invalid('input', `The history puts response '${child.id}' before its parent '${record.id}'.`, 'history_mismatch')
-      known.set(record.id, record)
+      if (groupOf.has(record.id)) continue
+      const child = childOf.get(record.id)
+      if (child) throw invalid('input', `The history puts response '${child}' before its parent '${record.id}'.`, 'history_mismatch')
+      if (record.prev !== null && groupOf.get(record.prev) === gi) {
+        throw invalid(
+          'input',
+          `The history puts response '${record.id}' in the same response group as its parent '${record.prev}'; the input between them is missing.`,
+          'history_mismatch',
+        )
+      }
+      groupOf.set(record.id, gi)
+      if (record.prev !== null) childOf.set(record.prev, record.id)
     }
     const record = records[records.length - 1]!
-    const covers = pending.flatMap((x) => [...x.inputs, ...x.outputs])
-    const candidate = records.length === 1 && o.continues(record) && record.prev === (head?.responseId ?? null) &&
-      (session === null || o.session(record) === session)
-    const providerCalls = candidate ? o.providerCalls(record) : null
-    const matched = providerCalls === null ? null : matchItems(covers, record, providerCalls, aliases)
-    // The record names this exact parent and continues the run, but the items it covers are not the ones it was issued
-    // for. No lookup can make that true; the client must drop the reasoning it contradicts.
-    if (candidate && providerCalls !== null && matched === null) {
+    // A record is comparable when it is the group's only record and names the last verified record as its parent (or,
+    // at the start, starts the log). Whether it may be reused under this request's instructions, tools and model is a
+    // separate question: a changed tool set is not evidence that the content changed, and not a reason to skip the
+    // comparison either. A record whose parent is not in the request is no evidence at all.
+    const comparable = records.length === 1 && record.prev === chain.id && (record.prev !== null || chain.group === -1)
+    const covers = comparable ? groups.slice(chain.group + 1, gi + 1).flatMap((x) => [...x.inputs, ...x.outputs]) : []
+    const providerCalls = comparable ? o.providerCalls(record) : null
+    const matched = providerCalls === null ? null : matchItems(covers, record, providerCalls, [...chain.aliases])
+    if (comparable && providerCalls !== null && matched === null) {
       throw invalid(
         'input',
         `The history carries the reasoning record of response '${record.id}', but the input it covers is not the input it was issued for. ` +
@@ -129,7 +144,10 @@ export async function matchHistory<R extends MatchRecord, S>(
         'history_mismatch',
       )
     }
-    if (matched === null) continue
+    if (matched !== null) chain = { id: record.id, group: gi, aliases: matched }
+    const linked = record.prev === (head?.responseId ?? null)
+    const reusable = linked && matched !== null && o.continues(record) && (session === null || o.session(record) === session)
+    if (!reusable) continue
     aliases = matched
     used.push({ record, state: await o.state(record, covers, aliases) })
     head = { responseId: record.id, end: record.end, calls: record.calls }
